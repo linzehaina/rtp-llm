@@ -1,3 +1,4 @@
+#include "rtp_llm/cpp/engine_base/stream/InputEmbeddingsUtils.h"
 #include "rtp_llm/cpp/engine_base/stream/GenerateStream.h"
 #include "rtp_llm/cpp/engine_base/EngineBase.h"
 #include "rtp_llm/cpp/normal_engine/NormalExecutor.h"
@@ -135,6 +136,7 @@ NormalEngine::NormalEngine(const EngineInitParams&                       params,
                            std::unique_ptr<ProposeModelEngineInitParams> propose_params):
     EngineBase(params),
     model_config_(params.model_config_),
+    model_supports_input_embeddings_(params.model_supports_input_embeddings),
     parallelism_config(params.parallelism_config),
     runtime_config(params.runtime_config),
     eplb_config(params.eplb_config),
@@ -767,17 +769,35 @@ std::shared_ptr<GenerateStream> NormalEngine::createStream(const std::shared_ptr
     return stream;
 }
 
+bool NormalEngine::rejectInvalidInputEmbeddings(const GenerateStreamPtr& stream) const {
+    const auto                         type = propose_params_ ? propose_params_->sp_type : sp_config.type;
+    const InputEmbeddingsRuntimePolicy policy{model_config_.hidden_size,
+                                              model_supports_input_embeddings_,
+                                              parallelism_config.tp_size,
+                                              parallelism_config.prefill_cp_config.is_enabled(),
+                                              type == SP_TYPE_MTP || type == SP_TYPE_EAGLE || type == SP_TYPE_DSPARK,
+                                              ffn_disaggregate_config.enable_ffn_disaggregate};
+    const auto                         status = validateInputEmbeddingsForRequest(*stream->generateInput(), policy);
+    if (status.ok()) {
+        return false;
+    }
+    stream->reportError(ErrorCode::INVALID_PARAMS, status.ToString());
+    return true;
+}
+
 std::shared_ptr<GenerateStream> NormalEngine::makeStream(const std::shared_ptr<GenerateInput>& input) {
     auto stream = createStream(input);
     // DecodeRpcServer allocates the destination KV table before enqueue/P-D handoff.
     stream->setReserveStep(reserveStepForStream(reserve_step_, stream->generateConfig()->isPrefillOnly()));
-    (void)validateStreamForScheduling(stream);
+    if (!rejectInvalidInputEmbeddings(stream)) {
+        (void)validateStreamForScheduling(stream);
+    }
     return stream;
 }
 
 void NormalEngine::enqueue(std::shared_ptr<GenerateStream>& stream) {
     stream->setReserveStep(reserveStepForStream(reserve_step_, stream->generateConfig()->isPrefillOnly()));
-    if (!validateStreamForScheduling(stream)) {
+    if (stream->hasError() || rejectInvalidInputEmbeddings(stream) || !validateStreamForScheduling(stream)) {
         return;
     }
     (void)scheduler_->enqueue(stream);
@@ -801,6 +821,18 @@ NormalEngine::enqueueMultiple(const std::vector<std::shared_ptr<GenerateInput>>&
         auto stream = createStream(inp);
         stream->setReserveStep(reserveStepForStream(reserve_step_, stream->generateConfig()->isPrefillOnly()));
         streams.push_back(stream);
+    }
+    bool has_invalid_input = false;
+    for (const auto& stream : streams) {
+        has_invalid_input = rejectInvalidInputEmbeddings(stream) || has_invalid_input;
+    }
+    if (has_invalid_input) {
+        for (const auto& stream : streams) {
+            if (!stream->hasError()) {
+                stream->reportError(ErrorCode::INVALID_PARAMS, "request group contains invalid input_embeddings");
+            }
+        }
+        return {std::vector<bool>(streams.size(), false), streams};
     }
 
     std::vector<GenerateStreamPtr> streams_for_mode_check;

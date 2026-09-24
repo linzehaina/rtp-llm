@@ -130,6 +130,12 @@ enum GptModelInputIndex : size_t {
     // Keep these at the end so existing shape-hint indices remain unchanged.
     skipLmHead,
     captureHiddenStates,
+    // Set to 1 by root iff input_embeddings is non-empty under tp_size > 1.
+    // Broadcast as a shape hint so all TP ranks abort symmetrically — input_embeddings
+    // is not TP-aware (tpSyncModelInputs does not broadcast the embedding tensors), so
+    // letting non-root proceed would either deadlock the next collective or produce
+    // silently-wrong output.
+    inputEmbeddingsRejected,
     gptModelInputLength,
 };
 

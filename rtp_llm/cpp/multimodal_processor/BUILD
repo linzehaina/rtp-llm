@@ -59,6 +59,7 @@ cc_library(
 cc_library(
     name = "feature_hash_utils",
     hdrs = ["FeatureHash.h"],
+    visibility = ["//visibility:public"],
 )
 
 cc_library(

@@ -23,7 +23,7 @@ from rtp_llm.models_py.model_desc.qwen3_next import (
     _validate_aiter_flydsl_gdn_decode_eager_state,
     _write_cp_cache_store,
 )
-from rtp_llm.ops.compute_ops import PyAttentionInputs
+from rtp_llm.ops.compute_ops import PyAttentionInputs, PyModelInputs
 
 
 class FakeKVCache:

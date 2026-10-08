@@ -60,6 +60,14 @@ py_test(
 )
 
 py_test(
+    name = "mega_moe_capacity_test",
+    srcs = ["mega_moe_capacity_test.py"],
+    deps = ["//rtp_llm/models_py:modules", "//rtp_llm:testlib"],
+    env = {"GPU_COUNT": "0"},
+    target_compatible_with = _CUDA13_ONLY,
+)
+
+py_test(
     name = "mega_moe_static_buf_test",
     srcs = ["mega_moe_static_buf_test.py"],
     deps = ["//rtp_llm:testlib"],

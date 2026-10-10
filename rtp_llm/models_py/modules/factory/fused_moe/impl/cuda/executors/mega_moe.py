@@ -11,6 +11,7 @@ available.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Any, Dict, Optional
@@ -242,6 +243,20 @@ class MegaMoeExecutor(Fp8Fp4ExecutorBase):
             )
         elif self._activation != "swiglu":
             raise ValueError(f"Unsupported MegaMoE activation {self._activation!r}")
+        if os.environ.get("RTP_LLM_SMOKE_EVIDENCE") == "1":
+            logging.info(
+                "[RTP_MOE_ACTIVATION] %s",
+                json.dumps(
+                    {
+                        "activation": self._activation,
+                        "gate_beta": cfg.activation_beta,
+                        "up_beta": cfg.activation_linear_beta,
+                        "kwargs": self._activation_kwargs,
+                        "backend": getattr(deep_gemm, "__file__", None),
+                    },
+                    allow_nan=False,
+                ),
+            )
         E = cfg.n_local_experts
         D = cfg.dim
         inter = cfg.moe_inter_dim

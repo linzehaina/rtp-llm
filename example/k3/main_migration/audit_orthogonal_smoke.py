@@ -848,6 +848,11 @@ def main() -> int:
                 ),
                 read_events(args.decode_log_dir, engine_log=args.decode_engine_log),
             )
+            from moe_smoke import audit_situ
+
+            verdict["situ_configuration"] = audit_situ(
+                args.prefill_log_dir, args.decode_log_dir
+            )
         except (AssertionError, ValueError, KeyError) as error:
             verdict["passed"] = False
             verdict["errors"].append(str(error))

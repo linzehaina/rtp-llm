@@ -3,8 +3,10 @@
 One ctypes launch (``launch_native_hybrid_attention``) replaces the Triton
 ``_q8kv4_selected|four_page_partial`` + ``_q8kv4_combine`` attention stage of
 ``q8kv4_paged_sparse_decode``.  The binary is the 13-round decode campaign's
-frozen champion P6-2-residual (``libdecode_hybrid_p6res.so``, see
-``NATIVE_HYBRID_DECODE.md`` beside this file for provenance).
+frozen champion P6-2-residual plus the P8-SMALLB dispatch threshold fix
+(``rows >= 16`` routes to the native tcgen05 K1; was ``rows >= 32`` — the
+GPU kernels are unchanged, rows 16-31 just take the faster already-gated
+path; see ``NATIVE_HYBRID_DECODE.md`` beside this file for provenance).
 
 The champion was designed against this exact production cache layout and
 consumes every input zero-copy:
@@ -65,7 +67,11 @@ logger = logging.getLogger(__name__)
 
 _LIB_FILENAME = "libdecode_hybrid_p6res.so"
 _MAIN_ENTRY = "launch_native_hybrid_attention"
-_BINARY_SHA256 = "e1d0b7efa3acea405cfd88764126bdfc652a25cd992e0fe22a4e3c634ea4a7b5"
+# P6-2-residual champion binary + the P8-SMALLB dispatch threshold fix
+# (rows >= 16 -> native tcgen05 K1; was rows >= 32). GPU kernels are
+# unchanged from the champion - the fix only re-routes rows 16-31 between
+# two already-gated paths (9-cell gate: O bitwise on every cell).
+_BINARY_SHA256 = "c1506bb46a56f4eb343aa6aead09f4dc72d79674ea74193558de6e14004b8954"
 
 # sm_103a build (L20D); the campaign never validated other devices.
 _REQUIRED_CAPABILITY = (10, 3)

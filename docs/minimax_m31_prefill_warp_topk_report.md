@@ -1,6 +1,6 @@
 # M3.1 prefill TopK 优化报告
 
-2026-10-10；基于外源 `feat/minimax_m3.1` 的 `208f1d2f3ff6c745652a9b0a60bbcdfbf6bf0833`，提交分支 `perf/m31-prefill-warp-topk`。
+2026-10-10；基于外源 `feat/minimax_m3.1` 的 `208f1d2f3ff6c745652a9b0a60bbcdfbf6bf0833`，目标分支 `feat/minimax_m3.1`。
 
 最终兼容版：同规格三段单算子 **1193.510 → 689.796 μs，快 1.73 倍，耗时减少 42.20%**；真实 M3.1 纯 prefill 的 model-forward **1634.49 → 1609.97 ms，减少 24.52 ms（1.50%）**。140/140 个对应请求首 token 一致，35,788,800 行真实 score 的 TopK block ID、顺序均与原实现一致。以下性能均包含等分兼容回退 kernel。
 
@@ -105,6 +105,6 @@ Compute Sanitizer memcheck 160 个正向子用例、synccheck 152 个，均 0 er
 
 ## 交付与复现
 
-代码、报告、图和精简 JSON/CSV 提交实验分支；构建/测试/benchmark/NCU/模型运行脚本见 [复现说明](minimax_m31_prefill_topk/reproduction.md)。交付 artifact 包含四 rank 新旧 timeline、完整 NCU reports、107 点数据、请求 protobuf/hash、日志、权重 SHA、audit 和 GPU gate/清理证据。原型和中间结果保存在历史目录，不作为最终性能口径。
+代码、报告、图和精简 JSON/CSV 随本次改动交付，推送目标为 `feat/minimax_m3.1`；构建/测试/benchmark/NCU/模型运行脚本见 [复现说明](minimax_m31_prefill_topk/reproduction.md)。交付 artifact 包含四 rank 新旧 timeline、完整 NCU reports、107 点数据、请求 protobuf/hash、日志、权重 SHA、audit 和 GPU gate/清理证据。原型和中间结果保存在历史目录，不作为最终性能口径。
 
 任务创建的模型服务和 GPU 测试容器已全部关闭；核验本任务 PID、端口、GPU allocations 连续超过 5 秒均已释放，保留权重、缓存及结果。

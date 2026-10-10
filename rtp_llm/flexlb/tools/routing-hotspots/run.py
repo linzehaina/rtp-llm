@@ -28,8 +28,48 @@ for variant, directory in [('before', baseline), ('after', root)]:
     destination.mkdir(exist_ok=True)
     runtime = classpath.replace(str(root), str(directory))
     (destination / 'classpath.txt').write_text(runtime)
+    verification_source = verification.read_text()
+    planner_source = directory / 'flexlb-sync/src/main/java/org/flexlb/balance/planner/GroupPlanner.java'
+    if 'interface ItemAccess<' in planner_source.read_text():
+        # Keep the workload identical when comparing across the planner API change.
+        verification_source = verification_source.replace(
+            'GroupPlanner.selectWithPrediction(items, limits,',
+            'GroupPlanner.selectWithPrediction(items, GroupPlanner.itemAccess(), limits,')
+    if 'String dispatchReason(' not in planner_source.read_text():
+        verification_source = verification_source.replace(
+            'GroupPlanner.dispatchReason(selection, limits, 1000)',
+            'GroupPlanner.evaluateReadiness(selection, limits, 1000).reason()')
+    benchmark_source = source.read_text()
+    delivery_source = directory / 'flexlb-sync/src/main/java/org/flexlb/balance/scheduler/BatchDeliveryStrategy.java'
+    if 'AdmissionCapacity capacity' not in delivery_source.read_text():
+        shared_capacity = ', new org.flexlb.balance.endpoint.DecodeResources.AdmissionCapacity(0L, 90L)'
+        benchmark_source = benchmark_source.replace(shared_capacity + ', 2)', ')')
+        verification_source = verification_source.replace(shared_capacity + ')', ')')
+    request_source = directory / 'flexlb-common/src/main/java/org/flexlb/dao/loadbalance/Request.java'
+    if '@Builder' not in request_source.read_text():
+        benchmark_source = benchmark_source.replace(
+            'var request = Request.builder()\n'
+            '                .requestId(id)\n'
+            '                .seqLen(tokens)\n'
+            '                .rawPriority(priority).build();',
+            'var request = new Request();\n'
+            '        request.setRequestId(id);\n'
+            '        request.setSeqLen(tokens);\n'
+            '        request.setPriority(priority);')
+    compatible_verification = destination / verification.name
+    compatible_verification.write_text(verification_source)
+    fixture_source = directory / 'flexlb-sync/src/test/java/org/flexlb/balance/scheduler/SchedulingTestConfig.java'
+    if 'RequestContext freezeInputs(' in fixture_source.read_text():
+        benchmark_source = benchmark_source.replace(
+            'SchedulingTestConfig.createRoute(context,',
+            'SchedulingTestConfig.createRoute(SchedulingTestConfig.freezeInputs(context),')
+    if 'RequestRoute createRoute(' not in fixture_source.read_text():
+        benchmark_source = benchmark_source.replace(
+            'org.flexlb.balance.scheduler.SchedulingTestConfig.createRoute(', 'RequestRoute.create(')
+    compatible_benchmark = destination / source.name
+    compatible_benchmark.write_text(benchmark_source)
     subprocess.run([str(java / 'javac'), '-proc:none', '-cp', runtime,
-                    '-d', str(destination), str(source), str(verification)], check=True)
+                    '-d', str(destination), str(compatible_benchmark), str(compatible_verification)], check=True)
     verified = subprocess.check_output([str(java / 'java'), '-Xms512m', '-Xmx512m',
                                        '-cp', str(destination) + os.pathsep + runtime,
                                        'ProjectionDifferential', str(formula)], text=True)

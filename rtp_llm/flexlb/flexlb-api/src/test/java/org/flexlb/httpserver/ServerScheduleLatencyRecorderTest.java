@@ -1,13 +1,11 @@
 package org.flexlb.httpserver;
 
-import org.flexlb.dao.BalanceContext;
+import org.flexlb.balance.scheduler.RequestContext;
 import org.flexlb.dao.SchedulingMetadata;
 import org.flexlb.dao.loadbalance.Request;
 import org.junit.jupiter.api.Test;
-
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
-
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -17,9 +15,9 @@ class ServerScheduleLatencyRecorderTest {
     void recordsServerTotalStagesAndRates() {
         ServerScheduleLatencyRecorder recorder = new ServerScheduleLatencyRecorder();
         long end = System.nanoTime();
-        BalanceContext context = new BalanceContext(org.flexlb.mock.TestFlexlbConfigs.create());
+        RequestContext context = new RequestContext(org.flexlb.mock.TestFlexlbConfigs.create());
         context.setGrpcEntryNanos(end - TimeUnit.MILLISECONDS.toNanos(20));
-        context.setServiceStartNanos(end - TimeUnit.MILLISECONDS.toNanos(18));
+        org.springframework.test.util.ReflectionTestUtils.setField(context, "serviceStartNanos", end - TimeUnit.MILLISECONDS.toNanos(18));
         context.setRouteSubmittedNanos(end - TimeUnit.MILLISECONDS.toNanos(15));
         context.setBatchDispatchedNanos(end - TimeUnit.MILLISECONDS.toNanos(10));
         context.setAckAtNanos(end - TimeUnit.MILLISECONDS.toNanos(2));
@@ -43,7 +41,7 @@ class ServerScheduleLatencyRecorderTest {
     void terminalBeforeAckKeepsEndToEndCoverageAndUsesOnlyActualAckSamples() {
         ServerScheduleLatencyRecorder recorder = new ServerScheduleLatencyRecorder();
         long end = System.nanoTime();
-        BalanceContext terminalFirst = contextWithBatchWait(end, 20L, null);
+        RequestContext terminalFirst = contextWithBatchWait(end, 20L, null);
         terminalFirst.setAckAtNanos(0L);
 
         recorder.recordCompletion(terminalFirst, end);
@@ -64,7 +62,7 @@ class ServerScheduleLatencyRecorderTest {
     void routePublicationRecordsEndToEndLatencyWithoutInventingBatchOrAckStages() {
         ServerScheduleLatencyRecorder recorder = new ServerScheduleLatencyRecorder();
         long end = System.nanoTime();
-        BalanceContext route = contextWithBatchWait(end, 5L, null);
+        RequestContext route = contextWithBatchWait(end, 5L, null);
         route.setBatchDispatchedNanos(0L);
         route.setAckAtNanos(0L);
 
@@ -89,9 +87,9 @@ class ServerScheduleLatencyRecorderTest {
         recorder.recordCompletion(contextWithBatchWait(end, 5, metadata(40)), end);
         recorder.recordCompletion(contextWithBatchWait(end, 10, metadata(50)), end);
         // Fallback path: priority carried on the request only (metadata == null)
-        BalanceContext legacy = contextWithBatchWait(end, 20, null);
-        Request request = new Request();
-        request.setPriority(70);
+        RequestContext legacy = contextWithBatchWait(end, 20, null);
+        Request request = Request.builder()
+                .rawPriority(70).build();
         legacy.setRequest(request);
         recorder.recordCompletion(legacy, end);
 
@@ -117,8 +115,8 @@ class ServerScheduleLatencyRecorderTest {
         // Neither scheduling metadata nor request present
         recorder.recordCompletion(contextWithBatchWait(end, 5, null), end);
         // Request present but priority unset (proto3 default 0)
-        BalanceContext unset = contextWithBatchWait(end, 7, null);
-        unset.setRequest(new Request());
+        RequestContext unset = contextWithBatchWait(end, 7, null);
+        unset.setRequest(Request.builder().build());
         recorder.recordCompletion(unset, end);
 
         Map<?, ?> byPriority = (Map<?, ?>) recorder.snapshot().get("batch_wait_ms_by_priority");
@@ -160,13 +158,13 @@ class ServerScheduleLatencyRecorderTest {
         return SchedulingMetadata.explicit(priority, now + 1000);
     }
 
-    private static BalanceContext contextWithBatchWait(
+    private static RequestContext contextWithBatchWait(
             long end,
             long batchWaitMs,
             SchedulingMetadata metadata) {
-        BalanceContext context = new BalanceContext(org.flexlb.mock.TestFlexlbConfigs.create());
+        RequestContext context = new RequestContext(org.flexlb.mock.TestFlexlbConfigs.create());
         context.setGrpcEntryNanos(end - TimeUnit.MILLISECONDS.toNanos(batchWaitMs + 10));
-        context.setServiceStartNanos(end - TimeUnit.MILLISECONDS.toNanos(batchWaitMs + 8));
+        org.springframework.test.util.ReflectionTestUtils.setField(context, "serviceStartNanos", end - TimeUnit.MILLISECONDS.toNanos(batchWaitMs + 8));
         context.setRouteSubmittedNanos(end - TimeUnit.MILLISECONDS.toNanos(batchWaitMs + 5));
         context.setBatchDispatchedNanos(end - TimeUnit.MILLISECONDS.toNanos(5));
         context.setAckAtNanos(end - TimeUnit.MILLISECONDS.toNanos(2));

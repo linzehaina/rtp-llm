@@ -17,6 +17,10 @@ for variant in ('before','after'):
         body=body[:a]+'''        var selected = GroupPlanner.select(items, GroupPlanner.itemAccess(), constraints(size),
                 prefix -> model.predictBatchMs(PrefillBatchFeatures.from(prefix,
                         GroupPlanner.Item::seqLen, GroupPlanner.Item::hitCache)));'''+body[b:]
+    directory = baseline if variant == 'before' else root
+    delivery_source = directory/'flexlb-sync/src/main/java/org/flexlb/balance/scheduler/BatchDeliveryStrategy.java'
+    if 'AdmissionCapacity capacity' not in delivery_source.read_text():
+        body=body.replace(', new org.flexlb.balance.endpoint.DecodeResources.AdmissionCapacity(0L, 90L), 2)', ')')
     (d/'PlanningBench.java').write_text(body)
     runtime=cp.replace(str(root),str(baseline)) if variant=='before' else cp
     (d/'classpath.txt').write_text(runtime)

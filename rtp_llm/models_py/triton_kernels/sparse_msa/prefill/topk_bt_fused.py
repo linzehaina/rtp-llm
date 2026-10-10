@@ -84,6 +84,55 @@ def _sparse_attn_chunk_enabled() -> bool:
     return os.environ.get("M3_SPARSE_ATTN_CHUNK_ENABLE", "1") == "1"
 
 
+def _champion_prefill_enabled() -> bool:
+    """MSAINTEGRATE108 Phase 3: frozen R8-PKG-E champion prefill route.
+
+    Read lazily (per call) so the env can be toggled after import; default
+    off keeps the production dispatch bit-for-bit.
+    """
+    return os.environ.get("MSA_INTEGRATION_CHAMPION", "0") == "1"
+
+
+@lru_cache(maxsize=1)
+def _our_fused_prefill_available() -> bool:
+    """Probe once whether the our_score .so exports the fused entry.
+
+    Only called with M3_OUR_FUSED=1 (the dispatch short-circuits on the flag
+    first, so the default-off path never loads the .so).  Any failure (old
+    .so, missing symbol, load error) logs once and returns False -- the
+    dispatcher then keeps the two-step chain, so a stale binary degrades to
+    the production path instead of raising mid-forward.
+    """
+    try:
+        from rtp_llm.models_py.triton_kernels.sparse_msa.our_score import (
+            our_score_bridge,
+        )
+
+        our_score_bridge.fused_prefill_available()
+        return True
+    except Exception as exc:  # old .so / missing library / load failure
+        logging.warning(
+            "[M3 our_score] fused prefill entry unavailable; keeping the "
+            "two-step path (%s: %s)",
+            type(exc).__name__,
+            exc,
+        )
+        return False
+
+
+def _our_fused_prefill_enabled() -> bool:
+    """M3_OUR_FUSED: fused score+topk prefill route (default off).
+
+    Read lazily (per call); default off keeps the production dispatch
+    bit-for-bit.  When on AND the chunk is native-eligible AND blocks<=1024
+    AND topk==16 AND emit_block_table is False AND the fused ABI is
+    available, the chunk's (score step + topk kernel) collapse into ONE
+    our_score kernel that emits topk_idx directly (no score-tensor round
+    trip).  Everything else keeps the production chain.
+    """
+    return os.environ.get("M3_OUR_FUSED", "0") == "1"
+
+
 def _sparse_attn_chunk_size() -> int:
     raw = os.environ.get(
         "M3_SPARSE_ATTN_CHUNK_SIZE", str(_DEFAULT_SPARSE_ATTN_CHUNK_SIZE)
@@ -1581,6 +1630,31 @@ def flash_prefill_topk_to_block_tables_fp4(
 
         chunk_max_pages = triton.cdiv(chunk.max_seqlen_k, block_size_k)
         score = score_buffer[:, :chunk_q, :chunk_max_pages]
+        # M3_OUR_FUSED: one fused kernel replaces this chunk's score step +
+        # topk kernel (single window only: blocks <= 1024, topk == 16, and
+        # the EMIT_TOPK_IDX-only mode the nvfp4 prefill flow uses).  The flag
+        # is read first so the default-off path never loads the .so; any
+        # other shape keeps the production two-step chain bit-for-bit.
+        fused_topk = (
+            _our_fused_prefill_enabled()
+            and native_workspace is not None
+            and not emit_block_table
+            and chunk_max_pages <= 1024
+            and topk == 16
+            and _our_fused_prefill_available()
+        )
+        if fused_topk:
+            topk_chunk = topk_idx[:, q_start:q_end, :]
+            native_workspace.score_ourscore_fused(
+                chunk_index,
+                q8_chunk,
+                cu_page_offsets,
+                topk_chunk,
+                topk,
+                init_blocks,
+                local_blocks,
+            )
+            continue
         if native_workspace is not None:
             native_workspace.score(chunk_index, q8_chunk, cu_page_offsets, score)
         else:
@@ -1983,6 +2057,21 @@ def _sparse_attn_chunked(
     partial_dtype = p.get("partial_dtype", torch.bfloat16)
 
     meta_key = "_chunk_meta_fp4" if k_scale_128x4 is not None else "_chunk_meta"
+    # MSAINTEGRATE108 Phase 3: the champion route re-chunks at its own stride.
+    # Production's 16k chunking bounds the K1 partial workspace
+    # ([topk, csz, Hq, dim]); the champion chain has no such workspace, so its
+    # default is ONE full-batch launch (bounded by a q8-scratch memory cap,
+    # MSA_INTEGRATION_CHAMPION_CHUNK rows, default 262144 = ~2.1 GiB q8).
+    champion_active = (
+        _champion_prefill_enabled() and k_scale_128x4 is not None
+    )
+    if champion_active:
+        champ_chunk = int(
+            os.environ.get("MSA_INTEGRATION_CHAMPION_CHUNK", "262144")
+        )
+        if total_q <= max(1, champ_chunk):
+            meta_key = "_chunk_meta_fp4_champ"
+            chunk_size = total_q
     meta = None if refresh_page_map else p.get(meta_key)
     if meta is None:
         meta = _build_chunk_meta(
@@ -2032,6 +2121,36 @@ def _sparse_attn_chunked(
             q8_scratch = torch.empty(
                 capacity, num_q_heads, head_dim, dtype=torch.float8_e4m3fn, device=dev
             )
+    # MSAINTEGRATE108 Phase 3: env-gated champion route. Default (env unset)
+    # keeps the production dispatch bit-for-bit; MSA_INTEGRATION_CHAMPION=1
+    # swaps each chunk's CSR+K1+K2 chain for the frozen R8-PKG-E champion
+    # (mark + decode_working_cache + resident12, PDL) over the same native
+    # packed-NVFP4 planes. Geometry the champion does not support falls back
+    # to production.
+    champion_runner = None
+    if _champion_prefill_enabled() and k_scale_128x4 is not None:
+        from rtp_llm.models_py.triton_kernels.sparse_msa.prefill.champion_r8pkge import (
+            make_chunk_runner,
+        )
+
+        champion_runner = make_chunk_runner(
+            q,
+            k_paged_f,
+            v_paged_f,
+            k_scale_128x4,
+            v_scale_128x4,
+            topk,
+            sm_scale,
+            block_size_k,
+        )
+        if champion_runner is not None:
+            logging.info(
+                "[MSA champion] R8-PKG-E prefill route active: total_q=%d "
+                "chunks=%d pages=%d",
+                total_q,
+                len(meta["chunks"]),
+                champion_runner.pages,
+            )
     for c in meta["chunks"]:
         g0, g1 = c["g0"], c["g1"]
         # dim-1 slice of the contiguous [nkv, total_q, topk] is non-contiguous
@@ -2040,6 +2159,9 @@ def _sparse_attn_chunked(
         q_chunk = q[g0:g1]
         if q8_scratch is not None:
             q_chunk = scale1_query_fp8(q_chunk, q8_scratch[: g1 - g0])
+        if champion_runner is not None:
+            champion_runner(q_chunk, topk_chunk, c, out[g0:g1])
+            continue
         run_sparse_attn_chunk(
             q_chunk,
             k_paged_f,

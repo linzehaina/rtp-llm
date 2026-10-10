@@ -158,3 +158,19 @@ py_test(
     tags = ["SM100_X86"],
     exec_properties = {"gpu": "SM100_X86", "gpu_count": "1"},
 )
+
+# MSAINTEGRATE108 Phase-3 gate: frozen R8-PKG-E champion prefill route vs
+# production + fp32 reference on the current dependency stack (default-off
+# integration check; env is set inside the test, never in the BUILD).
+py_test(
+    name = "test_champion_prefill_gate",
+    srcs = ["test_champion_prefill_gate.py"],
+    deps = [
+        "//rtp_llm:fmha-sm100",
+        "//rtp_llm:nvidia-cutlass-dsl",
+        "//rtp_llm/models_py/standalone:py_standalone_testlib",
+    ],
+    env = {"GPU_COUNT": "1"},
+    tags = ["SM100_X86"],
+    exec_properties = {"gpu": "SM100_X86", "gpu_count": "1"},
+)

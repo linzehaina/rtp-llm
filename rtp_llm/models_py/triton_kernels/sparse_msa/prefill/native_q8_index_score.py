@@ -546,6 +546,87 @@ class NativeIndexWorkspace:
         )
         return output
 
+    @torch.no_grad()
+    def score_ourscore_fused(
+        self, index, q8, page_offsets, topk_idx, topk, init_blocks, local_blocks
+    ):
+        """M3_OUR_FUSED route: fused score+topk kernel writes ``topk_idx``.
+
+        Identical prologue to ``score`` (staged check, chunk-geometry check,
+        Q ABI validation, mutable-table refresh via ``_prepare_table``,
+        compact-mode per-chunk staging via ``_stage_compact_index_pages``) so
+        table-epoch/compact/caching semantics are preserved bit-for-bit; then,
+        instead of the fmha score launch + the production topk kernel, the
+        our_score bridge launches the FUSED prefill kernel over ``self.staged``
+        and the workspace's safe page table, emitting ``topk_idx``
+        ([4, chunk_q, topk], -1 padded) directly.  Requires the chunk's block
+        count <= 1024 (single window) and topk == 16; the dispatch layer
+        checks the bound before calling and falls back to the two-step path
+        otherwise.  The bridge is imported lazily so the default
+        M3_OUR_FUSED=0 path never loads the .so.
+        """
+        if not self._staged:
+            raise RuntimeError("stage current layer's index K before score")
+        chunk = self.chunks[index]
+        if _chunk_geometry(chunk) != self._geometry[index]:
+            raise ValueError(
+                "native score producer geometry changed; rebuild workspace"
+            )
+        rows, blocks, _, _ = self._geometry[index]
+        _check_int_vector(
+            page_offsets, len(chunk.host_metadata.seq_lens) + 1, "page_offsets"
+        )
+        if (
+            q8.dtype != torch.float8_e4m3fn
+            or tuple(q8.shape) != (rows, 4, 128)
+            or not q8.is_contiguous()
+        ):
+            raise ValueError("native score Q must be contiguous E4M3 [chunk_q,4,128]")
+        if (
+            topk_idx.dtype != torch.int32
+            or tuple(topk_idx.shape) != (4, rows, int(topk))
+            or topk_idx.stride(2) != 1
+            or topk_idx.stride(1) < int(topk)
+            or topk_idx.stride(0) < rows * topk_idx.stride(1)
+        ):
+            raise ValueError(
+                "fused topk output must be nonoverlapping int32 "
+                "[4,chunk_q,topk] with stride(2)==1"
+            )
+        if int(topk) != 16:
+            raise ValueError("fused topk route requires topk == 16")
+        if blocks > 1024:
+            raise ValueError(
+                "fused topk route requires blocks <= 1024 (single window); "
+                "fall back to the two-step path"
+            )
+        table, safe = chunk.kv_indices, self.safe_tables[index]
+        self._check_device(q8, page_offsets, topk_idx, table)
+        if not self.immutable_tables:
+            self._prepare_table(index)
+        if self.compact:
+            page_list, page_count = (
+                (self.page_lists[index], self.page_counts[index])
+                if self.immutable_tables else (self.page_list, self.page_count)
+            )
+            _stage_compact_index_pages[(page_list.numel(),)](
+                self._packed,
+                self._scales.view(torch.uint8),
+                self.staged,
+                page_list,
+                page_count,
+                self._packed.stride(0),
+                self._scales.stride(0),
+                self.pages,
+                num_warps=4,
+            )
+        from ..our_score.our_score_bridge import run_fused_prefill_topk
+
+        return run_fused_prefill_topk(
+            self, index, q8, page_offsets, topk_idx, topk, init_blocks,
+            local_blocks,
+        )
+
 
 def validate_native_index_cache(packed, scales, pages):
     """Validate page-local MMA ABI without requiring contiguous physical pages."""

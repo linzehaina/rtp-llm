@@ -36,9 +36,18 @@ py_library(
         "sparse_msa/common/*.py",
         "sparse_msa/prefill/*.py",
         "sparse_msa/decode/*.py",
+        "sparse_msa/our_score/*.py",
     ]),
     data = [
         "sparse_msa/decode/libdecode_hybrid_p6res.so",
+        # our_score (M3_OUR_FUSED): the tcgen05 fused score+topk kernel
+        # .so, resolved by the bridge relative to its own module path.
+        "sparse_msa/our_score/lib/libour_score.so",
+        # R8-PKG-E prefill champion (MSA_INTEGRATION_CHAMPION): SHA-pinned
+        # binary + glibc-2.32 remap, resolved by champion_r8pkge.py relative
+        # to its own module path (champion_src/ holds the source + build.sh).
+        "sparse_msa/prefill/champion_src/lib/prefill-r8pkge-c58d6a73.so",
+        "sparse_msa/prefill/champion_src/lib/prefill-r8pkge-c58d6a73-glibc232.so",
     ],
     deps = select({
         "@//:using_cuda": ["//rtp_llm:flashinfer-python"],

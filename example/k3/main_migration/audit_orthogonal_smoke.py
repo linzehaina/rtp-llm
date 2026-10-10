@@ -839,6 +839,15 @@ def main() -> int:
                 read_events(args.decode_log_dir, engine_log=args.decode_engine_log),
                 args.decode_engine_log,
             )
+            from rdma_smoke import audit_protocol_handoff
+
+            verdict["protocol_pd_handoff"] = audit_protocol_handoff(
+                result,
+                read_events(
+                    args.prefill_log_dir, args.prefill_ranks, args.prefill_engine_log
+                ),
+                read_events(args.decode_log_dir, engine_log=args.decode_engine_log),
+            )
         except (AssertionError, ValueError, KeyError) as error:
             verdict["passed"] = False
             verdict["errors"].append(str(error))

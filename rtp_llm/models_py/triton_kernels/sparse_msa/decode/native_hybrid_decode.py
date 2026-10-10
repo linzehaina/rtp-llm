@@ -298,6 +298,7 @@ def native_hybrid_decode_supported(
     mma_scale_layout: bool,
     query_width: int,
     query_cu_seqlens: torch.Tensor | None,
+    block_table: torch.Tensor | None = None,
     output_format: str = "bf16",
 ) -> bool:
     """Static producer-side predicate: geometry, format and library only.
@@ -313,6 +314,15 @@ def native_hybrid_decode_supported(
     if query_cu_seqlens is not None:
         return False
     if not 1 <= query_width <= _MAX_QUERY_WIDTH:
+        return False
+    if block_table is not None and (
+        block_table.dtype != torch.int32
+        or block_table.ndim != 2
+        or block_table.stride(1) != 1
+    ):
+        # Graph reserve tables are zero-copy strided column views; any row
+        # stride is fine (the request view uses as_strided), only element
+        # contiguity within a row is required.
         return False
     rows = int(q.shape[0])
     if not _geometry_supported(q, layout, topk, query_width, rows, rows // query_width):
@@ -384,15 +394,14 @@ def native_hybrid_decode_attention(
     )
 
     # Per-request page table: rows of one request share the table (entry
-    # contract), so slice the first row of each request with a strided view.
-    if query_width == 1:
-        table = block_table
-    else:
-        _require(
-            block_table.stride(0) == max_pages,
-            "grouped block_table must be row-contiguous for the request view",
-        )
-        table = block_table.view(requests, query_width, max_pages)[:, 0, :]
+    # contract), so slice the first row of each request.  Graph reserve
+    # tables are strided column views, hence as_strided (any row stride)
+    # instead of a contiguous view.
+    table_row_stride = block_table.stride(0)
+    table = block_table.as_strided(
+        (requests, max_pages),
+        (query_width * table_row_stride, block_table.stride(1)),
+    )
 
     workspace = _NativeHybridWorkspace.acquire(q8, requests, query_width)
     # Per-request used KV follows the production lens convention
@@ -401,7 +410,11 @@ def native_hybrid_decode_attention(
     if query_width == 1 and seq_lens.is_contiguous():
         used = seq_lens
     else:
-        workspace.used.copy_(seq_lens.view(requests, query_width)[:, query_width - 1])
+        lens_stride = seq_lens.stride(0)
+        lens_2d = seq_lens.as_strided(
+            (requests, query_width), (query_width * lens_stride, lens_stride)
+        )
+        workspace.used.copy_(lens_2d[:, query_width - 1])
         used = workspace.used
 
     k, v = logical.main_k_fp4, logical.main_v_fp4

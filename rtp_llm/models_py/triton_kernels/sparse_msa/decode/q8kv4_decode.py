@@ -188,6 +188,7 @@ _CAKE_WORKSPACES: dict[tuple, object] = {}
 def _native_hybrid_decode_selected(
     q,
     layout,
+    block_table,
     topk,
     mma_scale_layout,
     query_width,
@@ -216,6 +217,7 @@ def _native_hybrid_decode_selected(
             mma_scale_layout,
             query_width,
             query_cu_seqlens,
+            block_table,
             output_format,
         )
     except Exception:
@@ -436,6 +438,7 @@ def _q8kv4_paged_sparse_decode(
     use_native = _native_hybrid_decode_selected(
         q,
         layout,
+        block_table,
         topk,
         mma_scale_layout,
         query_width,

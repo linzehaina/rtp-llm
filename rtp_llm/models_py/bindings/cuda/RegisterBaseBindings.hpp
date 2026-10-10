@@ -17,6 +17,7 @@
 #include "rtp_llm/models_py/bindings/cuda/ReuseKVCacheOp.h"
 #include "rtp_llm/models_py/bindings/cuda/MlaKMergeOp.h"
 #include "rtp_llm/models_py/bindings/cuda/FastTopkOp.h"
+#include "rtp_llm/models_py/bindings/cuda/kernels/minimax_prefill_topk.h"
 #include "rtp_llm/models_py/bindings/cuda/DebugKernelOp.h"
 #include "rtp_llm/models_py/bindings/cuda/UserBuffersOp.h"
 #include "rtp_llm/models_py/bindings/cuda/FakeBalanceExpertOp.h"
@@ -256,6 +257,22 @@ void registerBasicCudaOps(py::module& rtp_ops_m) {
                   py::arg("topk_idx"),
                   py::arg("block_size"),
                   py::arg("topk"));
+
+    rtp_ops_m.def("minimax_prefill_topk",
+                  &minimax_prefill_topk,
+                  "Fused warp TopK for packed MiniMax prefill block scores",
+                  py::arg("scores"),
+                  py::arg("topk_idx"),
+                  py::arg("block_tables"),
+                  py::arg("output_seq_lens"),
+                  py::arg("cu_seqlens"),
+                  py::arg("prefix_lens"),
+                  py::arg("max_query_length"),
+                  py::arg("topk"),
+                  py::arg("init_blocks"),
+                  py::arg("local_blocks"),
+                  py::arg("emit_block_table"),
+                  py::arg("num_pages"));
 
     rtp_ops_m.def("persistent_topk",
                   &persistent_topk,

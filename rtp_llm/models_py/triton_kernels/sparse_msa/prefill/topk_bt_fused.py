@@ -30,6 +30,7 @@ from .score_chunk import (
     m3_index_score_chunk_rows,
     resolve_prefill_score_host_metadata,
 )
+from .warp_topk import try_warp_prefill_topk
 
 # Opt-1+: bypass the fmha_sm100 adapter in step3, preallocating the CSR/schedule/
 # page_table buffers once per forward (reused across all sparse layers) so the
@@ -811,6 +812,89 @@ def _topk_to_block_table_multirow_kernel(
         )
 
 
+_topk_multirow_body = _topk_to_block_table_multirow_kernel.fn
+
+
+@triton.heuristics(_HEUR_topk_to_block_table_kernel)
+@triton.jit
+def _topk_to_block_table_tie_fallback_kernel(
+    s_ptr,
+    bt_ptr,
+    seqlen_ptr,
+    ti_ptr,
+    sample_interval: tl.constexpr,
+    block_size: tl.constexpr,
+    cu_seqlens,
+    cu_seqblocks_q,
+    prefix_lens,
+    topk,
+    init_blocks: tl.constexpr,
+    local_blocks: tl.constexpr,
+    num_pages,
+    stride_s_h,
+    stride_s_n,
+    stride_s_k,
+    stride_bt_r,
+    stride_bt_t,
+    stride_ti_h,
+    stride_ti_n,
+    stride_ti_t,
+    NKV: tl.constexpr,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_T: tl.constexpr,
+    MASK_INIT: tl.constexpr,
+    MASK_LOCAL: tl.constexpr,
+    EMIT_BLOCK_TABLE: tl.constexpr,
+    EMIT_TOPK_IDX: tl.constexpr,
+    TIE_FLAGS,
+    TIE_STRIDE_H: tl.constexpr,
+):
+    batch = tl.program_id(1)
+    head = tl.program_id(2)
+    lo = tl.load(cu_seqlens + batch)
+    length = tl.load(cu_seqlens + batch + 1) - lo
+    query = tl.program_id(0) * BLOCK_Q + tl.arange(0, BLOCK_Q)
+    flags = tl.load(
+        TIE_FLAGS + head.to(tl.int64) * TIE_STRIDE_H + lo + query,
+        mask=query < length,
+        other=0,
+    )
+    # Reuse the exact historical sorting body for the entire tile containing
+    # a tied row. Untied tiles return without reading any score.
+    if tl.sum(flags) != 0:
+        _topk_multirow_body(
+            s_ptr,
+            bt_ptr,
+            seqlen_ptr,
+            ti_ptr,
+            sample_interval,
+            block_size,
+            cu_seqlens,
+            cu_seqblocks_q,
+            prefix_lens,
+            topk,
+            init_blocks,
+            local_blocks,
+            num_pages,
+            stride_s_h,
+            stride_s_n,
+            stride_s_k,
+            stride_bt_r,
+            stride_bt_t,
+            stride_ti_h,
+            stride_ti_n,
+            stride_ti_t,
+            NKV,
+            BLOCK_Q,
+            BLOCK_SIZE_K,
+            BLOCK_SIZE_T,
+            MASK_INIT,
+            MASK_LOCAL,
+            EMIT_BLOCK_TABLE,
+            EMIT_TOPK_IDX,
+        )
+
 def _launch_topk_to_block_table(
     max_seqblock_q: int,
     batch_size: int,
@@ -819,6 +903,22 @@ def _launch_topk_to_block_table(
     *args,
     **kwargs,
 ):
+    tie_flags = try_warp_prefill_topk(
+        max_seqblock_q, num_heads, max_seqblock_k, args, kwargs
+    )
+    if tie_flags is not None:
+        _topk_to_block_table_tie_fallback_kernel[
+            (triton.cdiv(max_seqblock_q, _MULTIROW_BLOCK_Q), batch_size, num_heads)
+        ](
+            *args,
+            **kwargs,
+            BLOCK_Q=_MULTIROW_BLOCK_Q,
+            num_warps=_MULTIROW_NUM_WARPS,
+            num_stages=2,
+            TIE_FLAGS=tie_flags,
+            TIE_STRIDE_H=tie_flags.stride(0),
+        )
+        return
     if max_seqblock_k >= _MULTIROW_MIN_KV_BLOCKS:
         grid = (
             triton.cdiv(max_seqblock_q, _MULTIROW_BLOCK_Q),

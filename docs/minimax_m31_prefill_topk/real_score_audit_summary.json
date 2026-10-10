@@ -1,0 +1,43 @@
+{
+  "ranks": [
+    {
+      "file": "rankpid47113.jsonl",
+      "calls": 180,
+      "rows": 8947200,
+      "ordered_diff_rows": 0,
+      "set_diff_rows": 0,
+      "selected_score_diff_rows": 0
+    },
+    {
+      "file": "rankpid47114.jsonl",
+      "calls": 180,
+      "rows": 8947200,
+      "ordered_diff_rows": 0,
+      "set_diff_rows": 0,
+      "selected_score_diff_rows": 0
+    },
+    {
+      "file": "rankpid47116.jsonl",
+      "calls": 180,
+      "rows": 8947200,
+      "ordered_diff_rows": 0,
+      "set_diff_rows": 0,
+      "selected_score_diff_rows": 0
+    },
+    {
+      "file": "rankpid47117.jsonl",
+      "calls": 180,
+      "rows": 8947200,
+      "ordered_diff_rows": 0,
+      "set_diff_rows": 0,
+      "selected_score_diff_rows": 0
+    }
+  ],
+  "calls": 720,
+  "rows": 35788800,
+  "ordered_diff_rows": 0,
+  "set_diff_rows": 0,
+  "selected_score_diff_rows": 0,
+  "implementation": "Final native warp selection plus GPU-conditional original bitonic body",
+  "scope": "One actual BS20 forward, four ranks, 60 layers x three chunks; audit excluded from timing"
+}

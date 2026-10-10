@@ -1,0 +1,47 @@
+{
+  "gpu_test_methods": 10,
+  "gpu_positive_subcases": 1670,
+  "gpu_invalid_host_argument_cases": 15,
+  "gpu_skipped": 0,
+  "cpu_test_methods": 6,
+  "gpu_status": "passed",
+  "cpu_status": "passed",
+  "compiler": "CUDA13.2/GCC12 C++17/sm_103; ftz=true (Bazel default)",
+  "gpu_host": "azk114",
+  "gpu_physical_ids": [
+    4
+  ],
+  "memcheck": {
+    "methods": 7,
+    "positive_subcases": 160,
+    "errors": 0
+  },
+  "synccheck": {
+    "methods": 6,
+    "positive_subcases": 152,
+    "errors": 0
+  },
+  "native_test_mode": "Focused CUDAExtension using identical production CUDA translation unit; frozen native libraries unchanged",
+  "whole_bazel_build": "not executed: rules_python dependency fetch blocked by container SSH host-key verification",
+  "capacity_templates": [
+    32,
+    128,
+    256,
+    384,
+    512,
+    640,
+    768,
+    1024
+  ],
+  "dispatch_default": "warp for H=4, K=16, 512<=N<=1024, Q>=1024, indices-only; otherwise historical path",
+  "real_model_score_audit": {
+    "calls": 720,
+    "rows": 35788800,
+    "ordered_diff_rows": 0,
+    "set_diff_rows": 0,
+    "selected_score_diff_rows": 0
+  },
+  "corresponding_first_token_requests": 140,
+  "corresponding_first_token_mismatches": 0,
+  "additional_compatibility_tests": "40 flags + 32 legacy TI/BT/SL + 16 dynamic Graph + 10 nonfinite/sentinel subcases"
+}

@@ -1,0 +1,180 @@
+{
+  "baseline": {
+    "gpu__time_duration.sum": {
+      "value": "511.424000",
+      "unit": "us"
+    },
+    "launch__registers_per_thread": {
+      "value": "96",
+      "unit": "register/thread"
+    },
+    "launch__shared_mem_per_block_dynamic": {
+      "value": "1.024000",
+      "unit": "Kbyte/block"
+    },
+    "launch__shared_mem_per_block_static": {
+      "value": "0",
+      "unit": "byte/block"
+    },
+    "launch__shared_mem_per_block_driver": {
+      "value": "1.024000",
+      "unit": "Kbyte/block"
+    },
+    "launch__occupancy_limit_registers": {
+      "value": "5.000000",
+      "unit": "block"
+    },
+    "sm__warps_active.avg.pct_of_peak_sustained_active": {
+      "value": "29.504131",
+      "unit": "%"
+    },
+    "smsp__inst_executed.sum": {
+      "value": "429026768.000000",
+      "unit": "inst"
+    },
+    "smsp__sass_inst_executed_op_shared_ld.sum": {
+      "value": "32768.000000",
+      "unit": "inst"
+    },
+    "smsp__sass_inst_executed_op_shared_st.sum": {
+      "value": "66368.000000",
+      "unit": "inst"
+    },
+    "dram__bytes_read.sum": {
+      "value": "150.600960",
+      "unit": "Mbyte"
+    },
+    "dram__bytes_write.sum": {
+      "value": "5.111040",
+      "unit": "Mbyte"
+    },
+    "smsp__average_warps_issue_stalled_barrier_per_issue_active.ratio": {
+      "value": "0.167216",
+      "unit": "inst"
+    },
+    "smsp__average_warps_issue_stalled_short_scoreboard_per_issue_active.ratio": {
+      "value": "0.196025",
+      "unit": "inst"
+    }
+  },
+  "baseline_kernel": "_topk_to_block_table_multirow_kernel",
+  "warp": {
+    "gpu__time_duration.sum": {
+      "value": "253.536000",
+      "unit": "us"
+    },
+    "launch__registers_per_thread": {
+      "value": "64",
+      "unit": "register/thread"
+    },
+    "launch__shared_mem_per_block_dynamic": {
+      "value": "0.000000",
+      "unit": "Kbyte/block"
+    },
+    "launch__shared_mem_per_block_static": {
+      "value": "0",
+      "unit": "byte/block"
+    },
+    "launch__shared_mem_per_block_driver": {
+      "value": "1.024000",
+      "unit": "Kbyte/block"
+    },
+    "launch__occupancy_limit_registers": {
+      "value": "8.000000",
+      "unit": "block"
+    },
+    "sm__warps_active.avg.pct_of_peak_sustained_active": {
+      "value": "47.884854",
+      "unit": "%"
+    },
+    "smsp__inst_executed.sum": {
+      "value": "168490215.000000",
+      "unit": "inst"
+    },
+    "smsp__sass_inst_executed_op_shared_ld.sum": {
+      "value": "0.000000",
+      "unit": "inst"
+    },
+    "smsp__sass_inst_executed_op_shared_st.sum": {
+      "value": "0.000000",
+      "unit": "inst"
+    },
+    "dram__bytes_read.sum": {
+      "value": "150.548992",
+      "unit": "Mbyte"
+    },
+    "dram__bytes_write.sum": {
+      "value": "5.769216",
+      "unit": "Mbyte"
+    },
+    "smsp__average_warps_issue_stalled_barrier_per_issue_active.ratio": {
+      "value": "0.000000",
+      "unit": "inst"
+    },
+    "smsp__average_warps_issue_stalled_short_scoreboard_per_issue_active.ratio": {
+      "value": "0.045064",
+      "unit": "inst"
+    }
+  },
+  "warp_kernel": "void torch_ext::<unnamed>::minimax_prefill_warp_topk_kernel<640, 16, 0>(const float *, int *, int *, int *, int *, const int *, const int *, long, long, long, long, long, long, long, int, int, int, int, int, int)",
+  "warp_tie_fallback": {
+    "gpu__time_duration.sum": {
+      "value": "58.464000",
+      "unit": "us"
+    },
+    "launch__registers_per_thread": {
+      "value": "96",
+      "unit": "register/thread"
+    },
+    "launch__shared_mem_per_block_dynamic": {
+      "value": "1.024000",
+      "unit": "Kbyte/block"
+    },
+    "launch__shared_mem_per_block_static": {
+      "value": "0",
+      "unit": "byte/block"
+    },
+    "launch__shared_mem_per_block_driver": {
+      "value": "1.024000",
+      "unit": "Kbyte/block"
+    },
+    "launch__occupancy_limit_registers": {
+      "value": "5.000000",
+      "unit": "block"
+    },
+    "sm__warps_active.avg.pct_of_peak_sustained_active": {
+      "value": "23.223261",
+      "unit": "%"
+    },
+    "smsp__inst_executed.sum": {
+      "value": "797080.000000",
+      "unit": "inst"
+    },
+    "smsp__sass_inst_executed_op_shared_ld.sum": {
+      "value": "8.000000",
+      "unit": "inst"
+    },
+    "smsp__sass_inst_executed_op_shared_st.sum": {
+      "value": "16.000000",
+      "unit": "inst"
+    },
+    "dram__bytes_read.sum": {
+      "value": "0.364544",
+      "unit": "Mbyte"
+    },
+    "dram__bytes_write.sum": {
+      "value": "0.000000",
+      "unit": "Mbyte"
+    },
+    "smsp__average_warps_issue_stalled_barrier_per_issue_active.ratio": {
+      "value": "0.024980",
+      "unit": "inst"
+    },
+    "smsp__average_warps_issue_stalled_short_scoreboard_per_issue_active.ratio": {
+      "value": "3.943259",
+      "unit": "inst"
+    }
+  },
+  "warp_tie_fallback_kernel": "_topk_to_block_table_tie_fallback_kernel",
+  "warp_operator_gpu_time_sum_us": 312.0
+}

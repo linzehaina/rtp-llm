@@ -1,0 +1,338 @@
+{
+  "baseline_compat": [
+    {
+      "rank": 0,
+      "calls": 360,
+      "profiled_forwards": 2,
+      "topk_ms_per_forward": 71.3021155,
+      "native_ms_per_forward": 0.0,
+      "tie_fallback_ms_per_forward": 0.0,
+      "grids": [
+        {
+          "grid": "baseline:[59, 18, 4]",
+          "count": 120,
+          "median_us": 515.1225,
+          "min_us": 510.019,
+          "max_us": 545.828
+        },
+        {
+          "grid": "baseline:[59, 19, 4]",
+          "count": 120,
+          "median_us": 514.787,
+          "min_us": 511.107,
+          "max_us": 542.532
+        },
+        {
+          "grid": "baseline:[59, 5, 4]",
+          "count": 120,
+          "median_us": 155.0085,
+          "min_us": 153.761,
+          "max_us": 165.441
+        }
+      ]
+    },
+    {
+      "rank": 1,
+      "calls": 360,
+      "profiled_forwards": 2,
+      "topk_ms_per_forward": 70.64955,
+      "native_ms_per_forward": 0.0,
+      "tie_fallback_ms_per_forward": 0.0,
+      "grids": [
+        {
+          "grid": "baseline:[59, 18, 4]",
+          "count": 120,
+          "median_us": 511.65,
+          "min_us": 507.553,
+          "max_us": 524.258
+        },
+        {
+          "grid": "baseline:[59, 19, 4]",
+          "count": 120,
+          "median_us": 513.506,
+          "min_us": 509.602,
+          "max_us": 524.738
+        },
+        {
+          "grid": "baseline:[59, 5, 4]",
+          "count": 120,
+          "median_us": 151.6165,
+          "min_us": 150.4,
+          "max_us": 155.712
+        }
+      ]
+    },
+    {
+      "rank": 2,
+      "calls": 360,
+      "profiled_forwards": 2,
+      "topk_ms_per_forward": 70.4944145,
+      "native_ms_per_forward": 0.0,
+      "tie_fallback_ms_per_forward": 0.0,
+      "grids": [
+        {
+          "grid": "baseline:[59, 18, 4]",
+          "count": 120,
+          "median_us": 510.48350000000005,
+          "min_us": 504.227,
+          "max_us": 519.749
+        },
+        {
+          "grid": "baseline:[59, 19, 4]",
+          "count": 120,
+          "median_us": 512.1800000000001,
+          "min_us": 508.164,
+          "max_us": 523.524
+        },
+        {
+          "grid": "baseline:[59, 5, 4]",
+          "count": 120,
+          "median_us": 151.425,
+          "min_us": 150.081,
+          "max_us": 155.713
+        }
+      ]
+    },
+    {
+      "rank": 3,
+      "calls": 360,
+      "profiled_forwards": 2,
+      "topk_ms_per_forward": 71.75607249999999,
+      "native_ms_per_forward": 0.0,
+      "tie_fallback_ms_per_forward": 0.0,
+      "grids": [
+        {
+          "grid": "baseline:[59, 18, 4]",
+          "count": 120,
+          "median_us": 520.772,
+          "min_us": 516.228,
+          "max_us": 537.54
+        },
+        {
+          "grid": "baseline:[59, 19, 4]",
+          "count": 120,
+          "median_us": 522.0515,
+          "min_us": 518.756,
+          "max_us": 537.732
+        },
+        {
+          "grid": "baseline:[59, 5, 4]",
+          "count": 120,
+          "median_us": 152.097,
+          "min_us": 151.233,
+          "max_us": 156.257
+        }
+      ]
+    }
+  ],
+  "warp_compat": [
+    {
+      "rank": 0,
+      "calls": 720,
+      "profiled_forwards": 2,
+      "topk_ms_per_forward": 45.499404999999996,
+      "native_ms_per_forward": 34.4174415,
+      "tie_fallback_ms_per_forward": 11.0819635,
+      "grids": [
+        {
+          "grid": "warp:[233, 18, 4]",
+          "count": 120,
+          "median_us": 250.514,
+          "min_us": 250.241,
+          "max_us": 262.914
+        },
+        {
+          "grid": "warp:[233, 19, 4]",
+          "count": 120,
+          "median_us": 250.594,
+          "min_us": 250.337,
+          "max_us": 263.202
+        },
+        {
+          "grid": "warp:[233, 5, 4]",
+          "count": 120,
+          "median_us": 71.456,
+          "min_us": 71.232,
+          "max_us": 75.041
+        },
+        {
+          "grid": "legacy_tie:[59, 5, 4]",
+          "count": 120,
+          "median_us": 50.816,
+          "min_us": 39.52,
+          "max_us": 63.904
+        },
+        {
+          "grid": "legacy_tie:[59, 18, 4]",
+          "count": 120,
+          "median_us": 64.8965,
+          "min_us": 59.328,
+          "max_us": 95.329
+        },
+        {
+          "grid": "legacy_tie:[59, 19, 4]",
+          "count": 120,
+          "median_us": 65.28049999999999,
+          "min_us": 58.401,
+          "max_us": 102.497
+        }
+      ]
+    },
+    {
+      "rank": 1,
+      "calls": 720,
+      "profiled_forwards": 2,
+      "topk_ms_per_forward": 45.288052,
+      "native_ms_per_forward": 34.401199999999996,
+      "tie_fallback_ms_per_forward": 10.886852000000001,
+      "grids": [
+        {
+          "grid": "warp:[233, 18, 4]",
+          "count": 120,
+          "median_us": 250.625,
+          "min_us": 250.209,
+          "max_us": 257.889
+        },
+        {
+          "grid": "warp:[233, 19, 4]",
+          "count": 120,
+          "median_us": 250.673,
+          "min_us": 250.305,
+          "max_us": 257.889
+        },
+        {
+          "grid": "warp:[233, 5, 4]",
+          "count": 120,
+          "median_us": 71.265,
+          "min_us": 71.104,
+          "max_us": 73.473
+        },
+        {
+          "grid": "legacy_tie:[59, 18, 4]",
+          "count": 120,
+          "median_us": 63.9525,
+          "min_us": 58.079,
+          "max_us": 98.273
+        },
+        {
+          "grid": "legacy_tie:[59, 19, 4]",
+          "count": 120,
+          "median_us": 64.288,
+          "min_us": 57.344,
+          "max_us": 83.393
+        },
+        {
+          "grid": "legacy_tie:[59, 5, 4]",
+          "count": 120,
+          "median_us": 49.296499999999995,
+          "min_us": 43.937,
+          "max_us": 73.152
+        }
+      ]
+    },
+    {
+      "rank": 2,
+      "calls": 720,
+      "profiled_forwards": 2,
+      "topk_ms_per_forward": 45.3580245,
+      "native_ms_per_forward": 34.5095695,
+      "tie_fallback_ms_per_forward": 10.848455,
+      "grids": [
+        {
+          "grid": "warp:[233, 18, 4]",
+          "count": 120,
+          "median_us": 250.99349999999998,
+          "min_us": 250.145,
+          "max_us": 274.594
+        },
+        {
+          "grid": "warp:[233, 19, 4]",
+          "count": 120,
+          "median_us": 251.074,
+          "min_us": 250.338,
+          "max_us": 274.498
+        },
+        {
+          "grid": "warp:[233, 5, 4]",
+          "count": 120,
+          "median_us": 71.3925,
+          "min_us": 71.264,
+          "max_us": 78.272
+        },
+        {
+          "grid": "legacy_tie:[59, 18, 4]",
+          "count": 120,
+          "median_us": 63.9045,
+          "min_us": 55.393,
+          "max_us": 97.633
+        },
+        {
+          "grid": "legacy_tie:[59, 19, 4]",
+          "count": 120,
+          "median_us": 63.9845,
+          "min_us": 57.889,
+          "max_us": 101.185
+        },
+        {
+          "grid": "legacy_tie:[59, 5, 4]",
+          "count": 120,
+          "median_us": 49.599999999999994,
+          "min_us": 42.785,
+          "max_us": 64.929
+        }
+      ]
+    },
+    {
+      "rank": 3,
+      "calls": 720,
+      "profiled_forwards": 2,
+      "topk_ms_per_forward": 45.4309775,
+      "native_ms_per_forward": 34.4474055,
+      "tie_fallback_ms_per_forward": 10.983572,
+      "grids": [
+        {
+          "grid": "warp:[233, 18, 4]",
+          "count": 120,
+          "median_us": 250.833,
+          "min_us": 250.242,
+          "max_us": 263.202
+        },
+        {
+          "grid": "warp:[233, 19, 4]",
+          "count": 120,
+          "median_us": 250.786,
+          "min_us": 250.37,
+          "max_us": 263.074
+        },
+        {
+          "grid": "warp:[233, 5, 4]",
+          "count": 120,
+          "median_us": 71.4085,
+          "min_us": 71.264,
+          "max_us": 75.072
+        },
+        {
+          "grid": "legacy_tie:[59, 18, 4]",
+          "count": 120,
+          "median_us": 65.568,
+          "min_us": 58.272,
+          "max_us": 86.144
+        },
+        {
+          "grid": "legacy_tie:[59, 19, 4]",
+          "count": 120,
+          "median_us": 64.8,
+          "min_us": 58.657,
+          "max_us": 85.729
+        },
+        {
+          "grid": "legacy_tie:[59, 5, 4]",
+          "count": 120,
+          "median_us": 49.792,
+          "min_us": 43.809,
+          "max_us": 64.352
+        }
+      ]
+    }
+  ]
+}

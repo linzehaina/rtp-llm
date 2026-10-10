@@ -54,6 +54,24 @@ py_test(
     exec_properties = {"gpu": "H20", "gpu_count": "1"},
 )
 
+py_test(
+    name = "test_minimax_prefill_topk",
+    srcs = ["test_minimax_prefill_topk.py"],
+    data = ["//rtp_llm/models_py/triton_kernels:sparse_msa"],
+    deps = ["//rtp_llm/models_py/standalone:py_standalone_testlib"],
+    env = {"GPU_COUNT": "1"},
+    tags = ["SM100_X86"],
+    exec_properties = {"gpu": "SM100_X86", "gpu_count": "1"},
+)
+
+py_test(
+    name = "test_prefill_warp_dispatch",
+    srcs = ["test_prefill_warp_dispatch.py"],
+    data = ["//rtp_llm/models_py/triton_kernels:sparse_msa"],
+    deps = ["//rtp_llm:torch"],
+    env = {"CUDA_VISIBLE_DEVICES": ""},
+)
+
 # Chunked (M3_SPARSE_ATTN_CHUNK_ENABLE) vs non-chunked sparse attention
 # precision regression test. Runs on SM100 (fmha_sm100 cute-DSL backend).
 py_test(

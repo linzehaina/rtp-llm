@@ -138,6 +138,18 @@ cc_library(
     visibility = ["//visibility:public"],
 )
 
+cc_library(
+    name = "minimax_prefill_topk",
+    srcs = ["minimax_prefill_topk.cu"],
+    hdrs = ["minimax_prefill_topk.h"],
+    deps = [
+        "//rtp_llm/models_py/bindings/cuda:cuda_host_utils",
+        ":cuda_utils_common",
+    ] + torch_deps(),
+    copts = cuda_copts(),
+    visibility = ["//visibility:public"],
+)
+
 
 cc_library(
     name = "persistent_topk",

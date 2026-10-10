@@ -1,0 +1,22 @@
+{
+  "points": 107,
+  "eligible_points": 17,
+  "all_eligible_faster": true,
+  "minimum_eligible_speedup": 1.1149574173282364,
+  "minimum_case": {
+    "case": "n768_t4096_k16",
+    "H": 4,
+    "Q": 4096,
+    "N": 768,
+    "K": 16,
+    "warp_eligible": true,
+    "baseline_kernel_us": 123.52,
+    "warp_kernel_us": 110.7845,
+    "speedup": 1.1149574173282364,
+    "baseline_event_us": 128.00000607967377,
+    "warp_event_us": 115.74400216341019,
+    "event_speedup": 1.1058888900261135
+  },
+  "target_sum_baseline_us": 1193.51,
+  "target_sum_warp_us": 689.796
+}

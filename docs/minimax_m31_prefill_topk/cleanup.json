@@ -1,0 +1,130 @@
+{
+  "host": "e01-cn-v8n4s5sfd01",
+  "containers": [
+    {
+      "name": "azk_m31_warp_20261010_model",
+      "id": "31be81269b02643f81a14f7b2ffcfd4c23fc9e1a3368a01b0277c281d1d0de1c",
+      "state_before": {
+        "Status": "running",
+        "Running": true,
+        "Paused": false,
+        "Restarting": false,
+        "OOMKilled": false,
+        "Dead": false,
+        "Pid": 1914165,
+        "ExitCode": 0,
+        "Error": "",
+        "StartedAt": "2026-10-10T03:29:49.967635167Z",
+        "FinishedAt": "0001-01-01T00:00:00Z"
+      },
+      "owned_top_before": "PID                 PPID                PGID                COMMAND\n1914165             1914082             1914165             sleep infinity\n2197070             1914165             2197070             bazel(m31-warp-integration) --add-opens=java.base/java.lang=ALL-UNNAMED -Xverify:none -Djava.util.logging.config.file=/data4/aozhengkai.azk/m31_warp_20261010/cache/bazel/f7a0ec67f0ab015b34f046e88a7935fa/javalog.properties -Dcom.google.devtools.build.lib.util.LogHandlerQuerier.class=com.google.devtools.build.lib.util.SimpleLogHandler$HandlerQuerier -XX:-MaxFDLimit -Djava.library.path=/data4/aozhengkai.azk/m31_warp_20261010/cache/bazel/install/117cee491f5c7d83be6e3c6d6b5b8ca4/embedded_tools/jdk/lib/jli:/data4/aozhengkai.azk/m31_warp_20261010/cache/bazel/install/117cee491f5c7d83be6e3c6d6b5b8ca4/embedded_tools/jdk/lib:/data4/aozhengkai.azk/m31_warp_20261010/cache/bazel/install/117cee491f5c7d83be6e3c6d6b5b8ca4/embedded_tools/jdk/lib/server:/data4/aozhengkai.azk/m31_warp_20261010/cache/bazel/install/117cee491f5c7d83be6e3c6d6b5b8ca4/ -Dfile.encoding=ISO-8859-1 -Duser.country= -Duser.language= -Duser.variant= -jar /data4/aozhengkai.azk/m31_warp_20261010/cache/bazel/install/117cee491f5c7d83be6e3c6d6b5b8ca4/A-server.jar --max_idle_secs=10800 --noshutdown_on_low_sys_mem --connect_timeout_secs=30 --output_user_root=/data4/aozhengkai.azk/m31_warp_20261010/cache/bazel --install_base=/data4/aozhengkai.azk/m31_warp_20261010/cache/bazel/install/117cee491f5c7d83be6e3c6d6b5b8ca4 --install_md5=117cee491f5c7d83be6e3c6d6b5b8ca4 --output_base=/data4/aozhengkai.azk/m31_warp_20261010/cache/bazel/f7a0ec67f0ab015b34f046e88a7935fa --workspace_directory=/data0/aozhengkai.azk/Documents/Codex/2026-10-09/rtp-llm-m31-m3-timeline-bs20/work/m31-warp-integration --default_system_javabase= --failure_detail_out=/data4/aozhengkai.azk/m31_warp_20261010/cache/bazel/f7a0ec67f0ab015b34f046e88a7935fa/failure_detail.rawproto --expand_configs_in_place --idle_server_tasks --write_command_log --nowatchfs --nofatal_event_bus_exceptions --nowindows_enable_symlinks --client_debug=false --product_name=Bazel --option_sources=output_Uuser_Uroot:\n3231238             1914165             2342983             /opt/conda310/bin/python3 -c from multiprocessing.spawn import spawn_main; spawn_main(tracker_fd=47, pipe_handle=145) --multiprocessing-fork\n345805              1914165             57991               /opt/conda310/bin/python3 -c from multiprocessing.spawn import spawn_main; spawn_main(tracker_fd=47, pipe_handle=145) --multiprocessing-fork\n2430616             1914165             1558807             /opt/conda310/bin/python3 -c from multiprocessing.spawn import spawn_main; spawn_main(tracker_fd=47, pipe_handle=172) --multiprocessing-fork\n2707553             1914165             2451165             /opt/conda310/bin/python3 -c from multiprocessing.spawn import spawn_main; spawn_main(tracker_fd=47, pipe_handle=144) --multiprocessing-fork\n",
+      "pids": [
+        1914165,
+        2197070,
+        3231238,
+        345805,
+        2430616,
+        2707553
+      ],
+      "state_after": {
+        "Status": "exited",
+        "Running": false,
+        "Paused": false,
+        "Restarting": false,
+        "OOMKilled": false,
+        "Dead": false,
+        "Pid": 0,
+        "ExitCode": 137,
+        "Error": "",
+        "StartedAt": "2026-10-10T03:29:49.967635167Z",
+        "FinishedAt": "2026-10-10T05:33:54.717255629Z"
+      }
+    },
+    {
+      "name": "azk_m31_warp_20261010_operator",
+      "id": "6e36cd7beaca87fc2bbd50869bb6fbaffd8087cfb51693cc91549ffb67bdbc30",
+      "state_before": {
+        "Status": "running",
+        "Running": true,
+        "Paused": false,
+        "Restarting": false,
+        "OOMKilled": false,
+        "Dead": false,
+        "Pid": 1162683,
+        "ExitCode": 0,
+        "Error": "",
+        "StartedAt": "2026-10-10T04:47:31.21278336Z",
+        "FinishedAt": "2026-10-10T04:31:18.269389621Z"
+      },
+      "owned_top_before": "PID                 PPID                PGID                COMMAND\n1162683             1162589             1162683             sleep infinity\n",
+      "pids": [
+        1162683
+      ],
+      "state_after": {
+        "Status": "exited",
+        "Running": false,
+        "Paused": false,
+        "Restarting": false,
+        "OOMKilled": false,
+        "Dead": false,
+        "Pid": 0,
+        "ExitCode": 137,
+        "Error": "",
+        "StartedAt": "2026-10-10T04:47:31.21278336Z",
+        "FinishedAt": "2026-10-10T05:34:19.864536131Z"
+      }
+    }
+  ],
+  "samples": [
+    {
+      "utc": 1791610460.1254897,
+      "elapsed_s": 0.17351019894704223,
+      "live_owned_pids": [],
+      "owned_gpu_allocations": [],
+      "task_port_listeners": [],
+      "gpu_memory_mib": "0, 4\n1, 4\n2, 4\n3, 4\n4, 116\n5, 4\n6, 4\n7, 4\n"
+    },
+    {
+      "utc": 1791610461.1184502,
+      "elapsed_s": 1.1664702639682218,
+      "live_owned_pids": [],
+      "owned_gpu_allocations": [],
+      "task_port_listeners": [],
+      "gpu_memory_mib": "0, 4\n1, 4\n2, 4\n3, 4\n4, 116\n5, 4\n6, 4\n7, 4\n"
+    },
+    {
+      "utc": 1791610462.2034717,
+      "elapsed_s": 2.2514916509389877,
+      "live_owned_pids": [],
+      "owned_gpu_allocations": [],
+      "task_port_listeners": [],
+      "gpu_memory_mib": "0, 4\n1, 4\n2, 4\n3, 4\n4, 116\n5, 4\n6, 4\n7, 4\n"
+    },
+    {
+      "utc": 1791610463.113805,
+      "elapsed_s": 3.1618259489769116,
+      "live_owned_pids": [],
+      "owned_gpu_allocations": [],
+      "task_port_listeners": [],
+      "gpu_memory_mib": "0, 4\n1, 4\n2, 4\n3, 4\n4, 116\n5, 4\n6, 4\n7, 4\n"
+    },
+    {
+      "utc": 1791610464.117294,
+      "elapsed_s": 4.165314955986105,
+      "live_owned_pids": [],
+      "owned_gpu_allocations": [],
+      "task_port_listeners": [],
+      "gpu_memory_mib": "0, 4\n1, 4\n2, 4\n3, 4\n4, 116\n5, 4\n6, 4\n7, 4\n"
+    },
+    {
+      "utc": 1791610465.119057,
+      "elapsed_s": 5.167077513993718,
+      "live_owned_pids": [],
+      "owned_gpu_allocations": [],
+      "task_port_listeners": [],
+      "gpu_memory_mib": "0, 4\n1, 4\n2, 4\n3, 4\n4, 116\n5, 4\n6, 4\n7, 4\n"
+    }
+  ],
+  "all_task_services_stopped": true,
+  "preserved_assets": "/data4/aozhengkai.azk/m31_warp_20261010; weights, caches, logs preserved"
+}

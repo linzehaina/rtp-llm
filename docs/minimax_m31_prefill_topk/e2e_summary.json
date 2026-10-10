@@ -1,0 +1,128 @@
+{
+  "baseline": {
+    "arm": "baseline_compat",
+    "phase": "formal_steady",
+    "rounds": 6,
+    "warm_requests": 120,
+    "model_forward_ms": [
+      1629.577,
+      1636.042,
+      1635.988,
+      1635.988,
+      1636.222,
+      1633.141
+    ],
+    "model_forward_mean_ms": 1634.493,
+    "model_forward_std_ms": 2.677829419511251,
+    "rpc_ttft_round_median_ms": [
+      1661.5034830174409,
+      1659.7321630106308,
+      1658.9563800371252,
+      1657.7150885132141,
+      1660.5274945031852,
+      1655.8100355323404
+    ],
+    "rpc_ttft_mean_ms": 1659.0407741023228,
+    "server_prefill_round_mean_ms": [
+      1634.7774,
+      1641.24865,
+      1640.82725,
+      1640.3517,
+      1641.2215,
+      1638.11435
+    ],
+    "server_prefill_mean_ms": 1639.423475
+  },
+  "warp": {
+    "arm": "warp_compat",
+    "phase": "formal_steady",
+    "rounds": 6,
+    "warm_requests": 120,
+    "model_forward_ms": [
+      1612.344,
+      1605.307,
+      1607.187,
+      1607.586,
+      1616.779,
+      1610.63
+    ],
+    "model_forward_mean_ms": 1609.9721666666667,
+    "model_forward_std_ms": 4.185834273674342,
+    "rpc_ttft_round_median_ms": [
+      1637.3331735376269,
+      1635.5809234664775,
+      1628.5139869432896,
+      1628.770343028009,
+      1639.6775670000352,
+      1633.005881565623
+    ],
+    "rpc_ttft_mean_ms": 1633.8136459235102,
+    "server_prefill_round_mean_ms": [
+      1618.0564,
+      1610.79905,
+      1611.12545,
+      1611.5408,
+      1621.03045,
+      1614.3488
+    ],
+    "server_prefill_mean_ms": 1614.4834916666666
+  },
+  "forward_saved_ms": 24.520833333333258,
+  "forward_reduction_pct": 1.5002103608478752,
+  "forward_speedup": 1.0152305945661793,
+  "server_prefill_saved_ms": 24.93998333333343,
+  "rpc_ttft_saved_ms": 25.227128178812563,
+  "canonical_comparisons": [
+    {
+      "phase": "cold",
+      "requests": 20,
+      "identical_canonical_requests": true,
+      "identical_token_inputs": true,
+      "output_token_mismatches": 0
+    },
+    {
+      "phase": "warm1",
+      "requests": 20,
+      "identical_canonical_requests": true,
+      "identical_token_inputs": true,
+      "output_token_mismatches": 0
+    },
+    {
+      "phase": "warm2",
+      "requests": 20,
+      "identical_canonical_requests": true,
+      "identical_token_inputs": true,
+      "output_token_mismatches": 0
+    },
+    {
+      "phase": "warm3",
+      "requests": 20,
+      "identical_canonical_requests": true,
+      "identical_token_inputs": true,
+      "output_token_mismatches": 0
+    },
+    {
+      "phase": "warm4",
+      "requests": 20,
+      "identical_canonical_requests": true,
+      "identical_token_inputs": true,
+      "output_token_mismatches": 0
+    },
+    {
+      "phase": "warm5",
+      "requests": 20,
+      "identical_canonical_requests": true,
+      "identical_token_inputs": true,
+      "output_token_mismatches": 0
+    },
+    {
+      "phase": "warm6",
+      "requests": 20,
+      "identical_canonical_requests": true,
+      "identical_token_inputs": true,
+      "output_token_mismatches": 0
+    }
+  ],
+  "rank2_profile_topk_saved_ms": 25.136390000000006,
+  "scope": "Pure Prefill CP4/TP4/EP4, synthetic inputs, output1, no PD transfer, no decode generation"
+}

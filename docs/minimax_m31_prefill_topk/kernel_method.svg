@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="770" viewBox="0 0 1100 770">
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8" fill="#53677b"/></marker></defs>
+<style>text{font-family:Arial,"Noto Sans CJK SC","Microsoft YaHei",sans-serif;fill:#163047;font-size:17px}.title{font-size:26px;font-weight:700}.head{font-size:20px;font-weight:700}.small{font-size:15px}.box{fill:#eef4f8;stroke:#bdcddb;rx:12}.new{fill:#e7f7fa;stroke:#0891b2;rx:12}.tie{fill:#fff6d9;stroke:#d8a511;rx:12}.line{fill:none;stroke:#53677b;stroke-width:2;marker-end:url(#arrow)}</style>
+<rect width="1100" height="770" fill="white"/>
+<text x="35" y="40" class="title">M3.1 TopK：warp 选择 + GPU 条件回退，保持历史 block ID</text>
+<text x="35" y="72">FP32 [4,Q,579] → INT32 [4,Q,16]；Q 为 packed token 行，batch 由 cu_seqlens 分段</text>
+<text x="40" y="115" class="head">原窗口 bitonic</text><text x="425" y="115" class="head">新主 kernel：128 threads / CTA，4 行独立处理</text>
+<rect class="box" x="35" y="130" width="335" height="110"/>
+<text x="55" y="160">每 tile 16 行</text><text x="55" y="190">每窗口 32 列排序</text><text x="55" y="220">与已有 Top16 逐窗口合并</text>
+<path class="line" d="M202,240 V275"/>
+<rect class="box" x="35" y="280" width="335" height="110"/>
+<text x="55" y="311">保留历史等分顺序</text><text x="55" y="342">96 registers/thread</text><text x="55" y="373">共享内存、同步、比较交换</text>
+<path class="line" d="M202,390 V455"/>
+<rect class="box" x="35" y="460" width="335" height="80"/>
+<text x="55" y="490">直接输出 M3 indices view</text><text x="55" y="521">baseline chunk 0：512.338 μs</text>
+<rect class="new" x="415" y="130" width="645" height="105"/>
+<text x="435" y="160">warp 0：row 0　warp 1：row 1　warp 2：row 2　warp 3：row 3</text>
+<text x="435" y="190">每行 lane l 读取 l、l+32、l+64…；Capacity 640</text>
+<text x="435" y="220">每 lane 20 个寄存器 key，ID 隐含为 l+32*j</text>
+<path class="line" d="M737,235 V267"/>
+<rect class="new" x="415" y="273" width="645" height="105"/>
+<text x="435" y="303">FP32 bits → 有序 UINT32；因果 / NaN / init / local 处理</text>
+<text x="435" y="333">局部 max → warp reduce max → reduce min ID → 写结果</text>
+<text x="435" y="363">清除 winner，循环 16 次；主 kernel 无用户 shared / CTA barrier</text>
+<path class="line" d="M737,378 V410"/>
+<rect class="new" x="415" y="416" width="645" height="85"/>
+<text x="435" y="446">输出初步 indices + GPU 行标记</text>
+<text x="435" y="477" class="small">标记：已选或 cutoff 等分、有效 Inf、原 -1e30 padding 可影响 cutoff</text>
+<path class="line" d="M737,501 V533"/>
+<rect class="tie" x="415" y="539" width="645" height="108"/>
+<text x="435" y="569">第二个 kernel：每 tile 读取 16 个标记</text>
+<text x="435" y="599">无标记：直接返回　有标记：原 bitonic body 覆盖整个 tile</text>
+<text x="435" y="630">保持旧 ID / 顺序；无 CPU 判定或同步，支持动态 Graph replay</text>
+<path class="line" d="M737,647 V672"/>
+<rect class="new" x="415" y="678" width="645" height="58"/>
+<text x="435" y="714">最终 indices → 稀疏注意力；chunk 0 完整流程 306.658 μs</text>
+<text x="35" y="687" class="small">完整流程计入两个 kernel。</text>
+<text x="35" y="714" class="small">35,788,800 行真实 score：</text>
+<text x="35" y="741" class="small">ID / 顺序差异 0 行。</text>
+</svg>

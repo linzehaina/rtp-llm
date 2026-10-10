@@ -45,7 +45,8 @@ struct PyWrappedModelTestPeer {
 namespace {
 
 constexpr int    kLayerId        = 0;
-constexpr size_t kPhysicalBlocks = 8;
+// The CP scenario uses physical block ID 8; storage must include that slot.
+constexpr size_t kPhysicalBlocks = 9;
 
 struct TestCacheSpec: public KVCacheSpec {
     TestCacheSpec(std::string cache_tag, size_t tokens_per_block, size_t bytes):

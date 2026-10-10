@@ -10,6 +10,7 @@
 #include "rtp_llm/models_py/bindings/core/DeviceData.h"
 #include "rtp_llm/models_py/bindings/core/TensorHolder.h"
 #include <array>
+#include <optional>
 #include <string>
 #include <utility>
 #include <memory>
@@ -72,6 +73,10 @@ struct GptModelInitParams {
     // Final CUDA-graph kernel block-table width. Executors compute it from
     // the published model topology, actual reserve, and fake caller bounds.
     int64_t                                    kernel_block_table_width = 0;
+    // Physical producer cache rank and size. NormalExecutor sets this for main
+    // and draft models from their bound manager; warmup uses {0, 1}. Direct
+    // construction must supply it for a sharded producer cache.
+    std::optional<std::pair<int, int>>         cache_store_producer_cp_topology;
 };
 
 enum GptModelInputIndex : size_t {

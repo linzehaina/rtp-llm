@@ -1,0 +1,13 @@
+{
+  "pass": true,
+  "non_nan_patterns": 4278190082,
+  "chunk": 16777216,
+  "anchors": {
+    "0x0": 2147483648,
+    "0x7f800000": 4286578688,
+    "0x80000000": 2147483648,
+    "0xff800000": 8388607
+  },
+  "seconds": 3.562646467005834,
+  "scope": "all finite FP32 encodings, signed zeros, positive/negative infinities; NaN handled before key in production"
+}

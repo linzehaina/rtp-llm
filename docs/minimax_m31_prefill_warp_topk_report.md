@@ -95,7 +95,7 @@ azk114 GPU0–3，纯 prefill，CP4/TP4/EP4，Graph 关闭。冻结原模型运�
 
 ## Review 与验证
 
-GPU **10 个方法、1670 个正向交叉子用例、15 个非法 host 参数用例，零 skip**；CPU 6 个 dispatch 方法通过。覆盖 H1/2/4/8、K16/32、N1..1024 的 32 个代表值/边界、连续与 padded stride、indices/BT/seq_lens、短行、9 类分布与 init/local 交叉、NaN/Inf/±0/subnormal、空输入、非默认 stream、Graph 动态 score/prefix/cu，以及等分标记和复用原 body 的精确 ID/BT/SL 对照。
+GPU **10 个方法、1670 个正向交叉子用例、14 个非法 host 参数用例，零 skip**；CPU 6 个 dispatch 方法通过。覆盖 H1/2/4/8、K16/32、N1..1024 的 32 个代表值/边界、连续与 padded stride、indices/BT/seq_lens、短行、9 类分布与 init/local 交叉、NaN/Inf/±0/subnormal、空输入、非默认 stream、Graph 动态 score/prefix/cu，以及等分标记和复用原 body 的精确 ID/BT/SL 对照。
 
 Compute Sanitizer memcheck 160 个正向子用例、synccheck 152 个，均 0 errors。Review 修复 FTZ 下零判断（按 bits 判断，避免把 subnormal 当零）、别名与 stride、int64 指针偏移和 legacy int32 输出范围、页 ID 溢出、Graph metadata、容量档位、等分/Inf/-1e30 sentinel 兼容。原 bitonic body AST 未改；新代码通过 clang-format、Black、isort、diff whitespace 检查。[测试摘要](minimax_m31_prefill_topk/cross_tests.json)。
 
@@ -108,3 +108,5 @@ Compute Sanitizer memcheck 160 个正向子用例、synccheck 152 个，均 0 er
 代码、报告、图和精简 JSON/CSV 随本次改动交付，推送目标为 `feat/minimax_m3.1`；构建/测试/benchmark/NCU/模型运行脚本见 [复现说明](minimax_m31_prefill_topk/reproduction.md)。交付 artifact 包含四 rank 新旧 timeline、完整 NCU reports、107 点数据、请求 protobuf/hash、日志、权重 SHA、audit 和 GPU gate/清理证据。原型和中间结果保存在历史目录，不作为最终性能口径。
 
 任务创建的模型服务和 GPU 测试容器已全部关闭；核验本任务 PID、端口、GPU allocations 连续超过 5 秒均已释放，保留权重、缓存及结果。
+
+**2026-10-10 数值与同步专项 review**：逐段代码讲解、空 tensor 极端 stride 溢出修复、未使用页数窄化加固，以及 FP32 全位模式穷举、473 个新增子用例和四项 sanitizer 结果见[专项 review](minimax_m31_prefill_topk/kernel_review.md)。该文明确区分 native 数学 TopK 与完整 legacy 兼容路径的异常分数行为；此前性能数字不代表本次重新测量。

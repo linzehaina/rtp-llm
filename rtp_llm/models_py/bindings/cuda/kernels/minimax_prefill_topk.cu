@@ -239,8 +239,11 @@ void check_tensor(const torch::Tensor& value, const torch::Tensor& scores, at::S
 }
 
 void check_rows(const torch::Tensor& value, const char* name) {
-    TORCH_CHECK(value.stride(2) == 1 && value.stride(1) >= value.size(2)
-                    && value.stride(0) >= value.size(1) * value.stride(1),
+    TORCH_CHECK(value.stride(2) == 1
+                    && value.stride(1) >= value.size(2)
+                    // Empty tensors can carry arbitrarily large strides without
+                    // allocating storage. Division avoids overflowing Q * stride.
+                    && value.stride(0) / value.stride(1) >= value.size(1),
                 name,
                 " requires nonoverlapping head/query rows and a contiguous last dimension");
 }
@@ -324,6 +327,9 @@ torch::Tensor minimax_prefill_topk(const torch::Tensor& scores,
     if (scores.size(0) == 0 || scores.size(1) == 0)
         return tie_flags;
     TORCH_CHECK(max_query_length > 0 && prefix_lens.numel() > 0, "nonempty scores require segments");
+    // Only narrow a page count after its range was checked. The index-only
+    // specializations never use it, so do not truncate an unused int64 argument.
+    const int checked_num_pages = emit_block_table ? static_cast<int>(num_pages) : 0;
     if (topk == 16)
         dispatch<16>(scores,
                      topk_idx,
@@ -336,7 +342,7 @@ torch::Tensor minimax_prefill_topk(const torch::Tensor& scores,
                      init_blocks,
                      local_blocks,
                      emit_block_table,
-                     num_pages);
+                     checked_num_pages);
     else
         dispatch<32>(scores,
                      topk_idx,
@@ -349,7 +355,7 @@ torch::Tensor minimax_prefill_topk(const torch::Tensor& scores,
                      init_blocks,
                      local_blocks,
                      emit_block_table,
-                     num_pages);
+                     checked_num_pages);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return tie_flags;
 #else

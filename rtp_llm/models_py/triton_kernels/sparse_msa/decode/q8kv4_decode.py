@@ -18,8 +18,13 @@ of reusing SGLang strides.
 Ordinary decode and target verification share this path.  Score/top-k/partial/
 output buffers are cached by physical bucket shape so the complete chain has
 stable addresses under CUDA Graph.
+
+The attention stage itself has two native routes: the Triton partial+combine
+reader (plus its BF16-Q Cake specialization) and the frozen ctypes champion in
+``native_hybrid_decode.py`` (default; bitwise-identical output, one launch).
 """
 
+import logging
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -33,6 +38,8 @@ from rtp_llm.models_py.triton_kernels.sparse_msa.decode.nvfp4_q8_attention impor
 from rtp_llm.models_py.triton_kernels.sparse_msa.decode.nvfp4_q8_index_score import (
     q8kv4_index_score,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -176,6 +183,44 @@ def _scale1_e4m3(values: torch.Tensor, name: str, out: torch.Tensor) -> torch.Te
 # mutable scale staging and addressing buffers.
 _CAKE_SCALES: dict[tuple, object] = {}
 _CAKE_WORKSPACES: dict[tuple, object] = {}
+
+
+def _native_hybrid_decode_selected(
+    q,
+    layout,
+    topk,
+    mma_scale_layout,
+    query_width,
+    query_cu_seqlens,
+    output_format,
+):
+    """Frozen native champion as the attention stage (default on).
+
+    Replaces the Triton partial+combine reader (and the Cake reader above its
+    20-row boundary) with one ctypes launch that consumes the same cache
+    planes, workspace q8/topk and batch metadata zero-copy.  Output is
+    bitwise-identical to the Triton reader (19-cell campaign gate, 2026-10-10)
+    and CUDA-graph compatible.  ``MSA_USE_NATIVE_HYBRID_DECODE=0`` restores the
+    original dispatch; unsupported geometry, formats or a missing binary fall
+    back silently.  See ``native_hybrid_decode.py`` for the ABI contract.
+    """
+    try:
+        from .native_hybrid_decode import native_hybrid_decode_supported
+    except Exception:  # pragma: no cover - launcher module always ships
+        return False
+    try:
+        return native_hybrid_decode_supported(
+            q,
+            layout,
+            topk,
+            mma_scale_layout,
+            query_width,
+            query_cu_seqlens,
+            output_format,
+        )
+    except Exception:
+        logger.exception("native hybrid decode selection failed")
+        return False
 
 
 def _cake_supported(q, layout, topk, mma_scale_layout, max_blocks):
@@ -337,6 +382,12 @@ def _q8kv4_paged_sparse_decode(
     max_seq_len is the enforced model context limit, not the Graph allocation
     capacity. Callers supplying it must guarantee every live seq_len is within
     that limit. It removes only speculative reserve columns above 8192 pages.
+
+    The attention stage (partial + combine) is routed to the frozen native
+    champion (``native_hybrid_decode.py``) whenever the supported M3.1
+    geometry, BF16 output format and SM103 device allow it; the query cast,
+    index score and production TopK prefix are unchanged on that route.
+    ``MSA_USE_NATIVE_HYBRID_DECODE=0`` restores the Triton/Cake dispatch.
     """
     if fuse_bf16_query_rounding and (
         q.dtype != torch.bfloat16 or idx_q.dtype != torch.bfloat16
@@ -382,8 +433,19 @@ def _q8kv4_paged_sparse_decode(
     workspace = _Q8KV4DecodeWorkspace.acquire(
         q, idx_q, max_blocks, topk, num_topk_chunks, _output_format
     )
-    use_cake = bf16_main_query and _cake_supported(
-        q, layout, topk, mma_scale_layout, max_blocks
+    use_native = _native_hybrid_decode_selected(
+        q,
+        layout,
+        topk,
+        mma_scale_layout,
+        query_width,
+        query_cu_seqlens,
+        _output_format,
+    )
+    use_cake = (
+        bf16_main_query
+        and not use_native
+        and _cake_supported(q, layout, topk, mma_scale_layout, max_blocks)
     )
     if fuse_bf16_query_rounding:
         from .nvfp4_q8_query_cast import fused_query_cast
@@ -438,6 +500,30 @@ def _q8kv4_paged_sparse_decode(
         int(topk),
     )
     topk_indices = workspace.topk_i32
+    if use_native:
+        # Attention stage only: the champion consumes the entry's own q8/topk
+        # workspace carriers and cache planes zero-copy; O is bitwise-identical
+        # to the Triton partial+combine reader.  The fused global LSE byproduct
+        # lands in the native route's shape-cached buffer.
+        from .native_hybrid_decode import native_hybrid_decode_attention
+
+        output = native_hybrid_decode_attention(
+            q8,
+            logical,
+            block_table,
+            topk_indices,
+            seq_lens,
+            layout=layout,
+            query_width=query_width,
+            out=workspace.output,
+            partial_out=workspace.partial_output,
+            partial_lse=workspace.partial_lse,
+        )
+        return Q8KV4DecodeResult(
+            output=output,
+            topk_indices=topk_indices,
+            index_scores=index_scores,
+        )
     if use_cake:
         # Index-Q/idxK4 scoring and production TopK are unchanged. Cake reads
         # original BF16 main Q and packed cache. Preserve the existing packed
@@ -463,8 +549,10 @@ def _q8kv4_paged_sparse_decode(
                 num_warps=4,
             )
             return Q8KV4Mxfp8DecodeResult(
-                workspace.output_fp8, workspace.output_scales_packed,
-                topk_indices, index_scores,
+                workspace.output_fp8,
+                workspace.output_scales_packed,
+                topk_indices,
+                index_scores,
             )
         return Q8KV4DecodeResult(output, topk_indices, index_scores)
     attention_fn = q8kv4_sparse_decode_attention

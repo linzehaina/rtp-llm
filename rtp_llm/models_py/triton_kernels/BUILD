@@ -37,6 +37,9 @@ py_library(
         "sparse_msa/prefill/*.py",
         "sparse_msa/decode/*.py",
     ]),
+    data = [
+        "sparse_msa/decode/libdecode_hybrid_p6res.so",
+    ],
     deps = select({
         "@//:using_cuda": ["//rtp_llm:flashinfer-python"],
         "//conditions:default": [],

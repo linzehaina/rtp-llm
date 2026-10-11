@@ -1197,7 +1197,7 @@ def _tiled_swiglu_mxfp8_configs():
 
 
 @triton.autotune(configs=_tiled_swiglu_mxfp8_configs(), key=["size_n"])
-@triton.jit
+@triton.jit(do_not_specialize=["T"])
 def _silu_and_mul_mxfp8_quant_tiled_kernel(
     input_ptr,  # [T, 2*H_out] bf16
     stride_input_t,

@@ -1,4 +1,7 @@
+import os
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 import triton
@@ -28,6 +31,50 @@ class NVFP4InputPackerTest(unittest.TestCase):
         # produce a successful test receipt containing only skipped cases.
         if not torch.cuda.is_available():
             raise RuntimeError("NVFP4InputPackerTest requires an SM100 CUDA device")
+
+    def test_model_warmup_only_adds_small_packer_tiles(self):
+        from .mega_moe import GLM5MegaMoE
+        from .mega_moe_nvfp4 import GLM5MegaMoENVFP4
+
+        model = object.__new__(GLM5MegaMoENVFP4)
+        torch.nn.Module.__init__(model)
+        model.cfg = SimpleNamespace(
+            max_tokens_per_rank=4096, dim=6144, n_activated_experts=4
+        )
+        model._mega_l1_w = torch.empty(1, device="cuda")
+        model._mega_buf = SimpleNamespace()
+        model._input_packer = SimpleNamespace(name="fused", pack=Mock())
+
+        with patch.dict(os.environ, {"GLM5_MEGA_MOE_JIT_WARMUP": "1"}):
+            os.environ.pop("GLM5_MEGA_MOE_NVFP4_PACK_BLOCK_M", None)
+            with patch.object(GLM5MegaMoE, "_maybe_warmup_jit_once") as base_warmup:
+                model._maybe_warmup_jit_once()
+
+        base_warmup.assert_called_once_with()
+        self.assertEqual(model._input_packer.pack.call_count, 2)
+        calls = model._input_packer.pack.call_args_list
+        self.assertEqual([call.args[4] for call in calls], [20, 40])
+        for call in calls:
+            x, weights, indices, buf, tokens = call.args
+            self.assertEqual(tuple(x.shape), (tokens, 6144))
+            self.assertEqual(tuple(weights.shape), (tokens, 4))
+            self.assertEqual(tuple(indices.shape), (tokens, 4))
+            self.assertIs(buf, model._mega_buf)
+
+        with patch.dict(os.environ, {"GLM5_MEGA_MOE_JIT_WARMUP": "1"}):
+            os.environ.pop("GLM5_MEGA_MOE_NVFP4_PACK_BLOCK_M", None)
+            model._input_packer = SimpleNamespace(name="torch", pack=Mock())
+            with patch.object(GLM5MegaMoE, "_maybe_warmup_jit_once"):
+                model._maybe_warmup_jit_once()
+                model._input_packer = SimpleNamespace(name="fused", pack=Mock())
+                model._maybe_warmup_jit_once()
+        self.assertEqual(model._input_packer.pack.call_count, 2)
+
+        with patch.dict(os.environ, {"GLM5_MEGA_MOE_JIT_WARMUP": "0"}):
+            model._input_packer.pack.reset_mock()
+            with patch.object(GLM5MegaMoE, "_maybe_warmup_jit_once"):
+                model._maybe_warmup_jit_once()
+            model._input_packer.pack.assert_not_called()
 
     def test_scale_cast_subnormal_ties_and_clamps(self):
         """Exercise FP32 rounding directly, without BF16 masking scale ties."""

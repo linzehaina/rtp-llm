@@ -6,6 +6,30 @@ import os
 
 import torch
 
+_SMALL_VECTOR_TILES = {20: 8, 25: 8, 40: 16, 60: 16, 80: 16, 100: 16}
+
+
+def vector_packer_warmup_rows(
+    max_tokens: int, hidden: int, topk: int
+) -> tuple[int, ...]:
+    if (
+        hidden != 6144
+        or topk != 4
+        or os.environ.get("GLM5_MEGA_MOE_NVFP4_PACK_BLOCK_M") is not None
+    ):
+        return ()
+    rows = []
+    for tile in (8, 16):
+        candidates = [
+            tokens
+            for tokens, block_m in _SMALL_VECTOR_TILES.items()
+            if block_m == tile and tokens <= max_tokens
+        ]
+        if candidates:
+            rows.append(min(candidates))
+    return tuple(rows)
+
+
 try:
     import triton
     import triton.language as tl
@@ -294,7 +318,7 @@ def fused_pack_mega_nvfp4_inputs(
     # Compact DP8 verification uses 20/60/100 rows at B4/12/20 with
     # a four-draft-token budget. Byte-exact Graph gates favor vector tiles
     # here too; keep other shapes and explicit overrides unchanged.
-    small_vector_tile = {20: 8, 25: 8, 40: 16, 60: 16, 80: 16, 100: 16}.get(tokens)
+    small_vector_tile = _SMALL_VECTOR_TILES.get(tokens)
     vector_pack = (
         block_m_env is None
         and hidden == 6144

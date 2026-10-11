@@ -47,6 +47,18 @@ _FP8_SCALE_BYTES = 4
 _FP8_E4M3_MAX = tl.constexpr(448.0)
 
 
+def _select_nvfp4_prefill(backend: str) -> Tuple[bool, str]:
+    if backend == "fmha":
+        return False, "native"
+    if backend == "flashinfer_q16":
+        return True, "bf16"
+    if backend == "flashinfer_q8":
+        return True, "q8kv4"
+    raise ValueError(
+        "M3_NVFP4_PREFILL_BACKEND must be fmha, flashinfer_q16 or flashinfer_q8"
+    )
+
+
 def _should_use_cp_compact_prefill(compact_enabled: bool, nvfp4_kv_cache: bool) -> bool:
     """Keep the legacy BF16 compact path out of M3.1's packed-KV4 route."""
     return bool(compact_enabled and not nvfp4_kv_cache)
@@ -2185,15 +2197,23 @@ class MSAAttention(nn.Module):
         self.page_size = attn_config.kernel_tokens_per_block
         self.physical_page_size = attn_config.tokens_per_block
         self.nvfp4_kv_cache = bool(getattr(attn_config, "nvfp4_kv_cache", False))
-        if self.nvfp4_kv_cache and _NVFP4_PREFILL_BACKEND not in ("fmha", "flashinfer"):
-            raise ValueError("M3_NVFP4_PREFILL_BACKEND must be fmha or flashinfer")
-        self._flashinfer_nvfp4_prefill = (
-            self.nvfp4_kv_cache and _NVFP4_PREFILL_BACKEND == "flashinfer"
-        )
+        if self.nvfp4_kv_cache:
+            if "M3_NVFP4_PREFILL_COMPUTE" in os.environ:
+                raise ValueError(
+                    "M3_NVFP4_PREFILL_COMPUTE was removed; select flashinfer_q16 "
+                    "or flashinfer_q8 with M3_NVFP4_PREFILL_BACKEND"
+                )
+            self._flashinfer_nvfp4_prefill, self._nvfp4_prefill_compute = (
+                _select_nvfp4_prefill(_NVFP4_PREFILL_BACKEND)
+            )
+        else:
+            self._flashinfer_nvfp4_prefill = False
+            self._nvfp4_prefill_compute = "native"
         if self.nvfp4_kv_cache and self.layer_idx == 0:
             logger.info(
-                "MiniMax-M3.1 NVFP4 prefill=%s, native packed-FP4 decode",
+                "MiniMax-M3.1 NVFP4 prefill=%s, compute=%s, native packed-FP4 decode",
                 _NVFP4_PREFILL_BACKEND,
+                self._nvfp4_prefill_compute,
             )
 
         # --- main GQA branch (identical construction to CausalAttention) ---
@@ -4361,6 +4381,8 @@ class MSAAttention(nn.Module):
                 q, main[0], main[1], scales[0], scales[1], topk,
                 req_to_token, cu_seqlens, seq_lens, positions, seq_lens,
                 self.head_dim**-0.5, direct_layout=True,
+                compute_backend=self._nvfp4_prefill_compute,
+                layer_idx=self.layer_idx,
             )
         else:
             output = sparse_prefill_from_topk_fp4(
@@ -5155,6 +5177,8 @@ class MSAAttention(nn.Module):
                     prefix_i32 + segment_lengths_t, local_positions,
                     kv_lens_i32, self.head_dim**-0.5,
                     segments_per_request=2, direct_layout=True,
+                    compute_backend=self._nvfp4_prefill_compute,
+                    layer_idx=self.layer_idx,
                 )
             else:
                 o = sparse_prefill_from_topk_fp4(

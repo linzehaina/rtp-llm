@@ -28,9 +28,9 @@ def expand_fp32_router_weight(weight: torch.Tensor):
     return high, middle, low
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["ROWS"])
 def _prefill_bf16_router(
-    X, W, OUTPUT, ROWS: tl.constexpr, WS0: tl.constexpr, WS1: tl.constexpr
+    X, W, OUTPUT, ROWS, WS0: tl.constexpr, WS1: tl.constexpr
 ):
     rows = (tl.program_id(0) * 16 + tl.arange(0, 16)).to(tl.int64)
     experts = tl.program_id(1) * 64 + tl.arange(0, 64)

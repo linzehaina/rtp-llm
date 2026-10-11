@@ -2297,7 +2297,7 @@ def scatter_main_rows_to_hnd(
         )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["SCRATCH_SEQ_LEN"])
 def _clear_packed_working_tail_scales_kernel(
     k_scale,
     v_scale,
@@ -2306,7 +2306,7 @@ def _clear_packed_working_tail_scales_kernel(
     K_PAGE_STRIDE: tl.constexpr,
     V_PAGE_STRIDE: tl.constexpr,
     I_PAGE_STRIDE: tl.constexpr,
-    SCRATCH_SEQ_LEN: tl.constexpr,
+    SCRATCH_SEQ_LEN,
     HEADS: tl.constexpr,
     GROUPS: tl.constexpr,
     IDX_GROUPS: tl.constexpr,

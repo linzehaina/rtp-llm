@@ -1,6 +1,7 @@
 """Metadata-only dispatch regressions; no GPU or native extension required."""
 
 import importlib.util
+import io
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -178,6 +179,30 @@ class PrefillWarpDispatchTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "invalid input"):
                 self.module.try_warp_prefill_topk(932, 4, 579, self.args, self.kwargs)
+
+    def test_trace_labels_executed_dispatch_path(self):
+        stream = io.StringIO()
+        with patch.object(self.module.sys, "stderr", stream), patch.dict(
+            "os.environ", {"M3_PREFILL_TOPK_TRACE": "1", "M3_PREFILL_TOPK_IMPL": "bitonic"}
+        ):
+            self.assertIsNone(
+                self.module.try_warp_prefill_topk(932, 4, 579, self.args, self.kwargs)
+            )
+        with patch.object(self.module.sys, "stderr", stream), patch.dict(
+            "os.environ", {"M3_PREFILL_TOPK_TRACE": "1", "M3_PREFILL_TOPK_IMPL": "warp"}
+        ), patch.object(self.module, "_native_topk", return_value=Mock(return_value=1)):
+            self.assertIsNone(
+                self.module.try_warp_prefill_topk(932, 4, 511, self.args, self.kwargs)
+            )
+            self.assertEqual(
+                self.module.try_warp_prefill_topk(932, 4, 579, self.args, self.kwargs),
+                1,
+            )
+        lines = stream.getvalue().splitlines()
+        self.assertEqual(3, len(lines))
+        self.assertIn("path=disabled num_blocks=579 count=1", lines[0])
+        self.assertIn("path=ineligible num_blocks=511 count=1", lines[1])
+        self.assertIn("path=native num_blocks=579 count=1", lines[2])
 
 
 if __name__ == "__main__":

@@ -201,7 +201,91 @@ class MiniMaxM31Model(MiniMaxM3Model):
                     layer.self_attn, "nvfp4_kv_cache", False
                 ):
                     layer.mlp.prepare_prefill_router()
+            self._prewarm_prefill_structural_kernels()
         return result
+
+    @torch.inference_mode()
+    def _prewarm_prefill_structural_kernels(self) -> None:
+        from rtp_llm.models_py.modules.hybrid.dense_mlp import DenseMLP
+        from rtp_llm.models_py.triton_kernels.common.activation import (
+            silu_and_mul_per_token_group_fp8_quant_dense_packed_fwd,
+        )
+        from rtp_llm.models_py.triton_kernels.minimax_m31_gemma_rope import (
+            minimax_m31_gemma_norm_rope_,
+        )
+
+        for layer in self.layers:
+            attn = layer.self_attn
+            weights = getattr(attn, "_m31_raw_attention_norms", None)
+            if not (
+                getattr(attn, "nvfp4_kv_cache", False)
+                and getattr(attn, "_flashinfer_nvfp4_prefill", False)
+                and weights is not None
+                and getattr(attn, "cos_sin_cache", None) is not None
+            ):
+                continue
+            hq, hk, hi = attn.head_num, attn.kv_head_num, attn.num_idx_heads
+            width = (hq + 2 * hk + hi + 1) * 128
+            device = weights[0].device
+            for rows in (32, 2048):
+                carrier = torch.zeros(
+                    (rows, width), dtype=torch.bfloat16, device=device
+                )
+                positions = torch.zeros(rows, dtype=torch.int32, device=device)
+                outputs = (
+                    torch.empty((rows, hq, 128), dtype=torch.bfloat16, device=device),
+                    torch.empty(
+                        (rows, hi, 128), dtype=torch.float8_e4m3fn, device=device
+                    ),
+                    torch.empty(
+                        (rows, (2 * hk + 1) * 128),
+                        dtype=torch.bfloat16,
+                        device=device,
+                    ),
+                )
+                minimax_m31_gemma_norm_rope_(
+                    carrier[:, : (hq + 2 * hk) * 128],
+                    carrier[:, (hq + 2 * hk) * 128 : (hq + 2 * hk + hi) * 128],
+                    carrier[:, (hq + 2 * hk + hi) * 128 :],
+                    weights,
+                    positions,
+                    attn.cos_sin_cache,
+                    num_q_heads=hq,
+                    num_kv_heads=hk,
+                    num_index_heads=hi,
+                    eps=attn.layernorm_eps,
+                    prefill_outputs=outputs,
+                )
+            torch.cuda.synchronize(device)
+            break
+
+        warmed = set()
+        for module in self.modules():
+            if not isinstance(module, DenseMLP) or not module._fuse_silu_quant:
+                continue
+            params = module._down_proj_fp8_quant_params
+            if params is None:
+                continue
+            alpha, limit = module.swiglu_oai_params or (0.0, 0.0)
+            width = int(module.down_proj.K)
+            key = (width, params, alpha, limit)
+            if key in warmed:
+                continue
+            warmed.add(key)
+            device = module.down_proj.weight.device
+            tiled_mxfp8 = params.round_to_pow2 and not params.scale_ue8m0 and alpha > 0
+            for rows in ((32, 64, 8192) if tiled_mxfp8 else (32, 64)):
+                x = torch.zeros((rows, 2 * width), dtype=torch.bfloat16, device=device)
+                silu_and_mul_per_token_group_fp8_quant_dense_packed_fwd(
+                    x,
+                    quant_group_size=params.group_size,
+                    scale_ue8m0=params.scale_ue8m0,
+                    round_to_pow2=params.round_to_pow2,
+                    gemm1_alpha=alpha,
+                    gemm1_clamp_limit=limit,
+                    tma_packed_scales=params.tma_packed_scales,
+                )
+            torch.cuda.synchronize(device)
 
     def _prepare_prefill_moe_chunk_plan(self, inputs, hidden_states, layers):
         from rtp_llm.models_py.model_desc.generic_moe import (

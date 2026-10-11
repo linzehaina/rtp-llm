@@ -1,5 +1,11 @@
 """FlashInfer NVFP4 sparse prefill over direct working pages or legacy planes."""
 
+from functools import lru_cache
+import json
+import logging
+import os
+from pathlib import Path
+
 import torch
 import triton
 import triton.language as tl
@@ -48,9 +54,9 @@ def _convert_page_head(K, V, KS, VS, DST, K_STRIDE, V_STRIDE,
     tl.store(dst + V_SCALE_OFFSET + head * 1024 + swizzled, vs)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["T0", "T1", "T2", "P0", "ROWS", "COLS"])
 def _prepare_topk(TOPK, POSITIONS, OUT, T0, T1, T2, P0,
-                  ROWS: tl.constexpr, COLS: tl.constexpr,
+                  ROWS, COLS,
                   BLOCK_ROWS: tl.constexpr):
     row = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
     head = tl.program_id(1)
@@ -65,10 +71,10 @@ def _prepare_topk(TOPK, POSITIONS, OUT, T0, T1, T2, P0,
              mask=row[:, None] < ROWS)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["TABLE_STRIDE", "SEGMENTS_PER_REQUEST"])
 def _clear_unwritten_page_tail(REQ_TO_TOKEN, FULL_LENGTHS, DST,
-                               TABLE_STRIDE: tl.constexpr,
-                               SEGMENTS_PER_REQUEST: tl.constexpr,
+                               TABLE_STRIDE,
+                               SEGMENTS_PER_REQUEST,
                                PAGE_BYTES: tl.constexpr,
                                K_SCALE_OFFSET: tl.constexpr,
                                V_DATA_OFFSET: tl.constexpr,
@@ -110,12 +116,51 @@ class _PlanarPages:
 
 
 _PLANAR_PAGES = _PlanarPages()
+_Q8_SHADOW_COUNTS = {}
+_Q8_SHADOW_CAPTURE_WARNED = False
+_logger = logging.getLogger(__name__)
+
+
+def _q8_shadow_capture_active(q):
+    global _Q8_SHADOW_CAPTURE_WARNED
+    if not q.is_cuda or not torch.cuda.is_current_stream_capturing():
+        return False
+    if not _Q8_SHADOW_CAPTURE_WARNED:
+        _logger.warning("M3 Q8 shadow diagnostic skipped during CUDA Graph capture")
+        _Q8_SHADOW_CAPTURE_WARNED = True
+    return True
+
+
+@lru_cache(maxsize=3)
+def _q8kv4_module(target):
+    from flashinfer.jit import core as jit_core
+
+    flags = getattr(jit_core, f"{target}_nvcc_flags", None)
+    if flags is None:
+        raise RuntimeError(f"FlashInfer JIT does not support {target}")
+    source = Path(__file__).with_name("msa_prefill_q8kv4.cu")
+    if not source.is_file():
+        raise RuntimeError(f"Q8KV4 prefill source is missing from the runtime: {source}")
+    spec = jit_core.gen_jit_spec(
+        f"rtp_m31_prefill_q8kv4_{target}", [source],
+        extra_cuda_cflags=flags + ["--prec-div=true", "--prec-sqrt=true", "--fmad=true"],
+    )
+    return spec.build_and_load()
+
+
+def _q8kv4_target(device):
+    capability = torch.cuda.get_device_capability(device)
+    targets = {(10, 0): "sm100a", (10, 3): "sm103a"}
+    if capability not in targets:
+        raise RuntimeError(f"Q8KV4 prefill requires SM100/103, got {capability}")
+    return targets[capability]
 
 
 def flashinfer_sparse_prefill_from_topk_fp4(
     q, main_k, main_v, k_scale, v_scale, topk, req_to_token,
     cu_seqlens_q, seqused_k, positions, full_kv_lengths, sm_scale,
-    segments_per_request=1, *, direct_layout=False,
+    segments_per_request=1, *, direct_layout=False, compute_backend="bf16",
+    layer_idx=None,
 ):
     """Run FI over request-local pages; direct mode shares producer storage.
 
@@ -139,7 +184,13 @@ def flashinfer_sparse_prefill_from_topk_fp4(
     if (full_kv_lengths.dtype != torch.int32 or full_kv_lengths.ndim != 1
             or full_kv_lengths.numel() * segments_per_request != req_to_token.shape[0]):
         raise ValueError("full KV lengths must cover each request's working pages")
-    msa_prefill_nvfp4_specialized_warmup(q.device)
+    if compute_backend == "bf16":
+        msa_prefill_nvfp4_specialized_warmup(q.device)
+        q8_module = None
+    elif compute_backend == "q8kv4":
+        q8_module = _q8kv4_module(_q8kv4_target(q.device))
+    else:
+        raise ValueError("compute_backend must be bf16 or q8kv4")
     if direct_layout:
         layout = page_layout(heads)
         # Require the exact common-base ABI; never silently materialize a pool.
@@ -193,9 +244,54 @@ def flashinfer_sparse_prefill_from_topk_fp4(
     vs = torch.as_strided(pool, scale_shape, scale_stride,
                           layout["v_scale_byte_offset"])
     out = torch.empty_like(q)
-    msa_sparse_attention(q=q, k=k, v=v, k_scale=ks, v_scale=vs,
-           q2k_indices=ordered_topk, cu_seqlens_q=cu_seqlens_q,
-           page_table=page_table, seqused_k=seqused_k, out=out,
-           causal=True, softmax_scale=sm_scale,
-           k_global_scale=1.0, v_global_scale=1.0)
+    if q8_module is not None:
+        q8_module.msa_prefill_nvfp4_specialized(
+            q, k, v, ks, vs, ordered_topk, cu_seqlens_q, page_table,
+            seqused_k, out, sm_scale, 1.0, 1.0,
+        )
+    else:
+        msa_sparse_attention(q=q, k=k, v=v, k_scale=ks, v_scale=vs,
+               q2k_indices=ordered_topk, cu_seqlens_q=cu_seqlens_q,
+               page_table=page_table, seqused_k=seqused_k, out=out,
+               causal=True, softmax_scale=sm_scale,
+               k_global_scale=1.0, v_global_scale=1.0)
+    shadow_dir = os.environ.get("M3_FI_Q8_SHADOW_DIR")
+    shadow_call = _Q8_SHADOW_COUNTS.get(layer_idx, 0)
+    if (shadow_dir and q8_module is not None and layer_idx is not None
+            and shadow_call < int(os.environ.get("M3_FI_Q8_SHADOW_LIMIT", "1"))):
+        if _q8_shadow_capture_active(q):
+            return out
+        _Q8_SHADOW_COUNTS[layer_idx] = shadow_call + 1
+        msa_prefill_nvfp4_specialized_warmup(q.device)
+        shadow = torch.empty_like(out)
+        msa_sparse_attention(q=q, k=k, v=v, k_scale=ks, v_scale=vs,
+               q2k_indices=ordered_topk, cu_seqlens_q=cu_seqlens_q,
+               page_table=page_table, seqused_k=seqused_k, out=shadow,
+               causal=True, softmax_scale=sm_scale,
+               k_global_scale=1.0, v_global_scale=1.0)
+        q_f = q.float()
+        q8_f = q.to(torch.float8_e4m3fn).float()
+        delta = out.float() - shadow.float()
+        shadow_rms = shadow.float().square().mean().sqrt()
+        record = {
+            "pid": os.getpid(), "layer_idx": layer_idx,
+            "call_index": shadow_call, "q_shape": list(q.shape),
+            "q_abs_max": q_f.abs().max().item(),
+            "q_rms": q_f.square().mean().sqrt().item(),
+            "q_e4m3_rel_rms": ((q_f - q8_f).square().mean().sqrt()
+                                  / q_f.square().mean().sqrt().clamp_min(1e-30)).item(),
+            "q_gt_448": (q_f.abs() > 448).sum().item(),
+            "out_rel_rms": (delta.square().mean().sqrt()
+                              / shadow_rms.clamp_min(1e-30)).item(),
+            "out_max_abs": delta.abs().max().item(),
+            "shadow_rms": shadow_rms.item(),
+        }
+        path = Path(shadow_dir)
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            (path / f"pid_{os.getpid()}_layer_{layer_idx}_call_{shadow_call}.json").write_text(
+                json.dumps(record) + "\n"
+            )
+        except OSError:
+            _logger.exception("M3 Q8 shadow diagnostic record could not be written: %s", path)
     return out

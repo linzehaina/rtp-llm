@@ -2,8 +2,26 @@
 
 import os
 from functools import lru_cache
+import sys
 
 import torch
+
+
+_trace_counts = {"disabled": 0, "ineligible": 0, "native": 0}
+
+
+def _trace_dispatch(path, num_blocks):
+    if os.environ.get("M3_PREFILL_TOPK_TRACE") != "1":
+        return
+    _trace_counts[path] += 1
+    count = _trace_counts[path]
+    if count == 1 or count % 1000 == 0:
+        print(
+            f"M3_PREFILL_TOPK_DISPATCH pid={os.getpid()} "
+            f"path={path} num_blocks={num_blocks} count={count}",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 @lru_cache(maxsize=1)
@@ -19,6 +37,7 @@ def try_warp_prefill_topk(max_query_length, num_heads, num_blocks, args, kwargs)
     # The caller reuses the historical bitonic body for flagged rows, preserving
     # its equal-score IDs. The measured M3 geometry uses this path by default.
     if os.environ.get("M3_PREFILL_TOPK_IMPL", "warp") != "warp":
+        _trace_dispatch("disabled", num_blocks)
         return None
     scores, bt, sl, topk_idx = args[:4]
     sample_interval, block_size, cu, cu_blocks, prefix = args[4:9]
@@ -54,11 +73,13 @@ def try_warp_prefill_topk(max_query_length, num_heads, num_blocks, args, kwargs)
         and prefix.is_contiguous()
     )
     if not eligible:
+        _trace_dispatch("ineligible", num_blocks)
         return None
     op = _native_topk()
     if op is None:
+        _trace_dispatch("ineligible", num_blocks)
         return None
-    return op(
+    flags = op(
         scores,
         topk_idx,
         bt,
@@ -72,3 +93,5 @@ def try_warp_prefill_topk(max_query_length, num_heads, num_blocks, args, kwargs)
         kwargs.get("EMIT_BLOCK_TABLE", False),
         num_pages,
     )
+    _trace_dispatch("native", num_blocks)
+    return flags

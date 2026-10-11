@@ -48,6 +48,7 @@ py_library(
         # to its own module path (champion_src/ holds the source + build.sh).
         "sparse_msa/prefill/champion_src/lib/prefill-r8pkge-c58d6a73.so",
         "sparse_msa/prefill/champion_src/lib/prefill-r8pkge-c58d6a73-glibc232.so",
+        "sparse_msa/prefill/msa_prefill_q8kv4.cu",
     ],
     deps = select({
         "@//:using_cuda": ["//rtp_llm:flashinfer-python"],

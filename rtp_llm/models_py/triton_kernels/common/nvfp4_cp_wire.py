@@ -15,7 +15,7 @@ from rtp_llm.models_py.triton_kernels.common.nvfp4_kv_cache import (
 WIRE_BYTES = 648
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["ROWS"])
 def _pack_wire(packed, wire, ROWS, INPUT_S0: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     plane = tl.program_id(1)
@@ -40,7 +40,7 @@ def _pack_wire(packed, wire, ROWS, INPUT_S0: tl.constexpr):
              stored_scale.to(tl.uint8, bitcast=True), mask=row < ROWS)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["ROWS", "SOURCE_ROWS", "WORK_PAGES", "PERSIST_PAGES"])
 def _scatter_wire_multirow(wire, unpad, slots, persistent_slots,
                   k, ks, v, vs, idx, idxs, pk, pks, pv, pvs, pidx, pidxs,
                   ROWS, SOURCE_ROWS, WORK_PAGES, PERSIST_PAGES,

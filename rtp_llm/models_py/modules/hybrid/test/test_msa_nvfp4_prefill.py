@@ -16,6 +16,27 @@ SOURCE = Path(__file__).resolve().parents[1] / "msa_attention.py"
 
 
 class SourceContractTest(unittest.TestCase):
+    def test_nvfp4_prefill_backend_is_one_switch(self):
+        selector = next(
+            node for node in self.tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_select_nvfp4_prefill"
+        )
+        namespace = {"Tuple": tuple}
+        exec(compile(ast.Module(body=[selector], type_ignores=[]), str(SOURCE), "exec"),
+             namespace)
+        select = namespace["_select_nvfp4_prefill"]
+        self.assertEqual(select("fmha"), (False, "native"))
+        self.assertEqual(select("flashinfer_q16"), (True, "bf16"))
+        self.assertEqual(select("flashinfer_q8"), (True, "q8kv4"))
+        for obsolete in ("flashinfer", "q8kv4", "unknown"):
+            with self.subTest(obsolete=obsolete):
+                with self.assertRaisesRegex(ValueError, "M3_NVFP4_PREFILL_BACKEND"):
+                    select(obsolete)
+        self.assertIn('"M3_NVFP4_PREFILL_COMPUTE" in os.environ', self.text)
+        self.assertEqual(
+            self.text.count("compute_backend=self._nvfp4_prefill_compute"), 2
+        )
+
     def test_fmha_fp4_calls_bind_all_required_arguments(self):
         for name in ("_forward_nvfp4_prefill", "_forward_cp_prefill"):
             calls = [node for node in ast.walk(self.methods[name])
@@ -178,6 +199,7 @@ class NativeWrapperTest(unittest.TestCase):
         model._kv_sharded = False
         model.nvfp4_kv_cache = True
         model._flashinfer_nvfp4_prefill = flashinfer
+        model._nvfp4_prefill_compute = "bf16" if flashinfer else "native"
         model._m31_raw_attention_norms = None
         model.page_size = model.block_size = model.physical_page_size = 128
         model.disable_index_value = True

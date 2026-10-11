@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional
 import torch
 
 from .mega_buf import get_or_create_mega_output
+from .jit_warmup import mega_moe_jit_warmup_enabled
 from .mega_moe import (
     GLM5MegaMoE,
     GLM5MegaMoeCfg,
@@ -225,6 +226,38 @@ class GLM5MegaMoENVFP4(GLM5MegaMoE):
         )
         self._input_packer = get_mega_nvfp4_input_packer()
         self._maybe_warmup_jit_once()
+
+    def _maybe_warmup_jit_once(self) -> None:
+        super()._maybe_warmup_jit_once()
+        if not mega_moe_jit_warmup_enabled():
+            return
+        self._warmup_small_vector_packer()
+
+    @torch.inference_mode()
+    def _warmup_small_vector_packer(self) -> None:
+        if self._input_packer.name != "fused":
+            return
+
+        from .mega_nvfp4_input_packer_triton import vector_packer_warmup_rows
+
+        cfg = self.cfg
+        rows = vector_packer_warmup_rows(
+            cfg.max_tokens_per_rank, cfg.dim, cfg.n_activated_experts
+        )
+        if not rows:
+            return
+
+        device = self._mega_l1_w.device
+        x = torch.zeros((max(rows), cfg.dim), dtype=torch.bfloat16, device=device)
+        weights = torch.zeros(
+            (max(rows), cfg.n_activated_experts), dtype=torch.float32, device=device
+        )
+        indices = torch.zeros_like(weights, dtype=torch.int64)
+        for tokens in rows:
+            self._input_packer.pack(
+                x[:tokens], weights[:tokens], indices[:tokens], self._mega_buf, tokens
+            )
+        torch.cuda.synchronize(device)
 
     def forward(
         self,

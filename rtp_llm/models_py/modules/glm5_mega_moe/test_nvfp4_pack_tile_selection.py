@@ -63,7 +63,7 @@ class NVFP4PackTileSelectionTest(unittest.TestCase):
             override is None
             and hidden == 6144
             and topk == 4
-            and (tokens in (25, 40, 80) or tokens >= 4096)
+            and (tokens in (20, 25, 40, 60, 80, 100) or tokens >= 4096)
         )
         packed, unused = (vector, scalar) if use_vector else (scalar, vector)
         self.assertEqual(unused.calls, [])
@@ -97,6 +97,22 @@ class NVFP4PackTileSelectionTest(unittest.TestCase):
         self.assertEqual(self.dispatch(40), 16)
         self.assertEqual(self.dispatch(25, hidden=4096), 4)
         self.assertEqual(self.dispatch(40, topk=8), 4)
+
+    def test_warmup_covers_each_reachable_small_vector_tile(self):
+        with patch.dict(os.environ):
+            os.environ.pop(ENV, None)
+            expected = {19: (), 20: (20,), 39: (20,), 40: (20, 40), 4096: (20, 40)}
+            for cap, rows in expected.items():
+                with self.subTest(cap=cap):
+                    self.assertEqual(packer.vector_packer_warmup_rows(cap, 6144, 4), rows)
+                    self.assertEqual(
+                        tuple(self.dispatch(tokens) for tokens in rows),
+                        tuple((8, 16)[: len(rows)]),
+                    )
+            self.assertEqual(packer.vector_packer_warmup_rows(100, 4096, 4), ())
+            self.assertEqual(packer.vector_packer_warmup_rows(100, 6144, 8), ())
+            os.environ[ENV] = "4"
+            self.assertEqual(packer.vector_packer_warmup_rows(100, 6144, 4), ())
 
     def test_other_small_shapes_unchanged(self):
         for tokens in (1, 3, 5, 16, 64, 79, 81, 95, 97, 111, 113, 127, 129, 1023):

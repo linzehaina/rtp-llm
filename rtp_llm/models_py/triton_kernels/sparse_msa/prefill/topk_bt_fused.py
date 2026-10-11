@@ -12,6 +12,7 @@ import inspect
 import logging
 import os
 import subprocess
+import sys
 from functools import lru_cache
 
 import torch
@@ -967,6 +968,9 @@ def _launch_topk_to_block_table(
             TIE_FLAGS=tie_flags,
             TIE_STRIDE_H=tie_flags.stride(0),
         )
+        _shadow_check_topk(
+            max_seqblock_q, batch_size, num_heads, args, kwargs
+        )
         return
     if max_seqblock_k >= _MULTIROW_MIN_KV_BLOCKS:
         grid = (
@@ -987,6 +991,64 @@ def _launch_topk_to_block_table(
             **kwargs,
             num_warps=_TOPK_BT_PINNED_NUM_WARPS,
             num_stages=2,
+        )
+
+
+_TOPK_SHADOW_LIMIT = int(os.environ.get("M3_PREFILL_TOPK_SHADOW_LIMIT", "0"))
+_topk_shadow_checked = 0
+_topk_shadow_mismatches = 0
+_topk_shadow_capture_warned = False
+if _TOPK_SHADOW_LIMIT:
+    print(
+        f"M3_PREFILL_TOPK_SHADOW_CONFIG pid={os.getpid()} "
+        f"limit={_TOPK_SHADOW_LIMIT}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _shadow_check_topk(max_seqblock_q, batch_size, num_heads, args, kwargs):
+    global _topk_shadow_checked, _topk_shadow_mismatches, _topk_shadow_capture_warned
+    if _topk_shadow_checked >= _TOPK_SHADOW_LIMIT:
+        return
+    output = args[3]
+    if output.is_cuda and torch.cuda.is_current_stream_capturing():
+        if not _topk_shadow_capture_warned:
+            print("M3_PREFILL_TOPK_SHADOW skipped during CUDA Graph capture",
+                  file=sys.stderr, flush=True)
+            _topk_shadow_capture_warned = True
+        return
+    shadow = torch.empty_strided(
+        output.shape, output.stride(), dtype=output.dtype, device=output.device
+    )
+    shadow.fill_(-1)
+    shadow_args = list(args)
+    shadow_args[3] = shadow
+    _topk_to_block_table_multirow_kernel[
+        (triton.cdiv(max_seqblock_q, _MULTIROW_BLOCK_Q), batch_size, num_heads)
+    ](
+        *shadow_args,
+        **kwargs,
+        BLOCK_Q=_MULTIROW_BLOCK_Q,
+        num_warps=_MULTIROW_NUM_WARPS,
+        num_stages=2,
+    )
+    equal = torch.equal(output, shadow)
+    _topk_shadow_checked += 1
+    _topk_shadow_mismatches += not equal
+    if (
+        not equal
+        or _topk_shadow_checked == 1
+        or _topk_shadow_checked % 50 == 0
+        or _topk_shadow_checked == _TOPK_SHADOW_LIMIT
+    ):
+        print(
+            f"M3_PREFILL_TOPK_SHADOW pid={os.getpid()} "
+            f"checked={_topk_shadow_checked} "
+            f"mismatches={_topk_shadow_mismatches} "
+            f"equal={equal} shape={tuple(output.shape)}",
+            file=sys.stderr,
+            flush=True,
         )
 
 

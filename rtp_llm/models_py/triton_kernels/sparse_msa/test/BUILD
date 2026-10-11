@@ -174,3 +174,17 @@ py_test(
     tags = ["SM100_X86"],
     exec_properties = {"gpu": "SM100_X86", "gpu_count": "1"},
 )
+
+# Diagnostic reproducer for the frozen Champion binary's prior-tensor-core
+# state bug. It expects the known failure, not production correctness.
+py_test(
+    name = "test_champion_nonfinite_smoke",
+    srcs = ["test_champion_nonfinite_smoke.py"],
+    deps = [
+        "//rtp_llm:torch",
+        "//rtp_llm/models_py/triton_kernels:sparse_msa",
+    ],
+    env = {"GPU_COUNT": "1"},
+    tags = ["SM100_X86"],
+    exec_properties = {"gpu": "SM100_X86", "gpu_count": "1"},
+)

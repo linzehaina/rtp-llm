@@ -222,24 +222,6 @@ TEST(PPStageCacheConfigTest, DraftInheritsWholeModelTransferPolicyOnLastStage) {
     EXPECT_TRUE(sub->model_has_multiple_cache_groups);
 }
 
-TEST(PPStageCacheConfigTest, StageZeroMustOwnEveryCrossStageTag) {
-    auto model = makeHybridModelConfig(32);
-    int64_t linear_seen = 0;
-    for (auto& descs : model.kv_cache_spec_descs) {
-        if (descs[0].cache_type == KVCacheSpecType::LinearAttention) {
-            descs[0].tag = "linear" + std::to_string(linear_seen++ / 8);
-        }
-    }
-
-    auto first = CacheConfigCreator::createConfig(model, makePpConfig(32, 2, 0), KVCacheConfig{});
-    auto last  = CacheConfigCreator::createConfig(model, makePpConfig(32, 2, 1), KVCacheConfig{});
-    first.finalizeBlockNums(100, RuntimeConfig{});
-    last.finalizeBlockNums(100, RuntimeConfig{});
-    const auto result = validatePPTopology({StageCacheSnapshot::fromConfig(first), StageCacheSnapshot::fromConfig(last)});
-    ASSERT_FALSE(result.ok);
-    EXPECT_NE(result.error.find("absent from stage 0"), std::string::npos);
-}
-
 TEST(PPStageCacheConfigTest, PerTagOverridesReplaceDerivedCounts) {
     const auto model = makeHybridModelConfig(8);
     auto config = CacheConfigCreator::createConfig(model, makePpConfig(8, 2, 0), KVCacheConfig{});

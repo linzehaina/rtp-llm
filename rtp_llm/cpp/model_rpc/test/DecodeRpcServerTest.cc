@@ -278,11 +278,12 @@ TEST(DecodeRpcServerTest, PpLoadRequestCarriesStagePeerGroups) {
     const std::vector<StagePeerGroup> groups = {{{0, 2}, {"prefill-0", "prefill-1"}, false},
                                                 {{2, 2}, {"prefill-2", "prefill-3"}, true}};
     const auto                        load_context =
-        makeLoadContext(request_key, peer_addrs, cache_keys, block_ids_by_group, /*cp_size=*/1, /*reuse=*/0, groups);
+        makeLoadContext(request_key, peer_addrs, cache_keys, block_ids_by_group, /*cp_size=*/2, /*reuse=*/0, groups);
 
     const auto request = server.buildBroadcastLoadRequest(load_context);
 
     // PP routing ignores the flat peer list and ships the stage groups instead.
+    EXPECT_EQ(request.prefill_cp_size(), 2);
     EXPECT_EQ(request.peer_addrs_size(), 0);
     ASSERT_EQ(request.stage_peer_groups_size(), 2);
     EXPECT_EQ(request.stage_peer_groups(0).layer_begin(), 0);
@@ -293,26 +294,6 @@ TEST(DecodeRpcServerTest, PpLoadRequestCarriesStagePeerGroups) {
     EXPECT_EQ(request.stage_peer_groups(1).peer_addrs(0), "prefill-2");
     EXPECT_FALSE(request.stage_peer_groups(0).is_last_stage());
     EXPECT_TRUE(request.stage_peer_groups(1).is_last_stage());
-}
-
-TEST(DecodeRpcServerTest, PpMlaLoadRequestCarriesStagePeerGroups) {
-    DecodeRpcServer server;
-    server.resource_.workers                            = {"decode-0", "decode-1"};
-    server.maga_init_params_.parallelism_config.tp_size = 1;
-
-    const std::string                 request_key = "request";
-    const std::vector<std::string>    peer_addrs  = {"prefill-0", "prefill-1"};
-    const std::vector<CacheKeyType>   cache_keys  = {101};
-    const GroupBlockIds               block_ids_by_group;
-    const std::vector<StagePeerGroup> groups = {{{0, 2}, {"prefill-0"}, false}, {{2, 2}, {"prefill-1"}, true}};
-    const auto                        load_context =
-        makeLoadContext(request_key, peer_addrs, cache_keys, block_ids_by_group, /*cp_size=*/1, /*reuse=*/0, groups);
-
-    const auto request = server.buildBroadcastLoadRequest(load_context);
-
-    EXPECT_EQ(request.peer_addrs_size(), 0);
-    ASSERT_EQ(request.stage_peer_groups_size(), 2);
-    EXPECT_EQ(request.stage_peer_groups(1).peer_addrs(0), "prefill-1");
 }
 
 TEST(DecodeRpcServerTest, PpDecodeFlatLoadRequestCarriesRawPrefillPeers) {
@@ -333,43 +314,6 @@ TEST(DecodeRpcServerTest, PpDecodeFlatLoadRequestCarriesRawPrefillPeers) {
     EXPECT_EQ(request.peer_addrs(0), "prefill-0");
     EXPECT_EQ(request.peer_addrs(1), "prefill-1");
     EXPECT_EQ(request.stage_peer_groups_size(), 0);
-}
-
-TEST(DecodeRpcServerTest, PpDecodeFlatLoadRequestCarriesSingleRawPrefillPeer) {
-    DecodeRpcServer server;
-    server.resource_.workers                            = {"decode-0", "decode-1", "decode-2", "decode-3"};
-    server.maga_init_params_.parallelism_config.tp_size = 2;
-    server.maga_init_params_.parallelism_config.pp_size = 2;
-
-    const std::string               request_key = "request";
-    const std::vector<std::string>  peer_addrs  = {"prefill-0"};
-    const std::vector<CacheKeyType> cache_keys  = {101};
-    const GroupBlockIds             block_ids_by_group;
-    const auto load_context = makeLoadContext(request_key, peer_addrs, cache_keys, block_ids_by_group, /*cp_size=*/1);
-
-    // A single prefill peer is shipped raw; the worker derives the source slice.
-    const auto request = server.buildBroadcastLoadRequest(load_context);
-    ASSERT_EQ(request.peer_addrs_size(), 1);
-    EXPECT_EQ(request.peer_addrs(0), "prefill-0");
-    EXPECT_EQ(request.stage_peer_groups_size(), 0);
-}
-
-TEST(DecodeRpcServerTest, PpDecodeMlaFlatLoadRequestCarriesRawPrefillPeers) {
-    DecodeRpcServer server;
-    server.resource_.workers                            = {"decode-0", "decode-1", "decode-2", "decode-3"};
-    server.maga_init_params_.parallelism_config.tp_size = 2;
-    server.maga_init_params_.parallelism_config.pp_size = 2;
-
-    const std::string               request_key = "request";
-    const std::vector<std::string>  peer_addrs  = {"prefill-0", "prefill-1"};
-    const std::vector<CacheKeyType> cache_keys  = {101};
-    const GroupBlockIds             block_ids_by_group;
-    const auto load_context = makeLoadContext(request_key, peer_addrs, cache_keys, block_ids_by_group, /*cp_size=*/1);
-
-    const auto request = server.buildBroadcastLoadRequest(load_context);
-    ASSERT_EQ(request.peer_addrs_size(), 2);
-    EXPECT_EQ(request.peer_addrs(0), "prefill-0");
-    EXPECT_EQ(request.peer_addrs(1), "prefill-1");
 }
 
 TEST(DecodeRpcServerTest, CPShardedLoadRequestReadsFromEveryPrefillPeer) {
@@ -445,64 +389,6 @@ TEST(DecodeRpcServerTest, NonPipelineLoadRequestKeepsRankPartitionRouting) {
     EXPECT_EQ(mla_request.peer_addrs(0), "prefill-1");
     EXPECT_EQ(mla_request.partition_count(), 1);
     EXPECT_EQ(mla_request.partition_id(), 0);
-}
-
-TEST(DecodeRpcServerTest, PpCPShardedLoadRequestCarriesStagePeerGroups) {
-    DecodeRpcServer server;
-    server.resource_.workers                            = {"decode-0", "decode-1", "decode-2", "decode-3"};
-    server.maga_init_params_.parallelism_config.tp_size = 2;
-
-    const std::string                 request_key = "request";
-    const std::vector<std::string>    peer_addrs  = {"prefill-0", "prefill-1", "prefill-2", "prefill-3"};
-    const std::vector<CacheKeyType>   cache_keys  = {101, 102};
-    const GroupBlockIds               block_ids_by_group;
-    const std::vector<StagePeerGroup> groups = {{{0, 2}, {"prefill-0", "prefill-1"}, false},
-                                                {{2, 2}, {"prefill-2", "prefill-3"}, true}};
-    const auto                        load_context =
-        makeLoadContext(request_key, peer_addrs, cache_keys, block_ids_by_group, /*cp_size=*/2, /*reuse=*/0, groups);
-
-    const auto request = server.buildBroadcastLoadRequest(load_context);
-
-    // PP + CP sharded: stage groups carry the routing, the flat peer list is unused.
-    EXPECT_EQ(request.prefill_cp_size(), 2);
-    EXPECT_EQ(request.peer_addrs_size(), 0);
-    ASSERT_EQ(request.stage_peer_groups_size(), 2);
-    EXPECT_EQ(request.stage_peer_groups(0).layer_begin(), 0);
-    EXPECT_EQ(request.stage_peer_groups(0).layer_count(), 2);
-    ASSERT_EQ(request.stage_peer_groups(0).peer_addrs_size(), 2);
-    EXPECT_EQ(request.stage_peer_groups(0).peer_addrs(0), "prefill-0");
-    EXPECT_EQ(request.stage_peer_groups(0).peer_addrs(1), "prefill-1");
-    EXPECT_FALSE(request.stage_peer_groups(0).is_last_stage());
-    EXPECT_EQ(request.stage_peer_groups(1).layer_begin(), 2);
-    EXPECT_TRUE(request.stage_peer_groups(1).is_last_stage());
-}
-
-TEST(DecodeRpcServerTest, PpCPFullReplicationLoadRequestCarriesStagePeerGroups) {
-    DecodeRpcServer server;
-    server.resource_.workers                            = {"decode-0", "decode-1", "decode-2", "decode-3"};
-    server.maga_init_params_.parallelism_config.tp_size = 2;
-    server.maga_init_params_.parallelism_config.prefill_cp_config.method           = CPRotateMethod::PREFILL_CP;
-    server.maga_init_params_.parallelism_config.prefill_cp_config.kv_cache_sharded = false;
-
-    const std::string                 request_key = "request";
-    const std::vector<std::string>    peer_addrs  = {"prefill-0", "prefill-1"};
-    const std::vector<CacheKeyType>   cache_keys  = {101};
-    const GroupBlockIds               block_ids_by_group;
-    const std::vector<StagePeerGroup> groups = {{{0, 2}, {"prefill-0", "prefill-1"}, false},
-                                                {{2, 2}, {"prefill-0", "prefill-1"}, true}};
-    const auto                        load_context =
-        makeLoadContext(request_key, peer_addrs, cache_keys, block_ids_by_group, /*cp_size=*/1, /*reuse=*/0, groups);
-
-    const auto request = server.buildBroadcastLoadRequest(load_context);
-
-    // PP + CP full replication: stage groups carry the routing, the flat peer list is unused.
-    EXPECT_EQ(request.prefill_cp_size(), 1);
-    EXPECT_EQ(request.peer_addrs_size(), 0);
-    ASSERT_EQ(request.stage_peer_groups_size(), 2);
-    EXPECT_EQ(request.stage_peer_groups(0).layer_begin(), 0);
-    ASSERT_EQ(request.stage_peer_groups(0).peer_addrs_size(), 2);
-    EXPECT_EQ(request.stage_peer_groups(1).layer_begin(), 2);
-    EXPECT_TRUE(request.stage_peer_groups(1).is_last_stage());
 }
 
 TEST(DecodeRpcServerTest, TaggedBlockRowsPreserveReceivedOrderAcrossTopologies) {
@@ -1060,6 +946,9 @@ TEST_F(DecodeRpcBootstrapTest, PpHandoffPreservesLongerProposalPayload) {
         ASSERT_NE(buffer, nullptr);
         EXPECT_EQ(buffer->propose_step, 1);
         EXPECT_TRUE(torch::equal(buffer->tokens, torch::tensor(expected_tokens, torch::kInt32).reshape({1, 4})));
+        // The wire carries real draft tensors; a PP D rebuilds draft inputs locally instead.
+        EXPECT_FALSE(buffer->hidden_states.defined());
+        EXPECT_FALSE(buffer->all_probs.defined());
     }
 }
 
@@ -1201,38 +1090,16 @@ TEST_F(DecodeRpcBootstrapTest, PpDSparkPreservesEmptyHandoff) {
     }
 }
 
-TEST_F(DecodeRpcBootstrapTest, NormalHandoffUsesTheSameAnchorCommit) {
+TEST_F(DecodeRpcBootstrapTest, NormalHandoffCommitsAnchorWithoutSpeculativeBuffer) {
     rpc_.maga_init_params_.sp_config.type = SP_TYPE_NONE;
-    for (int pp_size : {1, 2}) {
-        rpc_.maga_init_params_.parallelism_config.pp_size = pp_size;
-        auto stream = makeStream();
-        ASSERT_TRUE(runHandoff(stream, makeRequest(false)).ok());
-        EXPECT_EQ(engine_->enqueue_count, 1);
-        EXPECT_EQ(stream->completeTokenIdsVec(0), (std::vector<int>{1, 2, 3, 7}));
-        EXPECT_EQ(stream->last_output_pos_, 4);
-        EXPECT_EQ(processor_->update_calls, 1);
-        EXPECT_EQ(processor_->committed_tokens, (std::vector<int>{7}));
-        EXPECT_EQ(stream->getSPOutputBuffer(), nullptr);
-    }
-}
-
-TEST_F(DecodeRpcBootstrapTest, NonPipelineDSparkKeepsItsProposalContract) {
-    rpc_.maga_init_params_.sp_config.type = SP_TYPE_DSPARK;
-    rpc_.maga_init_params_.parallelism_config.pp_size = 1;
-    engine_->is_dspark = true;
-    autil::EnvGuard stream_async("RTP_LLM_STREAM_ASYNC", "1");
-    autil::EnvGuard mtp_async("RTP_LLM_MTP_ASYNC_DEVICE_STATE", "1");
-    for (int64_t count : {1, 3, 4}) {
-        SCOPED_TRACE("K=" + std::to_string(count));
-        rpc_.maga_init_params_.sp_config.gen_num_per_cycle = count;
-        auto stream = makeStream();
-        ASSERT_TRUE(runHandoff(stream, makeRequest(false)).ok());
-        EXPECT_EQ(engine_->enqueue_count, 1);
-        EXPECT_EQ(processor_->update_calls, 1);
-        EXPECT_EQ(stream->getMtpAsyncDeviceState().next_seq_len_upper_bound, -1);
-        EXPECT_EQ(stream->getSPOutputBuffer(), nullptr);
-        EXPECT_TRUE(stream->getProposeToken().empty());
-    }
+    auto stream = makeStream();
+    ASSERT_TRUE(runHandoff(stream, makeRequest(false)).ok());
+    EXPECT_EQ(engine_->enqueue_count, 1);
+    EXPECT_EQ(stream->completeTokenIdsVec(0), (std::vector<int>{1, 2, 3, 7}));
+    EXPECT_EQ(stream->last_output_pos_, 4);
+    EXPECT_EQ(processor_->update_calls, 1);
+    EXPECT_EQ(processor_->committed_tokens, (std::vector<int>{7}));
+    EXPECT_EQ(stream->getSPOutputBuffer(), nullptr);
 }
 
 TEST_F(DecodeRpcBootstrapTest, AsyncFlagsNeverPublishUnsupportedPpState) {

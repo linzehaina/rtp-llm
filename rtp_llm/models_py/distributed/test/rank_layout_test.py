@@ -1,6 +1,6 @@
-# Pure unit test (no torch, no GPU) for RankLayout. Legacy rank formulas are
-# reproduced below as reference oracles only; RankLayout must agree with them
-# over an exhaustive sweep of (pp, dp, tp) layouts.
+"""Pure unit test (no torch, no GPU) for RankLayout. Legacy rank formulas are
+reproduced below as reference oracles only; RankLayout must agree with them
+over an exhaustive sweep of (pp, dp, tp) layouts."""
 
 import itertools
 import unittest
@@ -186,8 +186,8 @@ class RankLayoutGroupsTest(unittest.TestCase):
                 self.assertEqual(layout.rank_in_group(Group.WORLD, r), r)
 
     def test_stage_groups_are_per_stage_exhaustive(self):
-        # STAGE: one group per pp stage holding all its dp*tp ranks; the
-        # in-group position is the lane-local index dp * tp_size + tp.
+        """STAGE: one group per pp stage holding all its dp*tp ranks; the
+        in-group position is the lane-local index dp * tp_size + tp."""
         for pp_size, dp_size, tp_size in _SWEEP:
             layout = RankLayout(pp_size=pp_size, dp_size=dp_size, tp_size=tp_size)
             stride = dp_size * tp_size

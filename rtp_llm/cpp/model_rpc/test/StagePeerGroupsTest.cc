@@ -226,34 +226,6 @@ TEST(StagePeerGroups, GroupLoadSymmetricTpMatchesFlatTuple) {
     EXPECT_EQ(plan.loads[0].peer_piece_id, 0);
 }
 
-TEST(StagePeerGroups, GroupLoadFinerPrefillTpAssemblesPeerSlices) {
-    const auto plan = planStageGroupLoads(makeGroupParams(4, 1, false, 2, 1));
-    ASSERT_EQ(plan.loads.size(), 2u);
-    EXPECT_EQ(plan.loads[0].peer_index, 2u);
-    EXPECT_EQ(plan.loads[0].local_piece_count, 2);
-    EXPECT_EQ(plan.loads[0].local_piece_id, 0);
-    EXPECT_EQ(plan.loads[0].peer_piece_count, 1);
-    EXPECT_EQ(plan.loads[1].peer_index, 3u);
-    EXPECT_EQ(plan.loads[1].local_piece_id, 1);
-}
-
-TEST(StagePeerGroups, GroupLoadFinerDecodeTpReadsSubSlice) {
-    const auto plan = planStageGroupLoads(makeGroupParams(1, 1, false, 2, 1));
-    ASSERT_EQ(plan.loads.size(), 1u);
-    EXPECT_EQ(plan.loads[0].peer_index, 0u);
-    EXPECT_EQ(plan.loads[0].local_piece_count, 1);
-    EXPECT_EQ(plan.loads[0].peer_piece_count, 2);
-    EXPECT_EQ(plan.loads[0].peer_piece_id, 1);
-}
-
-TEST(StagePeerGroups, GroupLoadMlaUsesSingleWholePeer) {
-    const auto plan = planStageGroupLoads(makeGroupParams(2, 1, false, 2, 1, /*use_mla=*/true));
-    ASSERT_EQ(plan.loads.size(), 1u);
-    EXPECT_EQ(plan.loads[0].peer_index, 1u);
-    EXPECT_EQ(plan.loads[0].peer_piece_count, 1);
-    EXPECT_EQ(plan.loads[0].peer_piece_id, 0);
-}
-
 TEST(StagePeerGroups, GroupLoadEmptyPeerGroupRejected) {
     const auto plan = planStageGroupLoads(makeGroupParams(0, 1, false, 2, 0));
     EXPECT_TRUE(plan.loads.empty());

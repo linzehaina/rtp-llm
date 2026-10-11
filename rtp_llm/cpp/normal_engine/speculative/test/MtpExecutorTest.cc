@@ -21,7 +21,6 @@
 #include "rtp_llm/cpp/normal_engine/speculative/MtpBatchStreamProcessor.h"
 #include "rtp_llm/cpp/normal_engine/NormalGenerateStream.h"
 #include "rtp_llm/cpp/normal_engine/speculative/MtpExecutor.h"
-#include "rtp_llm/cpp/normal_engine/speculative/MtpCompute.h"
 #include "rtp_llm/cpp/models/SampleInfos.h"
 #include "rtp_llm/cpp/models/ModelTypes.h"
 #include "rtp_llm/models_py/bindings/core/Types.h"
@@ -1936,55 +1935,6 @@ TEST_F(MtpExecutorTest, testDecodeOneStepSpecLogitsCapReplacesInvalidDraftWithTa
     ASSERT_TRUE(status.ok());
 
     checkOutput(stream, {0, 1, 2, 1}, {1, 2}, {0.0, 0.0, 1.0, 0.0}, {});
-}
-
-TEST_F(MtpExecutorTest, testMtpHiddenOverridePreservesRowSelection) {
-    auto components = createMtpExecutorComponents(MtpExecutorTestConfig{});
-    auto& source     = *components.fake_target_model;
-    auto hidden     = torch::arange(24, torch::kFloat32).reshape({6, 4});
-    source.setMtpTargetHiddenStates(hidden);
-
-    struct Case {
-        int64_t              rows;
-        torch::Tensor        fallback;
-        std::vector<int64_t> requests;
-        int64_t              result_rows;
-    };
-    const std::vector<Case> cases = {
-        {0, torch::Tensor(), {}, 0},
-        {0, torch::empty({0, 4}), {}, 0},
-        {0, torch::zeros({3, 4}), {3}, 3},
-        {4, torch::Tensor(), {4}, 4},
-        {4, torch::empty({0, 4}), {4}, 4},
-        {4, torch::zeros({2, 4}), {4}, 4},
-        {-1, torch::zeros({8, 4}), {-1}, 6},
-    };
-    for (size_t i = 0; i < cases.size(); ++i) {
-        SCOPED_TRACE(i);
-        const auto& test_case = cases[i];
-        source.mtp_hidden_requests.clear();
-        GptModelOutputs output;
-        output.all_hidden_states = test_case.fallback;
-        mtp::maybeOverrideLastHiddenWithMtpBuffer(output, source, test_case.rows);
-        EXPECT_EQ(source.mtp_hidden_requests, test_case.requests);
-        if (test_case.requests.empty()) {
-            EXPECT_EQ(output.all_hidden_states.unsafeGetTensorImpl(), test_case.fallback.unsafeGetTensorImpl());
-        } else {
-            EXPECT_TRUE(torch::equal(output.all_hidden_states, hidden.narrow(0, 0, test_case.result_rows)));
-            EXPECT_EQ(output.all_hidden_states.data_ptr(), hidden.data_ptr());
-        }
-    }
-
-    for (const auto& missing : {torch::Tensor(), torch::empty({0, 4})}) {
-        source.setMtpTargetHiddenStates(missing);
-        source.mtp_hidden_requests.clear();
-        auto fallback = hidden.slice(1, 0, 4, 2);
-        GptModelOutputs output;
-        output.all_hidden_states = fallback;
-        mtp::maybeOverrideLastHiddenWithMtpBuffer(output, source);
-        EXPECT_EQ(source.mtp_hidden_requests, (std::vector<int64_t>{6}));
-        EXPECT_EQ(output.all_hidden_states.unsafeGetTensorImpl(), fallback.unsafeGetTensorImpl());
-    }
 }
 
 TEST_F(MtpExecutorTest, testDraftPrefillReadsHiddenFromActualCommitModel) {

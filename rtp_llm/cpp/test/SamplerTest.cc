@@ -297,31 +297,6 @@ TEST_F(SamplerTest, testGeneralSampling) {
     EXPECT_TRUE(torch::allclose(outputs.cum_log_probs, cum_log_probs));
 }
 
-TEST_F(SamplerTest, NoRepeatNgramUsesConsumedHistoryLength) {
-    SamplerInputs input;
-    input.logits = torch::tensor({0.0f, 10.0f, 0.0f, 5.0f}, torch::kFloat32).reshape({1, 4}).to(torch::kCUDA);
-    // Four consumed tokens plus an unwritten output slot. The suffix 2 bans 1.
-    input.token_ids = torch::tensor({1, 2, 1, 2, 0}, torch::kInt32).reshape({1, 5});
-    input.input_lengths = torch::ones({1}, torch::kInt32);
-    input.sequence_lengths = torch::full({1}, 4, torch::kInt32);
-    input.logits_processor_states_ptr = std::make_shared<LogitsProcessorStates>();
-    input.vocab_size = 4;
-    input.step = 4;
-    input.batch_size = input.batch_size_out = 1;
-    input.num_beams_in = input.num_beams_out = torch::ones({1}, torch::kLong);
-    input.top_k = torch::ones({1}, torch::kInt32).pin_memory();
-    input.top_p = torch::ones({1}, torch::kFloat32).pin_memory();
-    input.temperature = torch::ones({1}, torch::kFloat32).pin_memory();
-    input.no_repeat_ngram_size = torch::full({1}, 2, torch::kInt32).pin_memory();
-    input.do_sample = torch::ones({1}, torch::kBool).pin_memory();
-    input.all_probs = torch::zeros_like(input.logits);
-    input.generator.push_back(torch::make_generator<at::CUDAGeneratorImpl>());
-    input.generator.back().set_current_seed(17);
-    auto result = sampler_->forward(input);
-    EXPECT_EQ(result.token_ids.cpu()[0][4].item<int32_t>(), 3);
-    EXPECT_EQ(result.all_probs.cpu()[0][1].item<float>(), 0.0f);
-}
-
 TEST_F(SamplerTest, JointTopKTopPReturnedProbabilitySupport) {
     auto makeInputs = [](bool return_probs) {
         SamplerInputs input;

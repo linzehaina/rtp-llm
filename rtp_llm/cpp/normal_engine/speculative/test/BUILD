@@ -70,6 +70,30 @@ cc_test(
 )
 
 cc_test(
+    name = "mtp_compute_test",
+    srcs = glob([
+        "MtpComputeTest.cc",
+    ]),
+    data = [],
+    copts = test_copts,
+    deps = [
+        "//rtp_llm/cpp/testing:device_test_utils",
+        "//rtp_llm/models_py/bindings/cuda/ops:cuda_impl",
+        "//rtp_llm/cpp/normal_engine:normal_engine",
+        "//rtp_llm/cpp/models:models",
+        "//rtp_llm/cpp/models:logits_processor",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+        "@local_config_cuda//cuda:cuda_headers",
+        "@local_config_cuda//cuda:cudart",
+    ] + torch_deps() + cuda13_torch_link_deps,
+    env = {
+        "TEST_USING_DEVICE": "CUDA",
+    },
+    exec_properties = {'gpu':'A10'},
+)
+
+cc_test(
     name = "mtp_executor_test",
     srcs = glob([
         "MtpExecutorTest.cc",

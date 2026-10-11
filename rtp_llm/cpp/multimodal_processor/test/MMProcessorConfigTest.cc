@@ -26,15 +26,13 @@ TEST(MMProcessorConfigTest, resolvesOnlyValidIngressConfigurations) {
 }
 
 TEST(MMProcessorConfigTest, downstreamPipelineStagesDoNotRequireMultimodalIngress) {
-    for (auto role_type : {PDFUSION, PREFILL}) {
-        for (int64_t pp_rank : {1, 2}) {
-            for (auto separation : {VIT_SEPARATION_LOCAL, VIT_SEPARATION_REMOTE}) {
-                const auto decision = resolveAndLogMMProcessorKind(
-                    true, separation, false, role_type, 0, pp_rank, "qwen35_dense", "LocalRpcServer");
-                EXPECT_TRUE(decision.ok()) << decision.error;
-                EXPECT_EQ(decision.kind, MMProcessorKind::NONE);
-            }
-        }
+    // ownsMultimodalIngress short-circuits on pp_rank, so role_type and vit_separation cannot change this outcome.
+    for (int64_t pp_rank : {1, 2}) {
+        SCOPED_TRACE(pp_rank);
+        const auto decision = resolveAndLogMMProcessorKind(
+            true, VIT_SEPARATION_LOCAL, false, PDFUSION, 0, pp_rank, "qwen35_dense", "LocalRpcServer");
+        EXPECT_TRUE(decision.ok()) << decision.error;
+        EXPECT_EQ(decision.kind, MMProcessorKind::NONE);
     }
 }
 

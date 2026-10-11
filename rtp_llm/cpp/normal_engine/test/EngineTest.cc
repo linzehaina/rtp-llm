@@ -682,7 +682,7 @@ TEST_F(NormalEngineTest, testParallelDispatchMultipleRequests) {
     engine.reset();
 }
 
-TEST_F(NormalEngineTest, ppReserveCoversTwoWindowsWithoutAddingToMainDSparkReserve) {
+TEST_F(NormalEngineTest, testPpReserveCoversTwoWindowsWithoutAddingToMainDSparkReserve) {
     EngineInitParams params;
     for (const auto type : {SP_TYPE_MTP, SP_TYPE_DSPARK}) {
         params.sp_config.type = type;

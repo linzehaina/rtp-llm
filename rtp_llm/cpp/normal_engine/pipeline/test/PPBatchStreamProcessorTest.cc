@@ -85,19 +85,24 @@ protected:
         previous_backend_ = LogitsProcessorFactory::grammarBackend();
         LogitsProcessorFactory::grammarBackend().reset();
         model_config_.max_seq_len                 = 64;
-        model_config_.vocab_size                  = 64;
-        model_config_.input_vocab_size            = 64;
+        setVocab(64);
         model_config_.num_layers                  = 1;
         model_config_.hidden_size                 = 4;
         model_config_.attn_config.head_num        = 2;
         model_config_.attn_config.kv_head_num     = 2;
         model_config_.attn_config.size_per_head   = 2;
-        model_config_.special_tokens.eos_token_id = 63;
     }
 
     void TearDown() override {
         LogitsProcessorFactory::grammarBackend() = std::move(previous_backend_);
         DeviceTestBase::TearDown();
+    }
+
+    /** vocab_size, input_vocab_size and eos_token_id move together; eos is always vocab_size - 1. */
+    void setVocab(int64_t size) {
+        model_config_.vocab_size                  = size;
+        model_config_.input_vocab_size            = size;
+        model_config_.special_tokens.eos_token_id = size - 1;
     }
 
     static GenerateConfig config(int sequences = 1) {
@@ -166,9 +171,7 @@ protected:
     }
 
     void initGrammar() {
-        model_config_.vocab_size                 = 4;
-        model_config_.input_vocab_size           = 4;
-        model_config_.special_tokens.eos_token_id = 3;
+        setVocab(4);
         GrammarConfig grammar_config;
         grammar_config.num_workers = 1;
         LogitsProcessorFactory::grammarBackend() = XGrammarBackend::create(
@@ -451,9 +454,7 @@ TEST_F(PPBatchStreamProcessorTest, SamplingStateInitializationFailureIsRequestLo
 
 /** 3. Sampler inputs: row expansion must preserve histories, parameters and processor routing. */
 TEST_F(PPBatchStreamProcessorTest, SamplerInputsRouteMultiSequenceStateAndClampPositiveTopK) {
-    model_config_.vocab_size                 = 16;
-    model_config_.input_vocab_size           = 16;
-    model_config_.special_tokens.eos_token_id = 15;
+    setVocab(16);
     auto cfg = config(2);
     cfg.top_k                = 99;
     cfg.random_seed          = 123;
@@ -540,9 +541,7 @@ TEST_F(PPBatchStreamProcessorTest, VerifySamplerInputsExpandEachCandidatePrefix)
 }
 
 TEST_F(PPBatchStreamProcessorTest, SamplerInputsPreserveRequestedRawLogitsAndProbabilityMode) {
-    model_config_.vocab_size                 = 4;
-    model_config_.input_vocab_size           = 4;
-    model_config_.special_tokens.eos_token_id = 3;
+    setVocab(4);
     auto stream    = makeStream(101, {1, 2});
     auto processor = makeProcessor();
     const auto plan = processor.gatherSamplingPlan(StreamGroups({stream}));
@@ -572,9 +571,7 @@ TEST_F(PPBatchStreamProcessorTest, SamplerInputsPreserveRequestedRawLogitsAndPro
 }
 
 TEST_F(PPBatchStreamProcessorTest, OrdinarySamplerMasksPaddingAndKeepsProbabilityWidth) {
-    model_config_.vocab_size                 = 4;
-    model_config_.input_vocab_size           = 4;
-    model_config_.special_tokens.eos_token_id = 3;
+    setVocab(4);
     for (bool compact_vocab : {false, true}) {
         SCOPED_TRACE(compact_vocab);
         model_config_.output_vocab_ids = compact_vocab ? std::vector<int64_t>{0, 2, 3} : std::vector<int64_t>{};
@@ -611,9 +608,7 @@ TEST_F(PPBatchStreamProcessorTest, OrdinarySamplerMasksPaddingAndKeepsProbabilit
 }
 
 TEST_F(PPBatchStreamProcessorTest, VerifySamplerUsesOnlyTheConfiguredTargetVocabulary) {
-    model_config_.vocab_size                 = 4;
-    model_config_.input_vocab_size           = 4;
-    model_config_.special_tokens.eos_token_id = 3;
+    setVocab(4);
     auto stream = makeStream(101, {1, 2});
     commitTokens(stream, intTensor({0}).reshape({1, 1}));
     for (auto type : {SP_TYPE_MTP, SP_TYPE_DSPARK}) {
@@ -895,9 +890,7 @@ TEST_F(PPBatchStreamProcessorTest, FillResultUsesCompactProbabilityBeforeRestori
 }
 
 TEST_F(PPBatchStreamProcessorTest, FillResultPromptScoresUseFirstSequenceOnlyInPrefill) {
-    model_config_.vocab_size                 = 4;
-    model_config_.input_vocab_size           = 4;
-    model_config_.special_tokens.eos_token_id = 3;
+    setVocab(4);
     auto cfg = config(2);
     cfg.calculate_loss        = 2;
     cfg.return_prompt_logits  = true;

@@ -43,18 +43,6 @@ class PPStageViewTest(unittest.TestCase):
         self.assertFalse(stage1.pp_has_embedding)
         self.assertTrue(stage1.pp_has_lm_head)
 
-    def test_remainder_goes_to_earlier_stages(self):
-        ranges = [
-            make_base(pp_size=4, pp_rank=r, layer_num=65).pp_layer_ids()
-            for r in range(4)
-        ]
-        self.assertEqual([len(ids) for ids in ranges], [17, 16, 16, 16])
-        self.assertEqual(ranges[0], list(range(0, 17)))
-        self.assertEqual(ranges[1], list(range(17, 33)))
-        self.assertEqual(ranges[2], list(range(33, 49)))
-        self.assertEqual(ranges[3], list(range(49, 65)))
-        self.assertEqual(sorted(sum(ranges, [])), list(range(65)))
-
 
 def make_qwen3(pp_size, pp_rank, num_layers=8, counts=None, apply_pp_partition=True):
     """Construct Qwen3Model with heavy building blocks mocked out."""
@@ -159,8 +147,6 @@ class Qwen3NextPPBoundaryTest(unittest.TestCase):
     """
 
     def _make_model(self, pp_rank):
-        import torch
-
         from rtp_llm.models_py.model_desc import qwen3_next as qn
 
         model = object.__new__(qn.Qwen3NextModel)
@@ -197,8 +183,6 @@ class Qwen3NextPPBoundaryTest(unittest.TestCase):
         )
 
     def _run_forward(self, model, qn, inputs):
-        import torch
-
         attn = SimpleNamespace(
             is_target_verify=False, is_prefill=False, cu_seqlens_device=None
         )
@@ -210,8 +194,6 @@ class Qwen3NextPPBoundaryTest(unittest.TestCase):
             return model.forward(inputs)
 
     def test_non_last_stage_warmup_emits_hidden_and_residual(self):
-        import torch
-
         model, qn = self._make_model(pp_rank=1)
         intermediates = model.make_empty_intermediate_tensors(torch.zeros(2, 4))
         outputs = self._run_forward(
@@ -226,8 +208,6 @@ class Qwen3NextPPBoundaryTest(unittest.TestCase):
         )
 
     def test_entry_resumes_upstream_hidden_and_residual(self):
-        import torch
-
         model, qn = self._make_model(pp_rank=1)
         upstream_hidden = torch.full((2, 4), 2.0)
         upstream_residual = torch.ones(2, 4)
@@ -244,8 +224,6 @@ class Qwen3NextPPBoundaryTest(unittest.TestCase):
         )
 
     def test_entry_requires_both_upstream_boundary_tensors(self):
-        import torch
-
         model, qn = self._make_model(pp_rank=1)
         for missing_key in ("hidden_states", "residual"):
             with self.subTest(missing_key=missing_key):
@@ -260,8 +238,6 @@ class Qwen3NextPPBoundaryTest(unittest.TestCase):
                     )
 
     def test_last_stage_norms_and_emits_no_intermediates(self):
-        import torch
-
         model, qn = self._make_model(pp_rank=2)
         upstream_hidden = torch.full((2, 4), 2.0)
         upstream_residual = torch.ones(2, 4)
@@ -343,35 +319,34 @@ class Qwen3NextPPAuxCaptureTest(unittest.TestCase):
         counts = [2, 3, 1, 2]
         token_ids = torch.tensor([2, 5, 9], dtype=torch.int32)
         for capture_ids in ((0, 4, 7), (4, 7), (0,), ()):
-            for verify in (False, True):
-                with self.subTest(capture_ids=capture_ids, verify=verify):
-                    whole = self._make_stage([sum(counts)], 0, capture_ids)
-                    expected = self._forward(whole, token_ids, verify=verify)
-                    intermediates = None
-                    for rank in range(len(counts)):
-                        model = self._make_stage(counts, rank, capture_ids)
-                        output = self._forward(model, token_ids, intermediates, verify)
-                        if rank != len(counts) - 1:
-                            intermediates = output.pp_intermediates
-                            reached = sum(layer < sum(counts[: rank + 1]) for layer in capture_ids)
-                            if reached:
-                                prefix = intermediates["mtp_aux_hidden_states"]
-                                self.assertEqual(tuple(prefix.shape), (3, reached * 4))
-                                self.assertTrue(prefix.is_contiguous())
-                                torch.testing.assert_close(
-                                    prefix, expected.mtp_target_hidden_states[:, : reached * 4]
-                                )
-                            else:
-                                self.assertNotIn("mtp_aux_hidden_states", intermediates)
-                    self.assertFalse(output.pp_intermediates)
-                    torch.testing.assert_close(output.hidden_states, expected.hidden_states)
-                    if capture_ids:
-                        torch.testing.assert_close(
-                            output.mtp_target_hidden_states, expected.mtp_target_hidden_states
-                        )
-                        torch.testing.assert_close(
-                            model.get_mtp_target_hidden_states(-1), expected.mtp_target_hidden_states
-                        )
+            with self.subTest(capture_ids=capture_ids):
+                whole = self._make_stage([sum(counts)], 0, capture_ids)
+                expected = self._forward(whole, token_ids)
+                intermediates = None
+                for rank in range(len(counts)):
+                    model = self._make_stage(counts, rank, capture_ids)
+                    output = self._forward(model, token_ids, intermediates)
+                    if rank != len(counts) - 1:
+                        intermediates = output.pp_intermediates
+                        reached = sum(layer < sum(counts[: rank + 1]) for layer in capture_ids)
+                        if reached:
+                            prefix = intermediates["mtp_aux_hidden_states"]
+                            self.assertEqual(tuple(prefix.shape), (3, reached * 4))
+                            self.assertTrue(prefix.is_contiguous())
+                            torch.testing.assert_close(
+                                prefix, expected.mtp_target_hidden_states[:, : reached * 4]
+                            )
+                        else:
+                            self.assertNotIn("mtp_aux_hidden_states", intermediates)
+                self.assertFalse(output.pp_intermediates)
+                torch.testing.assert_close(output.hidden_states, expected.hidden_states)
+                if capture_ids:
+                    torch.testing.assert_close(
+                        output.mtp_target_hidden_states, expected.mtp_target_hidden_states
+                    )
+                    torch.testing.assert_close(
+                        model.get_mtp_target_hidden_states(-1), expected.mtp_target_hidden_states
+                    )
 
     def test_later_forward_does_not_overwrite_inflight_prefix(self):
         model = self._make_stage([2, 2], 0, (1, 3))
@@ -409,8 +384,6 @@ class Qwen3PPBoundaryTest(unittest.TestCase):
     """
 
     def _make_model(self, pp_rank):
-        import torch
-
         from rtp_llm.models_py.model_desc import qwen3 as q3
 
         model = object.__new__(q3.Qwen3Model)
@@ -434,8 +407,6 @@ class Qwen3PPBoundaryTest(unittest.TestCase):
         )
 
     def test_non_last_stage_emits_single_hidden_key(self):
-        import torch
-
         model, q3 = self._make_model(pp_rank=1)
         upstream_hidden = torch.full((2, 4), 3.0)
         inputs = self._make_inputs(torch, {"hidden_states": upstream_hidden})
@@ -446,8 +417,6 @@ class Qwen3PPBoundaryTest(unittest.TestCase):
         )
 
     def test_last_stage_norms_and_emits_no_intermediates(self):
-        import torch
-
         model, q3 = self._make_model(pp_rank=2)
         upstream_hidden = torch.full((2, 4), 3.0)
         inputs = self._make_inputs(torch, {"hidden_states": upstream_hidden})

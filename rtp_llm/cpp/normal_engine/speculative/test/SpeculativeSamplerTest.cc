@@ -34,7 +34,7 @@ TEST(FastTopKSamplerTest, TopKGreaterThanOneReturnsTopKIndices) {
     EXPECT_EQ(out.token_ids[0][1].item<int64_t>(), 3);
 }
 
-TEST(PointMassVerifierTest, FixedCandidatesUseTargetAcceptanceAndResidualDistribution) {
+TEST(ExecRejectionSamplingTest, FixedCandidatesUseTargetAcceptanceAndResidualDistribution) {
     constexpr int64_t batch = 7;
     constexpr int64_t width = 4;
     const auto i32 = torch::TensorOptions(torch::kInt32).device(torch::kCUDA);
@@ -114,11 +114,13 @@ TEST(MixedDraftProbabilitiesTest, MatchesExplicitTargetQWithoutCopyingSameVocabB
     };
 
     for (bool reduced_vocab : {false, true}) {
+        SCOPED_TRACE(reduced_vocab);
         InspectableSpeculativeSampler sampler(reduced_vocab ? torch::tensor({1, 3}, i64) : torch::Tensor(), steps);
         SpeculativeSampler reference({}, steps);
         float* mapped_storage = nullptr;
         /** Reuse the sampler with different missing rows and then all dense rows to expose stale q. */
         for (const std::vector<int64_t>& rows : std::vector<std::vector<int64_t>>{{0, 2}, {1, 3}, {}}) {
+            SCOPED_TRACE(::testing::PrintToString(rows));
             auto params = sampling_params();
             SamplerOutput draft;
             draft.token_ids = torch::tensor({1, 3}, torch::kInt32).reshape({1, steps}).repeat({batch, 1});
@@ -172,7 +174,7 @@ TEST(MixedDraftProbabilitiesTest, MatchesExplicitTargetQWithoutCopyingSameVocabB
     }
 }
 
-TEST(PointMassVerifierTest, ExplicitForceAcceptKeepsItsOverride) {
+TEST(SpeculativeSamplerTest, ExplicitForceAcceptKeepsItsOverride) {
     SpeculativeSampler sampler({}, 3);
     SamplerOutput draft;
     draft.token_ids = torch::ones({1, 3}, torch::kInt32);

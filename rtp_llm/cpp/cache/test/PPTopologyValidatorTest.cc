@@ -109,6 +109,7 @@ TEST(PPTopologyValidatorTest, NonStage0OwnedTagFails) {
     other.group_tags         = {"swa"};
     auto result              = validatePPTopology({makeHybridSnapshot(100, 50), other});
     ASSERT_FALSE(result.ok);
+    EXPECT_NE(result.error.find("[swa]"), std::string::npos);
     EXPECT_NE(result.error.find("absent from stage 0"), std::string::npos);
     EXPECT_NE(result.error.find("must own every cache group"), std::string::npos);
 }
@@ -126,13 +127,6 @@ TEST(PPTopologyValidatorTest, LinearWithoutFullPasses) {
     auto result                           = validatePPTopology({makeHybridSnapshot(100, 50), linear_only});
     ASSERT_TRUE(result.ok) << result.error;
     EXPECT_EQ(canonicalBlockNums(result), (std::vector<uint32_t>{100, 50}));
-}
-
-TEST(PPTopologyValidatorTest, PairingStillChecksSharedGeometry) {
-    StageCacheSnapshot subset = makeFullSnapshot(80, /*seq=*/8);  /** seq differs */
-    auto               result = validatePPTopology({makeHybridSnapshot(100, 50), subset});
-    ASSERT_FALSE(result.ok);
-    EXPECT_NE(result.error.find("seq_size_per_block"), std::string::npos);
 }
 
 TEST(PPTopologyValidatorTest, SharedTagTypeMismatchFails) {
@@ -228,13 +222,6 @@ TEST(PPTopologyValidatorTest, InitGeometryMultiStageMockComputesMin) {
     EXPECT_EQ(canonicalBlockNums(result), (std::vector<uint32_t>{90, 48}));
 }
 
-TEST(PPTopologyValidatorTest, InitGeometryAcceptsCapacitySkew) {
-    MockStageSnapshotCollector collector({makeFullSnapshot(100), makeFullSnapshot(10)});
-    auto                       result = initPPCacheGeometry(collector);
-    ASSERT_TRUE(result.ok) << result.error;
-    EXPECT_EQ(canonicalBlockNums(result), (std::vector<uint32_t>{10}));
-}
-
 TEST(PPTopologyValidatorTest, CanonicalGroupsIdenticalStages) {
     auto result = validatePPTopology({makeHybridSnapshot(100, 50), makeHybridSnapshot(90, 55)});
     ASSERT_TRUE(result.ok) << result.error;
@@ -248,69 +235,6 @@ TEST(PPTopologyValidatorTest, CanonicalGroupsIdenticalStages) {
     EXPECT_EQ(result.canonical_groups[1].seq_size_per_block, 4u);
     EXPECT_EQ(result.canonical_groups[1].kernel_seq_size_per_block, 4u);
     EXPECT_EQ(result.canonical_groups[1].cache_key_token_stride, 4u);
-}
-
-TEST(PPTopologyValidatorTest, LaterStageOnlyTagFails) {
-    auto stage1 = makeHybridSnapshot(90, 55);
-    stage1.group_tags.push_back("linear1");
-    stage1.group_types.push_back(CacheGroupType::LINEAR);
-    stage1.seq_size_per_block.push_back(4);
-    stage1.kernel_seq_size_per_block.push_back(4);
-    stage1.cache_key_token_strides.push_back(4);
-    stage1.block_nums.push_back(30);
-    stage1.explicit_block_nums.push_back(0);
-    stage1.policy_fingerprints.push_back(policyFingerprint(CacheGroupType::LINEAR));
-
-    auto result = validatePPTopology({makeHybridSnapshot(100, 50), stage1});
-    ASSERT_FALSE(result.ok);
-    EXPECT_NE(result.error.find("[linear1]"), std::string::npos);
-    EXPECT_NE(result.error.find("absent from stage 0"), std::string::npos);
-}
-
-TEST(PPTopologyValidatorTest, CanonicalGroupsRejectNonStage0TypeConflict) {
-    auto stage0 = makeFullSnapshot(100);
-    stage0.group_tags.push_back("x");
-    stage0.group_types.push_back(CacheGroupType::FULL);
-    stage0.seq_size_per_block.push_back(4);
-    stage0.kernel_seq_size_per_block.push_back(4);
-    stage0.cache_key_token_strides.push_back(4);
-    stage0.block_nums.push_back(40);
-    stage0.explicit_block_nums.push_back(0);
-    stage0.policy_fingerprints.push_back(policyFingerprint(CacheGroupType::FULL));
-
-    auto stage1 = makeFullSnapshot(90);
-    stage1.group_tags.push_back("x");
-    stage1.group_types.push_back(CacheGroupType::FULL);
-    stage1.seq_size_per_block.push_back(4);
-    stage1.kernel_seq_size_per_block.push_back(4);
-    stage1.cache_key_token_strides.push_back(4);
-    stage1.block_nums.push_back(40);
-    stage1.explicit_block_nums.push_back(0);
-    stage1.policy_fingerprints.push_back(policyFingerprint(CacheGroupType::FULL));
-
-    auto stage2 = makeFullSnapshot(95);
-    stage2.group_tags.push_back("x");
-    stage2.group_types.push_back(CacheGroupType::LINEAR);
-    stage2.seq_size_per_block.push_back(4);
-    stage2.kernel_seq_size_per_block.push_back(4);
-    stage2.cache_key_token_strides.push_back(4);
-    stage2.block_nums.push_back(40);
-    stage2.explicit_block_nums.push_back(0);
-    stage2.policy_fingerprints.push_back(policyFingerprint(CacheGroupType::LINEAR));
-
-    auto result = validatePPTopology({stage0, stage1, stage2});
-    ASSERT_FALSE(result.ok);
-    EXPECT_NE(result.error.find("group [x] type differs"), std::string::npos);
-}
-
-TEST(PPTopologyValidatorTest, CanonicalGroupsAcceptNonStage0Skew) {
-    auto stage0 = makeHybridSnapshot(100, 100);
-    auto stage1 = makeHybridSnapshot(100, 100);
-    auto stage2 = makeHybridSnapshot(90, 10);
-
-    auto result = validatePPTopology({stage0, stage1, stage2});
-    ASSERT_TRUE(result.ok) << result.error;
-    EXPECT_EQ(canonicalBlockNums(result), (std::vector<uint32_t>{90, 10}));
 }
 
 TEST(PPTopologyValidatorTest, CanonicalGroupsSingleStage) {

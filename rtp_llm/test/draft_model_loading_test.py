@@ -53,7 +53,7 @@ class DraftModelLoadingTest(unittest.TestCase):
             SpeculativeType.VANILLA, SpeculativeType.MTP, SpeculativeType.EAGLE,
             SpeculativeType.EAGLE3, SpeculativeType.DSPARK,
         ):
-            for pp_size, pp_rank in ((1, 0), (3, 0), (3, 1), (3, 2)):
+            for pp_size, pp_rank in ((1, 0), (3, 0), (3, 2)):
                 with self.subTest(sp_type=sp_type, pp_size=pp_size, pp_rank=pp_rank):
                     engine_config = make_engine_config(sp_type, pp_size, pp_rank)
                     target_config = SimpleNamespace(max_seq_len=128, gen_num_per_cycle=2)

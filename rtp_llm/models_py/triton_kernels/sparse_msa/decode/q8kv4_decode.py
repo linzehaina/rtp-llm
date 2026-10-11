@@ -25,10 +25,16 @@ reader (plus its BF16-Q Cake specialization) and the frozen ctypes champion in
 """
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import ClassVar
 
 import torch
+
+# Decode-campaign pair adoption gate (default OFF: production native radix
+# topk unchanged; set RTP_LLM_MSA_TRITON_TOPK=1 to adopt the pair per
+# pair_adoption/DECISION_MEMO.md).
+_TRITON_REG16_TOPK = os.environ.get("RTP_LLM_MSA_TRITON_TOPK", "0") == "1"
 
 from rtp_llm.models_py.triton_kernels.common.nvfp4_kv_cache import NVFP4CacheLayout
 from rtp_llm.models_py.triton_kernels.sparse_msa.decode.nvfp4_q8_attention import (
@@ -495,13 +501,31 @@ def _q8kv4_paged_sparse_decode(
     # Reuse MiniMax-M3's production decode TopK.  IndexScore already encodes
     # mandatory init/local pages with the same 1e30/1e29 sentinels, and this
     # op writes int32 page ids directly into a graph-stable workspace.
-    rtp_llm_ops.minimax_decode_topk(
-        index_scores,
-        seq_lens,
-        workspace.topk_i32,
-        int(block_size),
-        int(topk),
-    )
+    # Decode-campaign pair adoption (r1 H5 + r2 H5-stack policy rule): the
+    # Triton reg16w1 top-16 saves 1.13us kernel-time mean and emits canonical
+    # id-ascending slots (whole-chain bitwise determinism); the PAIR with the
+    # N1 score kernel saves 2.58us pair mean > the 2us bar.  Set
+    # RTP_LLM_MSA_TRITON_TOPK=0 to fall back to the native op (e.g. for
+    # eager deployments that cannot capture the Python launch in a graph --
+    # see pair_adoption/README.md for the +23.5us eager host-launch caveat).
+    if _TRITON_REG16_TOPK:
+        from .minimax_decode_topk_reg16 import triton_reg16_topk
+
+        triton_reg16_topk(
+            index_scores,
+            seq_lens,
+            workspace.topk_i32,
+            int(block_size),
+            int(topk),
+        )
+    else:
+        rtp_llm_ops.minimax_decode_topk(
+            index_scores,
+            seq_lens,
+            workspace.topk_i32,
+            int(block_size),
+            int(topk),
+        )
     topk_indices = workspace.topk_i32
     if use_native:
         # Attention stage only: the champion consumes the entry's own q8/topk

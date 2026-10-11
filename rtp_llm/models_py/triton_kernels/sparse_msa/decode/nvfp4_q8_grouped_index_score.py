@@ -1,10 +1,43 @@
-"""Grouped Q8KV4 target-verify IndexScore over the existing RTP cache ABI."""
+"""Grouped Q8KV4 target-verify IndexScore over the existing RTP cache ABI.
+
+Decode-campaign adopted kernel (rounds 1+2, opt_score_topk_r1/r2), uniform
+path only (the ragged variant below is unchanged):
+  * sk1 (r1): loop-invariant causal-mask fast-path skip.  The causal
+    ``tl.where`` is identically true for every tile whose 128 columns sit
+    below all live rows' causal lengths; only each request's final block(s)
+    contain a masked column.  Hoist the minimum once, branch uniformly, keep
+    the masked select on the ragged tail.  Bitwise-identical by construction.
+  * N1 (r2): the score store tail goes through ONE predicated
+    ``st.global.f32`` per lane via ``tl.inline_asm_elementwise`` instead of
+    the STSM.16.M88 -> BAR.SYNC -> LDSM.16.M88 -> STG.E smem transpose round
+    trip.  Bitwise-identical (duplicate lanes of the linear-slice layout
+    store identical bytes to identical addresses -- benign).
+
+Measured (L20D, 15-condition kernel-time matrix, locked bars): score
+67.87us mean vs 78.56us production = 0.8639x (sk1 alone 69.51 = 0.8849x).
+Kernel meta: 90 regs, 0 spills, 24584 B smem.
+"""
 
 import torch
 import triton
 import triton.language as tl
 
 from .nvfp4_q8_index_score import _load_index_page_fp8
+
+# r2 N1 store tail: an elementwise inline-asm op is NOT a memory op, so the
+# coalescer never assigns it a layout; the operand layout unification anchors
+# on the non-rematerializable max-tree chain and Triton rematerializes the
+# address/mask chains in the value's linear-slice layout -- the smem
+# transpose disappears.  Pointer tensors are rejected as inline-asm args, so
+# the address is passed as an int64 bitcast of ``OUT + output_row + block``.
+_ASM_DIRECT_STG = tl.constexpr("""
+{
+.reg .pred p;
+setp.ne.b32 p, $3, 0;
+@p st.global.f32 [$2], $1;
+mov.b32 $0, 0;
+}
+""")
 
 
 @triton.jit
@@ -58,6 +91,9 @@ def _grouped_index_score_kernel(
         other=0.0,
     )
     key_tok = tl.arange(0, 128)
+    # r1 sk1: minimum live causal length, loop-invariant (INT_MAX for dead
+    # lanes so they never hold the minimum).
+    min_lens = tl.min(tl.where(valid, lens, 2147483647), 0)
     for off in tl.range(iters, num_stages=1):
         block = first + off
         page = tl.load(TABLE + req * TABLE_STRIDE + block).to(tl.int64)
@@ -66,18 +102,37 @@ def _grouped_index_score_kernel(
             K, S, tl.where(page_ok, page, 0), page_ok, KS, SS, MMA
         )
         dot = tl.dot(query, tl.trans(key), out_dtype=tl.float32)
-        dot = tl.where(
-            block * 128 + key_tok[None, :] < lens[:, None], dot, float("-inf")
-        )
-        score = tl.max(dot, 1) * SM_SCALE
+        if block * 128 + 128 <= min_lens:
+            # r1 sk1 fast path: this whole tile is below every live row's
+            # causal length, so the causal tl.where is the identity -- skip
+            # it (the masked select stays on the ragged final blocks).
+            score = tl.max(dot, 1) * SM_SCALE
+        else:
+            dot = tl.where(
+                block * 128 + key_tok[None, :] < lens[:, None],
+                dot,
+                float("-inf"),
+            )
+            score = tl.max(dot, 1) * SM_SCALE
         visible = page_ok & (block < nblocks) & valid
         local = tl.maximum(0, nblocks - LOCAL)
         score = tl.where(visible, score, float("-inf"))
         score = tl.where(visible & (block >= local), 1.0e29, score)
         score = tl.where(visible & (block < INIT) & (block < local), 1.0e30, score)
-        # Padded elements are owned exclusively by the padding-store grid;
-        # shorter queries must not race its stores while another query scans on.
-        tl.store(OUT + output_row + block, score, mask=valid & (block < nblocks))
+        # r2 N1: one predicated st.global.f32 per lane from the max-tree
+        # register layout.  Padded elements are owned exclusively by the
+        # padding-store grid; shorter queries must not race its stores while
+        # another query scans on -- the mask keeps this store to live blocks.
+        mask_i = (valid & (block < nblocks)).to(tl.int32)
+        addr = (OUT + output_row + block).to(tl.int64)
+        tl.inline_asm_elementwise(
+            _ASM_DIRECT_STG,
+            "=r,f,l,r",
+            (score, addr, mask_i),
+            tl.int32,
+            is_pure=False,
+            pack=1,
+        )
 
 
 @triton.jit(

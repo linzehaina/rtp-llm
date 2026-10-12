@@ -1,87 +1,102 @@
-# M3.1 Decode：逐算子分析后的优化设计与验收
+# MiniMax-M3.1 Decode 优化、精度与性能结论
 
-## 冻结范围与结论边界
+合并原逐算子设计、首批审查/E2E、后续算子、空泡分析和Radix死锁报告。过时实施步骤已清理，仅保留方案、结论及证据入口。以下为截至2026-10-12的文档记录，本次整理未重新运行模型；不同日期/运行包的结果不能合为同一验收。
 
-基线 timeline：`/data0/ruixuan.zrx/profiling_results/m31_decode_dp8_bs32_80000_dspark_static4_old_scheduler_20261009`。DP8、每DP BS32、80K、static verify4，恢复固定Prefill/Decode阶段顺序。实际没有Prefill；fake history KV、force accept5；fake_balance_expert=0。异步stream开启不等于CPU逻辑能全部被GPU隐藏。
+## 实施方案与取舍
 
-基线源码HEAD 399db00d611eddf52263a5ca3e2c09fae6ef01de；Python算子解释使用冻结BS20 isolated_install，BS32复用该wheel。详细台账是rank0第6个采样轮（step_index=5）全部2658事件，跨rank空泡统计覆盖8rank×16轮，稳态去首轮。详细算子文档和HTML保留源码推断与直接trace证据的区别。以下保留原设计，第一批实现与单算子验证见 [review材料](minimax_m31_decode_operator_review.md)。没有改动运行服务，E2E等待用户review。
+| 方案 | 状态与结论 |
+| --- | --- |
+| 紧凑spec vocab mask | CPU bitset直接H2D，GPU按bit消费；T160/V200064由32010240→4001280字节。保持FP32旧−FLT_MAX哨兵、允许位置NaN payload、其他phase及HIP回退 |
+| batch设备状态owner | 消除逐请求Tensor view/重复cat；按ID/cohort/epoch/行顺序校验，保留owner、失败状态发布、pending claim清理与旧getter兼容 |
+| T160 norm/RoPE与输出量化 | producer直接生成consumer布局，BF16舍入保持；单算子22.726→10.072μs、4.341→2.005μs，不可相加当模型收益 |
+| LM head静态prefix缩行 | M224→M128精度门禁通过但cuBLAS429.002→459.571μs，撤回生产路由，保留全gamma计算 |
+| seed/table/完整COMMIT producer | seed上传合并、table完整覆盖、元数据融合；保留Graph代次/别名/容量/stream/readiness检查及完整legacy回退。单算子有效，四组模型未接受完整producer E2E收益 |
+| sampler配置fresh slab | 正确性通过，CPU构造/copy约1.985→7.466μs，退役，恢复原字段分配 |
+| Champion/Hybrid低精度候选 | 此前GEMM非有限/精度失败，默认关闭；不据孤立按位结果接入 |
+| norm/postnorm与静态采样整理 | 保留正零、stride0/TP回退、mask整任务fallback、批量owner/epoch及event-before-read；最终以新wheel模型门禁为准 |
+| 私有诊断清理 | 当前29文件净减1222行；周审计35文件增87/删1006、内部2文件增7/删20。去私有日志/marker/影子对照/导出/CI debug，保留标准profiler/NVTX和安全测试 |
 
-主要真空泡在CPU尚未提交下一个任务及graph launch尚未完成处。Target图内部没有>=20us空泡。首MoE中的peer等待吸收入场差异，是上游不齐的结果。算子融合主要减少有效任务、内存流量与graph节点数，不能拿其耗时直接当空泡收益。
+模型与缓存/DSpark契约见[设计](minimax_m31_nvfp4_native_kernel_design.md)，配置含义见[环境审计](minimax_m31_env_switch_audit.md)。
 
-## 借鉴Prefill优化的具体原则
+## 历史性能阶段：不能累加或替代最终结果
 
-参考 `docs/minimax_m31_prefill_attention_optimization.md`：让producer直接生成consumer布局；消除不必要物化与重复metadata；有生命周期证明才能复用；保持BF16舍入和量化语义；用全stream GPU union分析critical path。Decode不直接搬用Prefill CP allgather方案。这里的长CPU dense mask及per-request Tensor view是优先对象；不额外扩大80K历史的working scratch，不用更低精度KV换容量。
+共同诊断主场景为DP8、每DP BS32、80000物理fake history、输出256、gamma7/static verify4、FP32或明确记录的router配置。fake history与强制接受测量不能当真实普通拒绝采样质量/生产吞吐。
 
-## P0-A：紧凑spec vocab mask，消除CPU展开尾部
+| 阶段 | 结果 | 边界 |
+| --- | --- | --- |
+| 首批compact mask/owner E2E | 768/768，6.096669ms/token、5248.768TPS/card；对历史基线4506.406为+16.47% | 没有新交错基线，不能证明普遍稳定收益；正式与profile分开 |
+| seed/table | 768/768正式、256/256普通fake-history功能，5.770009ms/token | 比此前5.623579顺序控制慢2.60%，不接受E2E收益 |
+| 完整COMMIT producer四组 | 5120正式+1024普通功能全通过；OFF6.046268568、ON6.157925579ms/token | 单算子10.379→6.226μs不能替代模型结论；未接受E2E收益 |
+| 早期完整ABBA候选 | 5428.8407TPS、相对旧池+31.0168% | 最终fresh wheel未复现，历史结论撤回为最终性能依据 |
+| 最终fresh wheel七轮 | 1792/1792、TPOT7.371477ms、4341.0567TPS；对旧基线池+4.764789% | 5.688245..10.798983ms波动，全client吞吐620.0521→608.2272TPS；非新最终ABBA |
+| 清理后B-C-C-B正式 | B/C各24轮，TPS/card中位4333.313937→5418.698559（+25.04745%） | 观察器/NVML/外部CPU collector关闭；fakeKV/强制接受，四组普通拒绝采样256请求仅独立功能门禁 |
 
-现状：worker拿到512B候选后执行processor/merge，并把160×200064的bitset展开为32,010,240B bool，再上传GPU。D2H sync返回到上传提交平均29.122ms，包含processor、merge、分配与展开，不能全部归因展开loop。大部分已与target重叠，但rank0该轮仍暴露5.423ms真GPU空白；上传约0.592ms。
+最后一组：候选TPMS5.418699、TPM325121.9135，TPOT中位5.905477ms/p958.133657ms；TPS p053934.514675/p955784.124210，CV11.33063%，基线CV15.40084%。48正式轮及慢轮全部保留，原始计数由独立审查复算。证明中心趋势可重复，不能称波动消除或稳定生产普通拒绝吞吐，更不能与client completion混用。证据 `/data0/ruixuan.zrx/minimax-m31-dev/1012_decode_clean_stable_performance/stable_performance_summary.json`。
 
-修改边界：CUDA 的 SpecLogitsVerifyRunner保留CPU processor输出的紧凑mask；HIP 尚无 packed consumer，维持原 CPU bool 展开及 dense 上传协议。CUDA compact mask 大小为 160×ceil(200064/32)×4=4,001,280B；LogitsProcessorStates的MTP_VERIFY消费端增加明确格式字段和GPU bit-test masked-fill路径。优先让logits消费kernel读取bitset直接写旧 `BaseLogitsProcessor::neg_inf` 哨兵（FP32 为 `-FLT_MAX`，并非负无穷），避免先生成32MB bool再读一次。若先做GPU展开作为过渡，要单独标记其32MB写入成本，不能称融合完成。不要改变其他phase现有mask表示。
+Radix修复运行时最终性能/最新timeline仍在 `1012_decode_radix_final_performance` 采集，前述较早二进制吞吐不能自动继承为该修复版本验收。
 
-CPU处理器、mask合并、applied_processors、spec_cap、失败传播维持现有语义。ready_event保护H2D完成，consumed_event保护buffer复用，CPU owner保活到异步copy完成。buffer pool按真正未完成消费者决定容量，不能每轮覆盖同一块buffer。针对vocab尾部、全禁用、单token放行、混合processor及取消做逐元素等价。先在worker增加独立计时，分开processor/merge/alloc/展开/H2D，避免将未被消除的processor尾部误计收益。
+## GPU 空泡与观察器边界
 
-验收：dense mask与compact mask作用后的logits逐元素相同（含旧 mask 哨兵、允许位置的 NaN/Inf，以及旧 dtype 转换的溢出拒绝行为）；draft/target接受结果及失败状态相同。相同timeline中32MB H2D变为4MB，CPU展开loop消失，target-end→mask-ready暴露尾部缩短。未profile正式perftest必须另测，不能从29ms推出每轮29ms收益。
+同进程target Graph1968节点：pristine OFF replay wall/threadCPU中位18.5085/17.6365μs，FULL2084.487/2072.324μs；CUDA-only也约2140.7815/2127.031μs。独立1908节点控制同样显示观察器CPU成本。profile停止后可残留约1.2ms开销，`profilerEnabled=false` 不证明CUPTI卸载；teardown仅孤立试验通过，不能直接设生产默认。
 
-## P0-B：batch设备状态，移除dispatch/gather逐stream Tensor view
+正式性能在profile前或独立engine测，profile置最后；按全记录stream kernel/memcpy/memset并集定义idle，wait kernel计活跃，排队等待GPU不算idle。inclusive CPU、event wait和跨rank耗时不可相加。rank局部ordinal不等于全局逻辑轮，首profiler初始化返回差曾达1.811983s，并被MoE peer等待吸收。
 
-现状：MtpExecutor.cc旧state准备64次narrow累计257us，GPU空白433us；最后GPU任务到下一轮首copy之间191次narrow累计480us，真空白1.149ms。narrow没有GPU kernel，但CPU构建Tensor对象会迟交任务。各rank已有GPU任务覆盖程度不同，造成下一轮入场不齐。metrics本轮28us不是主因。
+已定位两个不同层次的停顿：
 
-修改边界：定义batch device-state owner，持有tokens、accept lengths、committed ends、anchor、hidden/KV引用；stream保存owner+row+epoch而不是每字段立即narrow。稳定cohort直接使用batched tensor；新请求、重排、结束和取消通过GPU row-map gather/scatter更新。buildDSparkRoundState不再逐stream拼anchors/committed ends。真正需要独立Tensor的RPC/外部接口延迟物化view，不在launch前热路径物化。迁移保留旧路径fallback，但不能让fallback每步隐式触发。
+- OFF诊断轮中一rank在proposal提交前约701ms host空隙，其他rank target Graph约724ms等待；不属于初始请求到达。CPU阻塞函数仍未明确，CPU线程组竞争仅假设；不能以缺启动GC freeze解释，日志已有 `gc.collect(); gc.freeze()`。
+- 最新八rank observer各48真实BS32 scope/101252kernel/144Graph提交。rank1 proposal索引33有102613.674μs全stream idle，CPU链 `publish_core_tensors_to_cuda → aten::to/_to_copy → aten::empty_strided → cudaEventQuery`，Query102462.022μs，shape[1,32,627] Int32对应新KV表H2D分配。一例定位allocator查询，不能证明所有OFF慢轮同因。
 
-正确性契约：普通reject回滚、失败请求where保留旧状态、实际GPU committed length、request顺序和epoch一致；不能把host预分配上界作为真实提交长度。worker和下一graph还消费旧buffer时禁止复用。graph输出会被replay覆盖，需要owner生命周期和completion event证明，不能只凭“两轮轮换”假设无并发。保留固定阶段顺序和PDFusion兼容性，不恢复CPU phase agreement。
+Torch2.11.0上游malloc先处理此前跨stream未完成事件，再选size pool。因此KV表分配处Query未必由该表自身引起，单表池化可能把Query移至下一allocation；这是机制加trace推断，非安装二进制完整C++栈。保留recordStream/lifetime，不能凭长尾删正确性wait、禁event回收或加全局同步。
 
-验收：稳定BS32热路径的64/191次narrow消失或移到不阻塞GPU的消费端，两个cat不再重新拼完整旧state；取消、混合成功失败、partial batch、换序、cohort变更、普通非force接受均逐轮比较token、accept_len、KV committed end。测完整GPU末端→下一gather首copy，而非dispatch CPU返回→下一process。
+48正式轮client起点跨度与TPOT相关基线−0.124613/候选−0.223579，不支持简单“客户端起点越散越慢”，但client起点不是服务端到达，不能据此确定driver/allocator因果。证据 `formal_round_arrival_spread_audit.json`。
 
-## P0-C：定位graph launch毫秒开销，不能盲改MoE
+## 精度测量纠正与最终交付
 
-113/120稳态target提交有>=20us空白，条件均值1.959ms、中位2.209ms；首kernel一般紧随cudaGraphLaunch返回约5us。已定位runtime提交边界，未证明内部是driver、CUPTI、线程抢占哪一项。
+早期Math预算512得381/500，新8192的40新增正确ID均触及旧上限，零新增错误；不能继续沿用短预算代表完整精度。HumanEval旧last-code-fence提取丢入口实现，旧88/164过时；修正入口感知提取并执行官方测试后142/164，保留安全拒绝及两组相同scorer hash。评测分数必须注明生成预算、提取和官方指标。
 
-先做同一wheel同一参数：无profiler正式测试、只采CUDA activity、完整CPU+CUDA profile三组；固定warmup、轮数、sampling和force配置。记录cudaGraphLaunch主机耗时、GPU首node、CPU调度/线程状态、CUPTI活动处理；只增加有界局部观测，不加barrier。若只full-profile有毫秒开销，修正观测方式，不宣称生产优化。若无profiler仍存在，再围绕graph节点数量和提交路径做单变量实验。
+### 长 Prefill 不确定性：已定位并修复，独立于 Decode
 
-后续producer融合减少节点是独立候选，必须报告launch空白是否实际随节点减少。graph_.replay()外不能用额外全局sync“修复”。也不优先加入新的CPU线程去争抢同一GIL/driver锁。
+同输入串行P-only、无D传输/推测verify：短200token稳定，16863/21000首logit最大变化8.98496/9.56688；实际P使用FlashInfer，不是模块默认FMHA。只关wire或overlap不足，FMHA控制12/12按位稳定。
 
-## P1-A：提前准备Sampler与commit metadata
+FI使用128槽union hash，>128block/16384token时atomicCAS线性探测位置改变累加顺序。真实不变Q/K/V/scale/TopK输入20replay有19次变化。修复仅>128block对完整entry按block code排序，保留membership全部位、softmax/TMEM/布局保护及≤128历史顺序，用新JIT URI避免旧缓存。
 
-rank0 target sampling输入前空白473us，reject后commit metadata前265us。将稳定temperature/topk/seed/config以及host小数组预打包到固定pinned staging，在target运行期间准备；一次合并上传替代零散分配/toCUDA。动态request配置用config epoch失效，seed及RNG offset仍按request row归属，禁止跨请求复用随机状态。
+修复单算子20/20、全P12/12首logit稳定；GPU回归7/7含Hkv1/2/4、128/129/132/257block、变长/高ID/Graph/空union。孤立event0.369120→0.375088ms（+1.62%），不能外推模型收益或全生成精度。证据 `1012_flashinfer_union_determinism`。
 
-commit的cu_seq、cu_kv_seq、padding_offset由一个GPU producer直接写graph-owned布局，移除重复fill/contiguous copy；不可改为host猜测GPU接受长度。KV block table仅在allocation/cohort epoch未变时复用，不是shape相同就复用；80K跨page边界必须更新。proposal/target/commit metadata buffer生命周期分别受consumer event保护。
+### M3 前端协议：字段分类修复
 
-验收：小H2D、copy/fill数量与提交延迟下降；page边界、长度0/1、最大长度、partial batch、重排对齐一致。不同graph/replay不会消费前轮metadata。
+共同旧前端忽略显式force_reasoning=False；非stream逐packet无状态解析丢关闭状态；已分类字符串又被CustomChatRenderer独立ThinkStatus二次分类。修复M3显式模式、增量close-state及结束flush，绕过已分类字符串二次解析，保留DeltaMessage工具/推理字段和其他detector兼容。
 
-## P1-B：force mask批量生成与greedy采样冗余
+四D路八enabled/disabled短请求通过，native token与失败前相同；enabled reasoning=`We`、最终content=`\boxed{4}`，disabled仅最终答案。40CPU/零skip及独立review通过，不能替代全质量。通用nonstream usage计数覆盖问题未修复，且非native MAL。证据 `1012_decode_corrected_wire_full_quality/matched_wire_parser_evidence.json`。
 
-perftest force override目前32次GPU标量fill，合并成一个批量mask producer或一次小H2D，再做batched override。仍对失败请求保留accept1/失败fallback；不能提前跳过正常验证路径得到虚假benchmark加速。单独报告benchmark辅助代码节省与真实服务节省。
+### Radix TopK 重归一化死锁与续跑范围
 
-greedy候选：processor完成后，top_k=1分支直接argmax logits并生成后续需要的一热target distribution，研究省掉softmax和renorm。普通rejection仍需要target distribution，不能只产token。仅当temperature、非有限值、tie规则、all_probs、cum_log_probs和RNG契约都证明等价才启用；其他情况沿用原路径。此项须有单算子精度及性能证据再合入。
+32client PD4+4在5409成功后停滞。CUDA13.2 cuda-gdb定位 `RadixTopKRenormProbKernel_MultiCTA<1024,4,false,float,int>`，60block/1024线程、剩余非leader block23；CPU metrics/transfer event等待是GPU未完成后果，不是已证实其他服务干扰或GraphLaunch瓶颈。
 
-## P1-C：static4只减少proposal LMhead的无用行
+leader通过最终到达屏障后清零counter，延迟CTA可能未观察目标便只见0、永久等待。仅移除该kernel终末histogram/counter重置；调用方每次新分配清零1MiB私有state，pivot/同分/归一化不变。后续复用须在全部前CTA完成后初始化并保持stream顺序。
 
-proposal gamma7 backbone输出224行；static4实际只采128行，但当前LMhead仍处理224行。保持7行query block及其attention关系，仅改变LMhead gather索引为每请求被采样的前4行，并显式定义head_steps=4契约。SpeculativeSampler现有[B*gamma,V]检查和view也要同步改为显式head_steps，禁止修改backbone width来冒充等价。
+测试专用延迟复现旧超时exit124，修复完成且3010560概率精确匹配；V200064、B3/15/80、TopK1/8/不限、各12轮独立threshold参考通过。生产无延迟hook；`native_radix_fix_install` Python字节相同，六native仅librtp_compute_ops.so改变。证据 `1012_decode_submission_candidate/radix_renorm_barrier_probe`、`radix_fix_runtime_identity.json`。
 
-留存4步Markov顺序依赖；未采3步的RNG reservation保持现有逻辑。验证相同backbone前缀hidden/logits、采样token/概率、后续target RNG位置及置信度输入。该优化是删掉LMhead冗余行，不能声称整套5层proposal减少3/7。
+完整5681生成完成后，用户将主要LongBench交付收缩为历史八任务160样本，每任务20。**最终候选由5409旧二进制成功响应加272修复后新响应组成，没有新生成基线。** 27传输timeout按状态归档排除，完成错误答案全部计入。不能称修复二进制新生成5681条；native MAL仅新272窗口。
 
-## P2：图内算子优化
+| 主要数据集 | 最终候选 | 结论边界 |
+| --- | ---: | --- |
+| Math500 | 418/500 | 与基线差异供审阅，不声称零回退 |
+| GSM8K | 1137/1319 | 同上 |
+| HumanEval | 143/164 | 实际官方测试 |
+| AIME24 | 完成最终答案26/30 | 区分旧仅reasoning fallback分数 |
+| LongBench历史160 | 66.7683125；基线66.8703545 | 保存响应按同官方指标重评 |
+| native MAL | 2.80470635 | 仅272请求修复窗口 |
 
-详见逐角色矩阵及全部事件决策。优先研究Gemma norm/RoPE直接产consumer布局（T160不命中现有<=128 contiguous分支），避免Q/K/indexQ/indexK独立copy；保持BF16主Q，不能因indexQ是FP8就将主Q改FP8。量化scale直接产UE8M0消费布局，减少transpose/pack。允许拓展attention输出量化的小T路由前必须microbench T160；现有<=100路径仍先生成BF16 attention output，不能宣称已融合attention epilogue。真正epilogue量化是另一项更复杂实现。
+主要评分/native MAL/sampled16/生命周期门禁通过执行与完整性检查；一次新最终只读review无已确认可执行生产阻塞，但分差不等于精度等价。证据 `1012_decode_latest_candidate_full_quality/{dataset_score_handoff.json,quality_radix_state.json,quality_candidate/resume_radix_checkpoint}`。
 
-shared expert与routed pack可研究独立工作重叠，但共享SM可能拖慢persistent MegaMoE，不能仅凭“两条stream”判定收益。TopK到MegaMoE该轮48.155us中约46us为shared expert、激活量化、GSF及pack，末pack到Mega仅0.364us；不是48us空泡。不优先改已98.57us量级的非首层MegaMoE或给首MoE加barrier。
+历史LongBench160旧标“官方”66.237738使用两TREC text-F1，标签不准确；以同历史scorer重评66.416310→新基线66.870355。13任务3668完整基线56.058134不能与八任务160直比。匹配hotpotqa仍下降4.104747、qasper升5.827373，汇总上升不能抹除逐项损失。审计 `1012_decode_corrected_wire_full_quality/longbench_historical_score_audit.json`。
 
-保持量化RNE、UE8M0、E4M3/E2M1、global scale、BF16舍入、tail mask和CUDA Graph稳定地址。每项单独对照，不能把小算子duration sum视作可得端到端收益。
+## 未完成优化与上线边界
 
-## 验收顺序与未完成项
+- 修复二进制最终匹配性能可重复性及最新timeline；sample/propose CPU空泡和OFF host/allocator根因。
+- target每图仍有60次query cast、metadata、valid-prefix、scale refresh；FillFunctor62次不是全O-projection清零，原O-projection zero-fill/where已融合去除。
+- Cake只需index-Q FP8；producer接入须独立storage及BF16后E4M3舍入、变长/stride/padding/Graph证明，不可只删cast或多写主Q FP8。
+- Cake共享页/seen/prefix/scale适配器，router加载时FP32转换与sigmoid/bias/selection融合，须精确FP32/同分及producer+consumer实测。
+- 其余未测beam/多返回、所需CP/HIP/长时间压力及发布CI须各自门禁。历史PD恢复为各活动当时HTTP/native/hash/空闲结果，本次文档整理不核验或改动常驻服务。
 
-1. 冻结基线wheel/source/config及正式BS32与BS20；性能正式结果与profile另列。
-2. 每项改动先有源码链、tensor/生命周期契约，再单算子正确性+性能；一次只改变一项。
-3. exact DP8 BS32/80K/static4 matched trace：全stream空泡、节点数、mask tail、graph launch、完整轮间gap、各rank入场skew；同时无profiler报告单卡TPS/TPM。
-4. 非force真实接受、动态verify、普通decode/PDFusion：token、概率、拒绝回滚、EOS/取消、并发cohort变化、worker异常。不能以force接受case证明真实speculative正确性。
-5. PD4+4真实模型质量和长请求稳定性，resident/peak memory、CUDA Graph pool、KV容量；确认新scratch没有侵蚀80K服务容量。
-
-第一批已实现 compact mask、稳定cohort批量设备状态、force mask批量上传及T160两项producer优化，验证范围见review材料。static前缀LM head候选按位正确，但实际cuBLAS微测未显示收益，本批撤回生产路由。P0-C graph launch定位、P1-A通用sampler/commit metadata改造、greedy省softmax等仍待后续阶段。异步调度已开启，但CPU dense-mask和逐stream对象工作仍会在GPU任务耗尽后暴露；优化目标是及时提供下一段合法设备工作，而不是再加同步屏障。单算子结果不能证明完整轮间空泡已消除。
-
-## 完整算子清单入口
-
-- [交互逐事件清单](/data0/ruixuan.zrx/minimax-m31-dev/1009_old_scheduler_decode_analysis/operator_explorer.html)：2658事件逐条逻辑、shape、耗时、源码、优化与验证。
-- [完整Markdown](/data0/ruixuan.zrx/minimax-m31-dev/1009_old_scheduler_decode_analysis/operator_complete_report.md)：全部算子与方案。
-- [Target 59角色优化矩阵](/data0/ruixuan.zrx/minimax-m31-dev/1009_old_scheduler_decode_analysis/target_operator_optimization_plan.md)。
-- [其余390事件优化方案](/data0/ruixuan.zrx/minimax-m31-dev/1009_old_scheduler_decode_analysis/non_target_operator_optimization_plan.md)。
-- [空泡逐段证据](/data0/ruixuan.zrx/minimax-m31-dev/1009_old_scheduler_decode_analysis/gpu_idle_report.md)。
+证据主目录：`1010_decode_e2e`、`1010_decode_next`、`1011_decode_final_validation`、`1012_decode_complete_quality_variance`、`1012_decode_clean_quality_final`、`1012_decode_clean_stable_performance`，均位于 `/data0/ruixuan.zrx/minimax-m31-dev`。详细过程已从文档清理；原报告历史由Git保留，原始实验材料仍在这些目录。

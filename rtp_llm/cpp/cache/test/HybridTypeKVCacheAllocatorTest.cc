@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -644,6 +645,111 @@ TEST_F(HybridTypeKVCacheAllocatorTest, IncrMallocRollbackFreesPartiallyAllocated
 
     // Cleanup.
     block_pool->requestFree(keep);
+}
+
+
+// MiniMax target FULL + draft SWA, using small physical head dimensions.
+static CacheConfig makeFullSwaConfig(uint32_t block_num = 32, uint32_t block_tokens = 4) {
+    auto config = makeTinyHybridConfig();
+    auto spec = std::make_shared<MHAKVCacheSpec>(
+        *std::dynamic_pointer_cast<MHAKVCacheSpec>(config.cache_specs[1]));
+    spec->seq_size_per_block = block_tokens;
+    config.cache_specs = {spec, spec};
+    config.group_types = {CacheGroupType::FULL, CacheGroupType::SWA};
+    config.linear_group_num = 0;
+    config.full_group_num = 1;
+    config.swa_group_num = 1;
+    config.block_num = block_num;
+    config.seq_size_per_block = block_tokens;
+    config.kernel_seq_size_per_block = block_tokens;
+    config.kv_block_stride_bytes = spec->block_size_bytes();
+    config.kv_block_size_bytes = config.group_layer_num * config.kv_block_stride_bytes;
+    config.block_size_bytes = config.kv_block_size_bytes;
+    return config;
+}
+
+TEST_F(HybridTypeKVCacheAllocatorTest, NoGrowthFullSwaPreservesOwnershipAndOverride) {
+    auto config = makeFullSwaConfig();
+    auto allocator = std::make_shared<HybridTypeKVCacheAllocator>(config, AllocationType::DEVICE);
+    allocator->setSharedBlockCache(std::make_shared<SharedBlockCache>());
+    ASSERT_TRUE(allocator->init());
+    auto res = makeBatchResource(1, 2, 4, config.layer_to_group_id, {100, 101, 102});
+    auto tokens = makeCompleteTokenIds(1, 9, 4);
+    tokens->setReserveStep(2);
+    MallocInfo info{res, tokens};
+    info.reuse_cache = false;
+    info.enable_device_cache = false;
+    ASSERT_TRUE(allocator->malloc(info).success);
+    std::vector<BlockIndicesType> original;
+    for (int b = 0; b < 1; ++b) {
+        for (int g = 0; g < 2; ++g) original.push_back(res->blocks(b, g));
+    }
+    const auto free_before = allocator->freeBlocksNum();
+    const auto refs_before = allocator->requestRefBlocksNum();
+    // GPU-published length differs from CPU bookkeeping but fits reserved slots.
+    info.incr_seq_len_override = 10;
+    for (int repeat = 0; repeat < 50; ++repeat) ASSERT_TRUE(allocator->malloc(info).success);
+    for (int b = 0; b < 1; ++b) {
+        for (int g = 0; g < 2; ++g) EXPECT_EQ(res->blocks(b, g), original[b * 2 + g]);
+    }
+    EXPECT_EQ(allocator->freeBlocksNum(), free_before);
+    EXPECT_EQ(allocator->requestRefBlocksNum(), refs_before);
+    // Crossing the reserved boundary must resume allocation.
+    info.incr_seq_len_override = 13;
+    ASSERT_TRUE(allocator->malloc(info).success);
+    for (int b = 0; b < 1; ++b) EXPECT_EQ(res->blocksNum(b, 0), 4);
+    EXPECT_LT(allocator->freeBlocksNum(), free_before);
+}
+
+TEST_F(HybridTypeKVCacheAllocatorTest, NoGrowthFullSwaStillReclaimsSkippedBlocks) {
+    auto config = makeFullSwaConfig();
+    config.linear_step = 1;
+    auto allocator = std::make_shared<HybridTypeKVCacheAllocator>(config, AllocationType::DEVICE);
+    allocator->setSharedBlockCache(std::make_shared<SharedBlockCache>());
+    ASSERT_TRUE(allocator->init());
+    auto res = makeBatchResource(1, 2, 4, config.layer_to_group_id, {100, 101, 102});
+    auto tokens = makeCompleteTokenIds(1, 12, 4);
+    MallocInfo info{res, tokens};
+    info.enable_device_cache = false;
+    ASSERT_TRUE(allocator->malloc(info).success);
+    ASSERT_FALSE(isNullBlockIdx(res->blocks(0, 1)[0]));
+    const auto free_before = allocator->freeBlocksNum();
+    info.reuse_cache = false;
+    info.enable_remove_skipped_blocks = false;
+    ASSERT_TRUE(allocator->malloc(info).success);
+    EXPECT_FALSE(isNullBlockIdx(res->blocks(0, 1)[0]));
+    info.enable_remove_skipped_blocks = true;
+    ASSERT_TRUE(allocator->malloc(info).success);
+    EXPECT_TRUE(isNullBlockIdx(res->blocks(0, 1)[0]));
+    EXPECT_EQ(res->blocksNum(0, 1), 3);
+    EXPECT_EQ(allocator->freeBlocksNum(), free_before + 1);
+    ASSERT_TRUE(allocator->malloc(info).success);
+    EXPECT_EQ(allocator->freeBlocksNum(), free_before + 1);
+}
+
+TEST_F(HybridTypeKVCacheAllocatorTest, NoGrowthThenFullSwaGrowthFailureKeepsOriginalBlocks) {
+    auto config = makeFullSwaConfig();
+    auto allocator = std::make_shared<HybridTypeKVCacheAllocator>(config, AllocationType::DEVICE);
+    allocator->setSharedBlockCache(std::make_shared<SharedBlockCache>());
+    ASSERT_TRUE(allocator->init());
+    auto res = makeBatchResource(1, 2, 4, config.layer_to_group_id, {100, 101, 102});
+    auto tokens = makeCompleteTokenIds(1, 8, 4);
+    MallocInfo info{res, tokens};
+    info.reuse_cache = false;
+    info.enable_device_cache = false;
+    ASSERT_TRUE(allocator->malloc(info).success);
+    ASSERT_TRUE(allocator->malloc(info).success);
+    const auto full_before = res->blocks(0, 0);
+    const auto swa_before = res->blocks(0, 1);
+    auto pool = allocator->getBlockPool();
+    auto held = pool->malloc(static_cast<int>(pool->freeBlocksNum()) - 1);
+    ASSERT_EQ(pool->freeBlocksNum(), 1);
+    info.incr_seq_len_override = 13; // Needs two FULL slots, but only one is free.
+    EXPECT_FALSE(allocator->malloc(info).success);
+    EXPECT_EQ(res->blocks(0, 0), full_before);
+    EXPECT_EQ(res->blocks(0, 1), swa_before);
+    EXPECT_EQ(pool->freeBlocksNum(), 1);
+    pool->requestFree(held);
 }
 
 }  // namespace test

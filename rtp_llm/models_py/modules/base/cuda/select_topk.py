@@ -37,8 +37,26 @@ class GroupTopK(nn.Module):
         renormalize: bool,
         routed_scaling_factor: float,
     ):
-        scores = scores.sigmoid()
-        scores_with_bias = scores + correction_bias.unsqueeze(0)
+        if (
+            scores.ndim == 2
+            and scores.shape[1] == 128
+            and 0 < scores.shape[0] <= 256
+            and scores.is_cuda
+            and scores.dtype == torch.float32
+            and scores.is_contiguous()
+            and correction_bias.shape == (128,)
+            and correction_bias.dtype == torch.float32
+            and correction_bias.device == scores.device
+            and correction_bias.is_contiguous()
+        ):
+            from rtp_llm.models_py.triton_kernels.common.fused_sigmoid_bias import (
+                fused_sigmoid_bias,
+            )
+
+            scores, scores_with_bias = fused_sigmoid_bias(scores, correction_bias)
+        else:
+            scores = scores.sigmoid()
+            scores_with_bias = scores + correction_bias.unsqueeze(0)
         self.group_topk_op.forward(
             topk_weights,
             topk_ids,

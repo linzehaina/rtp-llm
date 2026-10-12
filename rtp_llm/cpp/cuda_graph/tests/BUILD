@@ -34,6 +34,7 @@ py_library(
     visibility = ["//visibility:public"],
 )
 
+
 py_test(
     name = "cuda_graph_decode_padding",
     srcs = [
@@ -120,6 +121,29 @@ py_test(
         "NOT_USE_DEFAULT_STREAM": "1",
         "TEST_USING_DEVICE": "CUDA",
     },
+    tags = ["H20"],
+    exec_properties = {"gpu": "H20"},
+)
+
+py_test(
+    name = "cuda_graph_commit_table_overwrite",
+    srcs = ["cuda_graph_commit_table_overwrite.py"],
+    data = [":test_cuda_graph_runner", "//:th_transformer"],
+    deps = ["//rtp_llm/test/model_test/test_util:test_util"],
+    env = {
+        "NOT_USE_DEFAULT_STREAM": "1",
+        "TEST_USING_DEVICE": "CUDA",
+    },
+    tags = ["H20"],
+    exec_properties = {"gpu": "H20"},
+)
+
+py_test(
+    name = "cuda_graph_commit_metadata_producer",
+    srcs = ["cuda_graph_commit_metadata_producer.py"],
+    data = [":test_cuda_graph_runner", "//:th_transformer"],
+    deps = [":cuda_graph_test_utils", "//rtp_llm/test/model_test/test_util:test_util"],
+    env = {"LOAD_METHOD": "scratch", "NOT_USE_DEFAULT_STREAM": "1", "TEST_USING_DEVICE": "CUDA"},
     tags = ["H20"],
     exec_properties = {"gpu": "H20"},
 )

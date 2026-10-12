@@ -68,7 +68,10 @@ public:
                      int64_t            num_tokens_per_bs,
                      bool               is_target_verify,
                      bool               is_ragged_target_verify,
-                     bool               require_exact_decode_geometry) {
+                     bool               require_exact_decode_geometry,
+                     bool               commit_table_overwrite,
+                     bool               commit_metadata_producer,
+                     const std::string& forward_method_name) {
         reset_runner();
         GraphParams params;
         params.enable_cuda_graph_debug_mode  = false;
@@ -81,6 +84,8 @@ public:
         params.is_target_verify              = is_target_verify;
         params.is_ragged_target_verify       = is_ragged_target_verify;
         params.require_exact_decode_geometry = require_exact_decode_geometry;
+        params.commit_table_overwrite        = commit_table_overwrite;
+        params.commit_metadata_producer       = commit_metadata_producer;
         params.hidden_size                   = static_cast<size_t>(hidden_size);
         params.model_data_type               = parseModelDataType(model_data_type);
         params.max_context_batch_size        = 128;
@@ -88,7 +93,7 @@ public:
         params.kv_cache_layer_to_group       = {};  // test: no hybrid kv cache
         params.kv_cache_group_num            = 0;
 
-        runner_ = CudaGraphRunner::createForDecode(std::move(py_instance), std::move(params));
+        runner_ = CudaGraphRunner::createForDecode(std::move(py_instance), std::move(params), forward_method_name.c_str());
     }
 
     bool canRun(torch_ext::PyModelInputs& inputs) {
@@ -99,12 +104,24 @@ public:
         return runner_->forward(inputs, state_);
     }
 
+    bool tryPrepareCommitMetadata(torch_ext::PyModelInputs& inputs, bool skip_forward_event_sync) {
+        return runner_ != nullptr && runner_->tryPrepareCommitMetadata(inputs, state_, skip_forward_event_sync);
+    }
+
+    void prepareAttentionInputs(torch_ext::PyModelInputs& inputs, bool skip_forward_event_sync) {
+        runner_->prepareAttentionInputs(inputs, state_, skip_forward_event_sync);
+    }
+
     int getCurrentRealGraphSize() {
         return runner_ != nullptr ? runner_->getCurrentRealGraphBs(state_) : 0;
     }
 
     torch::Tensor getMtpTargetHiddenStates(int64_t num_tokens) {
         return runner_ != nullptr ? runner_->getMtpTargetHiddenStates(state_, num_tokens) : torch::Tensor();
+    }
+
+    void replayCapturedGraph(int key) {
+        runner_->replayGraph(key);
     }
 
     ~CudaGraphTestRunner() {
@@ -150,9 +167,17 @@ PYBIND11_MODULE(libtest_cuda_graph_runner, m) {
              py::arg("num_tokens_per_bs")             = 1,
              py::arg("is_target_verify")              = false,
              py::arg("is_ragged_target_verify")       = false,
-             py::arg("require_exact_decode_geometry") = false)
+             py::arg("require_exact_decode_geometry") = false,
+             py::arg("commit_table_overwrite")        = false,
+             py::arg("commit_metadata_producer")      = false,
+             py::arg("forward_method_name")           = "forward")
         .def("canRun", &CudaGraphTestRunner::canRun)
         .def("forward", &CudaGraphTestRunner::forward)
+        .def("tryPrepareCommitMetadata", &CudaGraphTestRunner::tryPrepareCommitMetadata,
+             py::arg("inputs"), py::arg("skip_forward_event_sync") = false)
+        .def("prepareAttentionInputs", &CudaGraphTestRunner::prepareAttentionInputs,
+             py::arg("inputs"), py::arg("skip_forward_event_sync") = false)
         .def("getMtpTargetHiddenStates", &CudaGraphTestRunner::getMtpTargetHiddenStates)
-        .def("getCurrentRealGraphSize", &CudaGraphTestRunner::getCurrentRealGraphSize);
+        .def("getCurrentRealGraphSize", &CudaGraphTestRunner::getCurrentRealGraphSize)
+        .def("replayCapturedGraph", &CudaGraphTestRunner::replayCapturedGraph);
 }

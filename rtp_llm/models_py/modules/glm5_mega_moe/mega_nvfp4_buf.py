@@ -22,6 +22,9 @@ def estimate_mega_moe_nvfp4_symm_buffer_bytes(
     try:
         import deep_gemm
 
+        # The routed-only API predates fused shared experts. Keep its
+        # signature when shared experts are disabled, including older wheels.
+        shared_args = (num_shared_experts,) if num_shared_experts else ()
         return int(
             deep_gemm._C.get_symm_buffer_size_for_mega_moe_nvfp4(
                 group_size,
@@ -31,7 +34,7 @@ def estimate_mega_moe_nvfp4_symm_buffer_bytes(
                 hidden,
                 intermediate_hidden,
                 activation,
-                num_shared_experts,
+                *shared_args,
             )[0]
         )
     except Exception:
@@ -83,6 +86,9 @@ def get_or_create_mega_buf_nvfp4(
         if group_size > 0
         else None
     )
+    shared_kwargs = (
+        {"num_shared_experts": num_shared_experts} if num_shared_experts else {}
+    )
     buf = deep_gemm.get_symm_buffer_for_mega_moe_nvfp4(
         group=group,
         num_experts=num_experts,
@@ -91,7 +97,7 @@ def get_or_create_mega_buf_nvfp4(
         hidden=hidden,
         intermediate_hidden=intermediate_hidden,
         activation=activation,
-        num_shared_experts=num_shared_experts,
+        **shared_kwargs,
     )
     actual_bytes = None
     try:

@@ -11,6 +11,7 @@ from rtp_llm.models_py.model_desc.minimax_m3 import (
     MiniMaxM3Model,
 )
 from rtp_llm.models_py.modules.factory.linear.impl.cuda.f16_linear import CudaF16Linear
+from rtp_llm.models_py.modules.hybrid.msa_attention import MSAAttention
 from rtp_llm.ops import RoleType
 from rtp_llm.ops.compute_ops import PyModelInputs
 
@@ -178,6 +179,29 @@ class MiniMaxM31DecoderLayer(MiniMaxM3DecoderLayer):
                 not attn_inputs.is_prefill
                 or getattr(attn_inputs, "is_target_verify", False)
             )
+        # Explicit per-invocation ownership: no shared attention flag or stale
+        # mask attribute on a layer/Graph clone. Other attention consumers keep
+        # their eager output mask. TP>1 masks before the collective as before.
+        if (
+            attn_inputs is not None
+            and getattr(attn_inputs, "is_target_verify", False)
+            and isinstance(self.self_attn, MSAAttention)
+            and self.self_attn.nvfp4_kv_cache
+            and self.self_attn.tp_size == 1
+            and hidden_states.dim() == 2
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.shape[1] <= 8192
+            and (self._fuse_post_norm_quant or self._fuse_post_norm_quant_moe)
+        ):
+            output = self.self_attn(
+                hidden_states=hidden_states,
+                attn_inputs=attn_inputs,
+                kv_cache=kv_cache,
+                x_fp8=x_fp8,
+                x_scale=x_scale,
+                defer_output_mask=True,
+            )
+            return output, None
         return super()._forward_attention(
             hidden_states,
             fmha_impl,

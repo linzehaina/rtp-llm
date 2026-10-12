@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <array>
 #include <unordered_map>
 #include <vector>
 #include <pybind11/embed.h>
@@ -16,6 +17,8 @@
 namespace py = pybind11;
 
 namespace rtp_llm {
+
+struct CudaGraphCommitMetadataParams;
 
 class CudaGraphRunner: public GraphBase {
 public:
@@ -39,6 +42,8 @@ public:
                                                                 graph_params.hidden_size * graph_params.hc_mult),
         hc_mult_(static_cast<int>(graph_params.hc_mult)),
         require_exact_decode_geometry_(graph_params.require_exact_decode_geometry),
+        commit_table_overwrite_(graph_params.commit_table_overwrite),
+        commit_metadata_producer_(graph_params.commit_metadata_producer),
         draft_prefill_requires_full_token_capacity_(graph_params.draft_prefill_requires_full_token_capacity),
         sp_steps_(graph_params.sp_steps),
         prefill_capture_seq_lens_(graph_params.prefill_capture_seq_lens),
@@ -93,6 +98,10 @@ public:
     void           prepareAttentionInputs(const PyModelInputs& inputs,
                                           CudaGraphState&      state,
                                           bool                 skip_forward_event_sync = false) override;
+    bool           tryPrepareCommitMetadata(const PyModelInputs& inputs, CudaGraphState& state,
+                                              bool skip_forward_event_sync = false) override;
+    bool           preparedCommitMetadataMatches(const PyModelInputs& inputs, const CudaGraphState& state) const override;
+    void           resetPreparedInputs() override;
     void           updateKVCacheKernelBlockId(const PyModelInputs& inputs, CudaGraphState& state) override;
     bool           canRun(const PyModelInputs& inputs, CudaGraphState& state) override;
     void           replayGraph(int key);
@@ -105,9 +114,12 @@ public:
 
     // Factory methods for test: take GraphParams so callers can reuse the same struct
     static CudaGraphRunner* createForPrefill(py::object py_instance, GraphParams params);
-    static CudaGraphRunner* createForDecode(py::object py_instance, GraphParams params);
+    static CudaGraphRunner* createForDecode(py::object py_instance, GraphParams params,
+                                            const char* forward_method_name = "forward");
 
 private:
+    void prepareAttentionInputsImpl(const PyModelInputs& inputs, CudaGraphState& state,
+                                    bool skip_forward_event_sync, const CudaGraphCommitMetadataParams* commit);
     // Common capture logic for both prefill and decode
     void captureOneGraphInstance(int key, const char* key_type);
     // Common replay and sync check logic
@@ -156,6 +168,14 @@ private:
     // input. The post-reduce output tensor still uses hidden_size_.
     int              hc_mult_{1};
     bool             require_exact_decode_geometry_{false};
+    bool commit_table_overwrite_ = false;
+    bool commit_metadata_producer_ = false;
+    int prepared_commit_key_ = -1;
+    uint64_t capture_generation_ = 0;
+    uint64_t prepared_commit_generation_ = 0;
+    int prepared_commit_batch_ = 0;
+    int prepared_commit_tokens_ = 0;
+    std::vector<PreparedGraphTensorIdentity> prepared_commit_sources_;
     bool             draft_prefill_requires_full_token_capacity_{false};
     int              sp_steps_{0};
     std::vector<int> capture_range_;

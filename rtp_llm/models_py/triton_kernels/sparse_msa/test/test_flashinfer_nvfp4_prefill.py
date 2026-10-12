@@ -1,10 +1,6 @@
 """RTP-to-FlashInfer sparse prefill page and query contract."""
 
 import unittest
-import json
-import os
-import tempfile
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
@@ -13,23 +9,6 @@ from flashinfer.msa_ops import _nvfp4_prefill_sm100 as fi_reference
 
 
 class FlashInferQ8KV4DispatchTest(unittest.TestCase):
-    def test_q8_shadow_skips_capture_once(self):
-        from rtp_llm.models_py.triton_kernels.sparse_msa.prefill import (
-            flashinfer_nvfp4_prefill as adapter,
-        )
-
-        q = SimpleNamespace(is_cuda=True)
-        with patch.object(adapter, "_Q8_SHADOW_CAPTURE_WARNED", False), patch.object(
-            adapter.torch.cuda, "is_current_stream_capturing", return_value=True
-        ), patch.object(adapter._logger, "warning") as warning:
-            self.assertTrue(adapter._q8_shadow_capture_active(q))
-            self.assertTrue(adapter._q8_shadow_capture_active(q))
-            warning.assert_called_once()
-        with patch.object(adapter.torch.cuda, "is_current_stream_capturing") as capture:
-            self.assertFalse(adapter._q8_shadow_capture_active(
-                SimpleNamespace(is_cuda=False)
-            ))
-            capture.assert_not_called()
 
     def test_target_selection(self):
         from rtp_llm.models_py.triton_kernels.sparse_msa.prefill import (
@@ -93,66 +72,6 @@ class FlashInferQ8KV4DispatchTest(unittest.TestCase):
                 adapter.flashinfer_sparse_prefill_from_topk_fp4(
                     *args, direct_layout=True, compute_backend="invalid")
 
-    def test_q8_shadow_diagnostic_preserves_output_and_limit(self):
-        from rtp_llm.models_py.triton_kernels.sparse_msa.prefill import (
-            flashinfer_nvfp4_prefill as adapter,
-        )
-
-        layout = adapter.page_layout(4)
-        pool = torch.zeros((1, layout["page_bytes"]), dtype=torch.uint8)
-        k = torch.as_strided(pool, (1, 4, 128, 64),
-                             (layout["page_bytes"], 8192, 64, 1))
-        v = torch.as_strided(pool, k.shape, k.stride(), layout["v_data_byte_offset"])
-        ks = torch.as_strided(pool, (1, 4096), (layout["page_bytes"], 1),
-                              layout["k_scale_byte_offset"])
-        vs = torch.as_strided(pool, (1, 4096), (layout["page_bytes"], 1),
-                              layout["v_scale_byte_offset"])
-        q = torch.ones((1, 64, 128), dtype=torch.bfloat16)
-        topk = torch.full((4, 1, 16), -1, dtype=torch.int32)
-        slots = torch.arange(128, dtype=torch.int32)[None, :]
-        cu = torch.tensor([0, 1], dtype=torch.int32)
-        length = torch.tensor([128], dtype=torch.int32)
-        positions = torch.tensor([127], dtype=torch.int32)
-
-        def q8_call(*args):
-            args[9].fill_(2)
-
-        def bf16_call(**kwargs):
-            kwargs["out"].fill_(1)
-
-        adapter._Q8_SHADOW_COUNTS.clear()
-        with (tempfile.TemporaryDirectory() as directory,
-              patch.dict(os.environ, {"M3_FI_Q8_SHADOW_DIR": directory,
-                                   "M3_FI_Q8_SHADOW_LIMIT": "2"}),
-              patch.object(adapter, "_prepare_topk", MagicMock()),
-              patch.object(adapter, "_clear_unwritten_page_tail", MagicMock()),
-              patch.object(adapter, "_q8kv4_target", return_value="sm103a"),
-              patch.object(adapter, "_q8kv4_module", return_value=SimpleNamespace(
-                  msa_prefill_nvfp4_specialized=q8_call)),
-              patch.object(adapter, "msa_prefill_nvfp4_specialized_warmup"),
-              patch.object(adapter, "msa_sparse_attention", side_effect=bf16_call) as shadow):
-            for _ in range(3):
-                out = adapter.flashinfer_sparse_prefill_from_topk_fp4(
-                    q, k, v, ks, vs, topk, slots, cu, length, positions, length,
-                    128**-0.5, direct_layout=True, compute_backend="q8kv4",
-                    layer_idx=3,
-                )
-                self.assertTrue(torch.all(out == 2))
-            self.assertEqual(shadow.call_count, 2)
-            records = sorted(Path(directory).glob("*.json"))
-            self.assertEqual(len(records), 2)
-            self.assertEqual([json.loads(path.read_text())["call_index"]
-                              for path in records], [0, 1])
-            with (patch.object(Path, "write_text", side_effect=OSError("disk full")),
-                  patch.object(adapter._logger, "exception") as log_error):
-                out = adapter.flashinfer_sparse_prefill_from_topk_fp4(
-                    q, k, v, ks, vs, topk, slots, cu, length, positions, length,
-                    128**-0.5, direct_layout=True, compute_backend="q8kv4",
-                    layer_idx=4,
-                )
-                self.assertTrue(torch.all(out == 2))
-                log_error.assert_called_once()
-        adapter._Q8_SHADOW_COUNTS.clear()
 
 
 class FlashInferNVFP4PrefillTest(unittest.TestCase):

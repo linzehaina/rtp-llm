@@ -8,6 +8,7 @@
 #if USING_CUDA
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDACachingAllocator.h>
+#include "rtp_llm/models_py/bindings/cuda/kernels/compact_spec_vocab_mask.h"
 #endif
 
 using namespace std;
@@ -46,13 +47,26 @@ bool LogitsProcessorStates::requiresTokenHistory() const {
 }
 
 void LogitsProcessorStates::batchProcess(const SamplerInputs& inputs) {
-    const bool has_spec_mask = inputs.phase == LogitsProcessorPhase::MTP_VERIFY && inputs.spec_vocab_mask_gpu.defined();
+    const bool has_compact_mask = inputs.spec_vocab_bitmask_gpu.defined();
+    const bool has_spec_mask = inputs.phase == LogitsProcessorPhase::MTP_VERIFY
+                              && (inputs.spec_vocab_mask_gpu.defined() || has_compact_mask);
     if (has_spec_mask) {
         if (inputs.spec_mask_ready_event) {
             inputs.spec_mask_ready_event->block(cuda_graph::graphGetCurrentStream());
         }
-        recordSpecTensorUseOnCurrentStream(inputs.spec_vocab_mask_gpu);
-        inputs.logits.masked_fill_(inputs.spec_vocab_mask_gpu, BaseLogitsProcessor::neg_inf);
+        TORCH_CHECK(!(has_compact_mask && inputs.spec_vocab_mask_gpu.defined()),
+                    "spec vocab mask must have a single representation");
+        const auto& mask = has_compact_mask ? inputs.spec_vocab_bitmask_gpu : inputs.spec_vocab_mask_gpu;
+        recordSpecTensorUseOnCurrentStream(mask);
+        if (!has_compact_mask) {
+            inputs.logits.masked_fill_(inputs.spec_vocab_mask_gpu, BaseLogitsProcessor::neg_inf);
+        } else {
+#if USING_CUDA
+            applyCompactSpecVocabMask(inputs.logits, inputs.spec_vocab_bitmask_gpu);
+#else
+            TORCH_CHECK(false, "compact spec vocab mask requires CUDA");
+#endif
+        }
     }
 
     for (size_t i = 0; i < logits_processors_.size(); i++) {

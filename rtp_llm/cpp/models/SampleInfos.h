@@ -70,6 +70,9 @@ public:
     // MTP_VERIFY only. spec_vocab_mask_gpu is a bool mask with the same row
     // count as logits; true means the token is disallowed for that verify row.
     torch::Tensor                      spec_vocab_mask_gpu;
+    // MTP_VERIFY compact allow mask [rows, ceil(vocab_size / 32)], int32.
+    // Low bit first, 1 means allowed. Mutually exclusive with the dense mask.
+    torch::Tensor                      spec_vocab_bitmask_gpu;
     torch::Tensor                      spec_cap_gpu;
     std::shared_ptr<torch::Event>      spec_mask_ready_event;
     std::shared_ptr<torch::Event>      spec_mask_consumed_event;

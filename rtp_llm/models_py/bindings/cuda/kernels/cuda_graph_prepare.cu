@@ -8,6 +8,18 @@ namespace rtp_llm {
 
 namespace {
 
+__global__ void cudaGraphTableOverwriteKernel(CudaGraphTableOverwriteParams params) {
+    const auto task = params.tasks[blockIdx.y];
+    const int64_t size = task.dst_rows * task.dst_cols;
+    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < size; i += int64_t(gridDim.x) * blockDim.x) {
+        const int64_t row = i / task.dst_cols;
+        const int64_t col = i % task.dst_cols;
+        task.dst[i] = task.src && row < task.src_rows && col < task.src_cols ?
+                          task.src[row * task.src_stride + col] : 0;
+    }
+}
+
 __global__ void cudaGraphPrepareFillKernel(CudaGraphPrepareFillParams params) {
     const int64_t tid    = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
@@ -218,6 +230,14 @@ __global__ void prepareSparseMlaTargetVerifyParamsKernel(const int32_t* input_le
 }
 
 }  // namespace
+
+void invokeCudaGraphTableOverwrite(CudaGraphTableOverwriteParams params, cudaStream_t stream) {
+    TORCH_CHECK(params.count >= 0 && params.count <= kMaxCudaGraphPrepareFillRegions,
+                "invalid table overwrite task count");
+    if (params.count > 0) {
+        cudaGraphTableOverwriteKernel<<<dim3(8, params.count), 256, 0, stream>>>(params);
+    }
+}
 
 void invokeCudaGraphPrepareFill(CudaGraphPrepareFillParams params, cudaStream_t stream) {
     TORCH_CHECK(params.region_count >= 0 && params.region_count <= kMaxCudaGraphPrepareFillRegions,

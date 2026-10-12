@@ -106,6 +106,29 @@ class MLATest(TestCase):
             raise SkipTest("CUDA is not available")
         torch.set_default_device(device)
 
+    def test_fused_preprocess_matches_native_group_selection(self):
+        torch.manual_seed(391)
+        for rows, experts in ((1, 128), (5, 128), (20, 128), (32, 128),
+                              (100, 128), (160, 128), (256, 128), (257, 128), (7, 256)):
+            logits = torch.randn(rows, experts, dtype=torch.float32, device="cuda")
+            bias = torch.randn(experts, dtype=torch.float32, device="cuda")
+            scores = logits.sigmoid()
+            corrected = scores + bias
+            for groups, selected in ((1, 1), (8, 4)):
+                for renormalize in (False, True):
+                    for dtype in (torch.int32, torch.int64):
+                        layer = GroupTopK()
+                        expected = torch.empty(rows, 8, device="cuda")
+                        expected_ids = torch.empty(rows, 8, device="cuda", dtype=dtype)
+                        actual, actual_ids = torch.empty_like(expected), torch.empty_like(expected_ids)
+                        layer.group_topk_op.forward(
+                            expected, expected_ids, scores, corrected, groups, selected,
+                            8, renormalize, 2.5)
+                        layer(actual, actual_ids, logits, bias, groups, selected,
+                              8, renormalize, 2.5)
+                        self.assertTrue(torch.equal(actual_ids, expected_ids))
+                        self.assertTrue(torch.equal(actual, expected))
+
     def _run_mla_test(
         self, seq_length, num_experts, num_expert_group, topk_group, topk
     ):

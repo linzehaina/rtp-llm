@@ -2,9 +2,6 @@
 #ifndef MSA_Q_TMEM
 #define MSA_Q_TMEM 0
 #endif
-#ifndef MSA_FORCE_ONE_CTA
-#define MSA_FORCE_ONE_CTA 0
-#endif
 
 namespace rtp_llm {
 struct alignas(128) Resident5Shared {
@@ -12,7 +9,6 @@ struct alignas(128) Resident5Shared {
     int blocks[16],physical[16];
     alignas(8) uint64_t kv_ready[2],kv_free[2],score_ready,pv_ready,math_free,p_half,p_ready,done;
     uint32_t tmem;
-    uint8_t occupancy_probe_pad[MSA_FORCE_ONE_CTA?20480:0];
 };
 static_assert(sizeof(Resident5Shared)<=232448,"resident5 kernel exceeds SMEM budget");
 
@@ -71,7 +67,7 @@ __global__ __launch_bounds__(256,2) void grouped_cutlass_resident5(Params p) {
             int block=s.blocks[page];
             bool valid=s.physical[page]>=0&&query<stop;
             float inv,lp;
-            page_softmax<true>(t,addr,block,limit,length,valid,p.alpha,inv,lp,nullptr,&s.p_half,s.p);
+            page_softmax<true>(t,addr,block,limit,length,valid,p.alpha,inv,lp,&s.p_half,s.p);
             wg_sync<1>();if(local==0) cutlass::arch::ClusterBarrier::arrive(&s.p_ready);
             cutlass::arch::ClusterBarrier::wait(&s.pv_ready,page%2);after_sync();
             float nm=max_native(m,lp),safe=nm==-CUDART_INF_F?0.f:nm;

@@ -1,5 +1,6 @@
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <stdexcept>
 #include <thread>
 #include <ATen/record_function.h>
@@ -13,6 +14,58 @@ namespace rtp_llm {
 namespace {
 
 std::atomic<int>* g_record_function_callback_count = nullptr;
+
+// Release a deliberately gated producer at the existing host-barrier entry.
+// This is test-only observation: no sleep decides whether streamWait is safe.
+// The old bare event.block never enters this scope and returns with the producer
+// still gated; tests release it unconditionally before draining/destruction.
+thread_local std::function<void()>* g_sync_entry_action = nullptr;
+
+std::unique_ptr<at::ObserverContext> releaseProducerAtSyncEntry(const at::RecordFunction& fn) {
+    if (g_sync_entry_action && std::strcmp(fn.name(), "async_runner.sync") == 0) {
+        (*g_sync_entry_action)();
+    }
+    return nullptr;
+}
+
+class ControlledProducer {
+public:
+    bool enterAndWait() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        started_ = true;
+        cv_.notify_all();
+        // A watchdog bounds test failure/cleanup; elapsed time is not an oracle.
+        return cv_.wait_for(lock, std::chrono::seconds(10), [&] { return released_; });
+    }
+    bool waitUntilStarted() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return cv_.wait_for(lock, std::chrono::seconds(10), [&] { return started_; });
+    }
+    void release() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        released_ = true;
+        cv_.notify_all();
+    }
+private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool started_ = false, released_ = false;
+};
+
+class ScopedSyncEntryAction {
+public:
+    explicit ScopedSyncEntryAction(std::function<void()> action): action_(std::move(action)) {
+        g_sync_entry_action = &action_;
+        handle_ = at::addThreadLocalCallback(at::RecordFunctionCallback(&releaseProducerAtSyncEntry));
+    }
+    ~ScopedSyncEntryAction() {
+        at::removeCallback(handle_);
+        g_sync_entry_action = nullptr;
+    }
+private:
+    std::function<void()> action_;
+    at::CallbackHandle handle_;
+};
 
 std::unique_ptr<at::ObserverContext> countRecordFunctionCallback(const at::RecordFunction&) {
     if (g_record_function_callback_count != nullptr) {
@@ -32,7 +85,72 @@ protected:
     torch::Stream currentStream() {
         return cuda_graph::graphGetCurrentStream();
     }
+
+    void checkDelayedEventPublication(bool previous_event_completed) {
+        ControlledProducer producer;
+        std::atomic<bool> published{false};
+        auto stream = makeStream();
+        auto dst = torch::zeros({64}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+        currentStream().synchronize();
+        AsyncRunner runner(stream);
+        if (previous_event_completed) {
+            runner.launch([dst] { dst.fill_(1); });
+            runner.sync(currentStream());
+            currentStream().synchronize();
+        }
+        runner.launch([&producer, &published, dst] {
+            if (!producer.enterAndWait()) throw std::runtime_error("producer gate watchdog expired");
+            dst.fill_(7);
+            published.store(true, std::memory_order_release);
+            // workerLoop records event_ only after this task body returns.
+        });
+        if (!producer.waitUntilStarted()) {
+            producer.release();
+            (void)runner.joinAndDrain();
+            FAIL() << "producer did not enter controlled gate";
+        }
+        {
+            ScopedSyncEntryAction action([&producer] { producer.release(); });
+            runner.streamWait(currentStream());
+        }
+        const bool publication_observed = published.load(std::memory_order_acquire);
+        // Capture the consumer result before releasing the old implementation's
+        // gated task; otherwise cleanup could accidentally repair a stale wait.
+        auto observed = dst.clone();
+        currentStream().synchronize();
+        producer.release();
+        EXPECT_FALSE(runner.joinAndDrain());
+        EXPECT_TRUE(publication_observed);
+        EXPECT_TRUE(torch::equal(observed.cpu(), torch::full({64}, 7, torch::kFloat32)));
+    }
 };
+
+TEST_F(AsyncRunnerTest, StreamWaitPublishesFirstTaskBeforeOrderingConsumer) {
+    checkDelayedEventPublication(false);
+}
+
+TEST_F(AsyncRunnerTest, StreamWaitPublishesRerecordedTaskNotPreviousCompletedEvent) {
+    checkDelayedEventPublication(true);
+}
+
+TEST_F(AsyncRunnerTest, StreamWaitPropagatesPublishedFailureAndAllowsRecovery) {
+    AsyncRunner runner(makeStream());
+    runner.launch([] { throw std::runtime_error("streamWait task failure"); });
+    {
+        // Establish that the worker published its error without consuming it.
+        std::unique_lock<std::mutex> lock(runner.mutex_);
+        ASSERT_TRUE(runner.cv_done_.wait_for(lock, std::chrono::seconds(10), [&] { return runner.task_done_; }));
+    }
+    EXPECT_THROW(runner.streamWait(currentStream()), std::runtime_error);
+    auto dst = torch::zeros({64}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+    currentStream().synchronize();
+    // If the old implementation did not propagate the exception, drain consumes
+    // it so the regression still cleans up and can check subsequent recovery.
+    (void)runner.joinAndDrain();
+    runner.launch([dst] { dst.fill_(9); });
+    runner.streamWait(currentStream());
+    EXPECT_TRUE(torch::equal(dst.cpu(), torch::full({64}, 9, torch::kFloat32)));
+}
 
 TEST_F(AsyncRunnerTest, LaunchAndSyncBasic) {
     auto        stream = makeStream();
@@ -87,6 +205,11 @@ TEST_F(AsyncRunnerTest, CudaTensorWork) {
     auto src = torch::ones({64}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
     auto dst = torch::zeros({64}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
 
+    // Inputs were initialized on the caller stream, while the worker uses a
+    // private stream. Order that initialization before its first tensor read.
+    auto inputs_ready = cuda_graph::makeGraphEvent();
+    inputs_ready.record(currentStream());
+    inputs_ready.block(stream);
     runner.launch([&src, &dst] { dst.copy_(src); });
     runner.sync(currentStream());
 

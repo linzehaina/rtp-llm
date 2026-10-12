@@ -5,7 +5,8 @@ from typing import Any, List, Optional
 from jinja2 import Environment
 from typing_extensions import override
 
-from rtp_llm.openai.api_datatype import ChatCompletionRequest
+from rtp_llm.config.generate_config import ThinkingMode
+from rtp_llm.openai.api_datatype import ChatCompletionRequest, DeltaMessage
 from rtp_llm.openai.renderer_factory_register import register_renderer
 from rtp_llm.openai.renderers.reasoning_tool_base_renderer import (
     ReasoningToolBaseRenderer,
@@ -125,7 +126,51 @@ class MiniMaxM3Renderer(ReasoningToolBaseRenderer):
     def _create_reasoning_parser(
         self, request: ChatCompletionRequest
     ) -> Optional[ReasoningParser]:
-        return ReasoningParser(model_type="minimax_m3")
+        # Enabled prompts end with an opening marker; disabled prompts already
+        # contain the closing marker. Adaptive prompts leave the decision to
+        # generated markers instead of assuming that every reply is reasoning.
+        return ReasoningParser(
+            model_type="minimax_m3",
+            force_reasoning=request.resolve_thinking_mode() == ThinkingMode.ENABLED,
+        )
+
+    @override
+    def _extract_reasoning_content(self, reasoning_parser, text: str, is_streaming: bool):
+        # Native outputs are normalized token chunks even for a non-streaming HTTP
+        # reply. Keep the close-marker state across those chunks in both modes.
+        if reasoning_parser is None:
+            return "", text
+        return reasoning_parser.parse_stream_chunk(text)
+
+    @override
+    def _split_reasoning_text_and_content(self, item, think_status):
+        # M3's detector has already classified every normalized packet. Plain
+        # strings from its normal-content fallback and final buffer flush must
+        # not enter the generic thinking parser a second time.
+        if isinstance(item.output_str, str):
+            return DeltaMessage(content=item.output_str)
+        return super()._split_reasoning_text_and_content(item, think_status)
+
+    @override
+    async def _process_normalized_tokens(
+        self, normalizer, status, new_token_ids, output,
+        stop_words_str, stop_word_slice_list, is_streaming,
+    ):
+        deltas, yielded = await super()._process_normalized_tokens(
+            normalizer, status, new_token_ids, output,
+            stop_words_str, stop_word_slice_list, is_streaming,
+        )
+        if not is_streaming:
+            # Incremental parsing may retain a partial marker until EOS, including
+            # a final packet whose normalizer emits no text. Preserve the ordering
+            # of normal text the non-streaming base renderer has not emitted yet.
+            pending = await self._flush_reasoning_parser(status, output)
+            if pending is not None:
+                if status.delta_output_string:
+                    status.delta_output_string += pending.output_str.content or ""
+                else:
+                    deltas.append(pending)
+        return deltas, yielded
 
 
 register_renderer("minimax_m3", MiniMaxM3Renderer)

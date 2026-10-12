@@ -38,7 +38,8 @@ shape-bucket caches below (stable addresses across replays).
 
 Dispatch is reversible without code changes:
 
-* ``MSA_USE_NATIVE_HYBRID_DECODE=0`` disables the route (default on).
+* ``MSA_USE_NATIVE_HYBRID_DECODE=1`` explicitly enables this experimental route.
+  The default is OFF pending the prior-GEMM nonfinite regression fix.
 * ``MSA_NATIVE_HYBRID_LIB=/path/to/lib.so`` loads an operator-supplied
   binary instead of the bundled artifact (sha not enforced for overrides).
 
@@ -229,7 +230,7 @@ def load_library() -> _NativeHybridLibrary | None:
 
 def native_hybrid_decode_enabled() -> bool:
     """Per-call env read so the route can be toggled without re-import."""
-    return os.environ.get("MSA_USE_NATIVE_HYBRID_DECODE", "1") == "1"
+    return os.environ.get("MSA_USE_NATIVE_HYBRID_DECODE", "0") == "1"
 
 
 @dataclass

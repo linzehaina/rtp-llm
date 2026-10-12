@@ -550,3 +550,39 @@ TEST_F(GenerateStreamTest, testMtpAsyncDeviceStateBackCompatWrappers) {
 }
 
 }  // namespace rtp_llm
+
+namespace rtp_llm {
+TEST_F(GenerateStreamTest, testMtpBatchOwnerMaterializesOnlyRequestedRowsAndOutlivesStreamState) {
+    GenerateStreamBuilder builder;
+    auto stream = builder.createContextStream({1, 2, 3});
+    auto owner = std::make_shared<GenerateStream::MtpBatchDeviceState>();
+    owner->accept_len_gpu = torch::tensor({5, 2}, torch::kInt32);
+    owner->accept_tokens_gpu = torch::tensor({10, 11, 12, 13, 14, 20, 21, 0, 0, 0}, torch::kInt32).view({2, 5});
+    owner->next_seq_len_gpu = torch::tensor({105, 202}, torch::kInt32);
+    owner->dspark_anchor_gpu = torch::tensor({14, 21}, torch::kInt32);
+    owner->dspark_committed_end_gpu = torch::tensor({104, 201}, torch::kInt32);
+    GenerateStream::MtpAsyncDeviceState state;
+    state.batch_owner = owner;
+    state.batch_row = 1;
+    state.last_real_seq_len = 200;
+    state.next_real_seq_len = 205;  // allocation bound, distinct from exact GPU 202
+    const auto epoch = stream->setMtpAsyncDeviceState(state);
+    EXPECT_FALSE(stream->getMtpAsyncDeviceStateMetadata().accept_len_gpu.defined());
+    EXPECT_EQ(stream->getMtpAsyncDeviceStateMetadata().next_real_seq_len, 205);
+    EXPECT_EQ(stream->getAcceptLenGpu().item<int>(), 2);
+    auto row = stream->getAcceptTokensGpu();
+    EXPECT_EQ(row.data_ptr<int32_t>(), owner->accept_tokens_gpu.data_ptr<int32_t>() + 5);
+    const auto materialized = stream->getMtpAsyncDeviceState();
+    EXPECT_EQ(materialized.accept_len_gpu.item<int>(), 2);
+    EXPECT_EQ(materialized.dspark_anchor_gpu.item<int>(), 21);
+    EXPECT_EQ(materialized.dspark_committed_end_gpu.item<int>(), 201);
+    EXPECT_FALSE(stream->getMtpAsyncDeviceStateMetadata().accept_tokens_gpu.defined());
+    // A worker/legacy row still owns its storage after main-thread replacement.
+    std::weak_ptr<const GenerateStream::MtpBatchDeviceState> weak = owner;
+    owner.reset();
+    EXPECT_TRUE(stream->clearMtpAsyncDeviceState(epoch));
+    EXPECT_FALSE(weak.expired());  // local state and materialized retain owner
+    EXPECT_EQ(row[0][1].item<int>(), 21);
+    EXPECT_FALSE(stream->getAcceptTokensGpu().defined());
+}
+}  // namespace rtp_llm

@@ -1774,21 +1774,12 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKRenormProbKernel_Multi
     }
   }
 
-  // Clear histogram buffers and reset arrival counter for next kernel launch (only for multi-CTA)
-  if constexpr (!SINGLE_CTA) {
-    // Only leading CTA clears the buffers using release semantics
-    if (cta_in_group == 0) {
-      for (uint32_t buf = 0; buf < 3; ++buf) {
-        for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
-          state->histogram[buf][i] = 0;
-        }
-      }
+  // RTP supplies a freshly zeroed, private row-state buffer for every invocation.
+  // Do not reset the arrival counter here: the leading CTA can finish stores
+  // before another CTA has observed the final software-barrier phase. Resetting
+  // to zero would strand that waiter forever. Reinitialization belongs to the
+  // caller, ordered before the next kernel, after all CTAs have completed.
 
-      if (tx == 0) {
-        st_release(&state->arrival_counter, 0);
-      }
-    }
-  }
 }
 
 template <typename DType, typename IdType>

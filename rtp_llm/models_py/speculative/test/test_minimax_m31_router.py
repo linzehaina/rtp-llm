@@ -77,6 +77,7 @@ class TestMiniMaxM31Router(unittest.TestCase):
         nn.Module.__init__(layer)
         layer.mlp = object.__new__(MiniMaxM31MoeLayer)
         nn.Module.__init__(layer.mlp)
+        layer.self_attn = nn.Identity()
         x = torch.zeros(1, 1)
         with patch.object(
             MiniMaxM3DecoderLayer, "_forward_attention", return_value=(x, None)

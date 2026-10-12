@@ -71,7 +71,8 @@ public:
                                     const torch::Tensor& markov_w1,
                                     const torch::Tensor& markov_w2,
                                     size_t               draft_vocab_size,
-                                    size_t               sampled_prefix_steps = 0) const;
+                                    size_t               sampled_prefix_steps = 0,
+                                    size_t               base_logit_steps = 0) const;
 
     torch::Tensor computeDSparkConfidence(const torch::Tensor& draft_hidden,
                                           const torch::Tensor& anchors,

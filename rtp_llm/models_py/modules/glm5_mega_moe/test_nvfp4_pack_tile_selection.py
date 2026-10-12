@@ -63,7 +63,7 @@ class NVFP4PackTileSelectionTest(unittest.TestCase):
             override is None
             and hidden == 6144
             and topk == 4
-            and (tokens in (20, 25, 40, 60, 80, 100) or tokens >= 4096)
+            and (tokens in (20, 25, 40, 60, 80, 100, 160) or tokens >= 4096)
         )
         packed, unused = (vector, scalar) if use_vector else (scalar, vector)
         self.assertEqual(unused.calls, [])
@@ -95,13 +95,14 @@ class NVFP4PackTileSelectionTest(unittest.TestCase):
     def test_measured_small_vector_tiles(self):
         self.assertEqual(self.dispatch(25), 8)
         self.assertEqual(self.dispatch(40), 16)
+        self.assertEqual(self.dispatch(160), 16)
         self.assertEqual(self.dispatch(25, hidden=4096), 4)
         self.assertEqual(self.dispatch(40, topk=8), 4)
 
     def test_warmup_covers_each_reachable_small_vector_tile(self):
         with patch.dict(os.environ):
             os.environ.pop(ENV, None)
-            expected = {19: (), 20: (20,), 39: (20,), 40: (20, 40), 4096: (20, 40)}
+            expected = {19: (), 20: (20,), 39: (20,), 40: (20, 40), 160: (20, 40), 4096: (20, 40)}
             for cap, rows in expected.items():
                 with self.subTest(cap=cap):
                     self.assertEqual(packer.vector_packer_warmup_rows(cap, 6144, 4), rows)

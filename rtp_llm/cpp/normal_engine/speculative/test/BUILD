@@ -86,8 +86,29 @@ cc_test(
         "@local_config_cuda//cuda:cuda_headers",
         "@local_config_cuda//cuda:cudart",
     ] + torch_deps() + cuda13_torch_link_deps,
+    args = ["--gtest_filter=-MtpExecutorTest.DSparkDispatchMetricsPublishesBeforeSameStepConsumption:MtpExecutorTest.DSparkDispatchMetricsPreviousLaunchErrorPreservedAfterCleanup:MtpExecutorTest.DSparkDispatchMetricsCollectionFailureDoesNotPreventAcceptedWorker:MtpExecutorTest.NonDSparkDispatchMetricsCollectsBeforeAsyncPublication:MtpExecutorTest.DSparkMetricsFaultThroughProcessDrainsWorkerAndReaderBeforeLeaseRelease"],
     env = {
         "TEST_USING_DEVICE": "CUDA",
+        "RTP_LLM_STREAM_ASYNC": "0",
+        "RTP_LLM_DROP_BROAD_SYNC": "0",
     },
     exec_properties = {'gpu':'H20'},
+)
+
+# Cached runtime flags require separate processes. Legacy mock-sampler tests
+# produce CPU tensors; async lifecycle tests use the actual GPU publication path.
+sh_test(
+    name = "mtp_executor_async_test",
+    srcs = ["//:cc_test_wrapper.sh"],
+    data = [":mtp_executor_test_bin"],
+    args = [
+        "$(location :mtp_executor_test_bin)",
+        "--gtest_filter=-MtpExecutorTest.DSparkDispatchMetricsSyncCollectsBeforePublication:MtpExecutorTest.testSingleBatchDecode:MtpExecutorTest.testMultiBatchDecode",
+    ],
+    env = {
+        "TEST_USING_DEVICE": "CUDA",
+        "RTP_LLM_STREAM_ASYNC": "1",
+        "RTP_LLM_DROP_BROAD_SYNC": "1",
+    },
+    exec_properties = {"gpu": "H20"},
 )

@@ -1,6 +1,7 @@
 #include "rtp_llm/models_py/bindings/core/OpData.h"
 #include "rtp_llm/models_py/bindings/core/CommonDefines.h"
 #include "rtp_llm/models_py/bindings/core/TensorHolder.h"
+#include "rtp_llm/models_py/bindings/core/SamplingSeedOffset.h"
 
 #if USING_CUDA
 #include <ATen/cuda/CUDAContext.h>
@@ -27,6 +28,37 @@ namespace rtp_llm {
 #if USING_CUDA
 
 using SamplerT = float;
+
+namespace detail {
+
+std::pair<torch::Tensor, torch::Tensor> makeSamplingSeedOffsetTensors(const std::vector<at::Generator>& generators,
+                                                                      int64_t                           batch_size,
+                                                                      int                               increment,
+                                                                      TensorHolder*                     buffer_holder) {
+    auto options  = torch::TensorOptions().dtype(torch::kInt64).pinned_memory(true);
+    auto pair_h   = torch::empty({2, batch_size}, options);
+    auto seed_ptr = pair_h.data_ptr<int64_t>();
+    auto off_ptr  = pair_h.select(0, 1).data_ptr<int64_t>();
+
+    for (int64_t i = 0; i < batch_size; ++i) {
+        auto generator      = (i < static_cast<int64_t>(generators.size()) && generators[i].defined()) ?
+                                  std::make_optional(generators[i]) :
+                                  std::nullopt;
+        auto [seed, offset] = get_seed_and_offset(increment, generator);
+        seed_ptr[i]         = static_cast<int64_t>(seed);
+        off_ptr[i]          = static_cast<int64_t>(offset);
+    }
+
+    // Keep the original row order, generator locks and reservations above.
+    // One asynchronous copy publishes both arrays without changing their ABI.
+    auto pair_d = pair_h.to(torch::kCUDA, /*non_blocking=*/true).contiguous();
+    if (buffer_holder != nullptr) {
+        buffer_holder->hold_host(pair_h);
+    }
+    return {pair_d.select(0, 0), pair_d.select(0, 1)};
+}
+
+}  // namespace detail
 
 namespace {
 
@@ -59,33 +91,6 @@ void pyTopPRenormProbs(const torch::Tensor& probs, torch::Tensor& renorm_probs, 
     renorm_probs.copy_(result, /*non_blocking=*/true);
 }
 
-std::pair<torch::Tensor, torch::Tensor> makeSamplingSeedOffsetTensors(const std::vector<at::Generator>& generators,
-                                                                      int64_t                           batch_size,
-                                                                      int                               increment,
-                                                                      TensorHolder*                     buffer_holder) {
-    auto options  = torch::TensorOptions().dtype(torch::kInt64).pinned_memory(true);
-    auto seed_h   = torch::empty({batch_size}, options);
-    auto offset_h = torch::empty({batch_size}, options);
-    auto seed_ptr = seed_h.data_ptr<int64_t>();
-    auto off_ptr  = offset_h.data_ptr<int64_t>();
-
-    for (int64_t i = 0; i < batch_size; ++i) {
-        auto generator      = (i < static_cast<int64_t>(generators.size()) && generators[i].defined()) ?
-                                  std::make_optional(generators[i]) :
-                                  std::nullopt;
-        auto [seed, offset] = get_seed_and_offset(increment, generator);
-        seed_ptr[i]         = static_cast<int64_t>(seed);
-        off_ptr[i]          = static_cast<int64_t>(offset);
-    }
-
-    auto seed_d   = seed_h.to(torch::kCUDA, /*non_blocking=*/true).contiguous();
-    auto offset_d = offset_h.to(torch::kCUDA, /*non_blocking=*/true).contiguous();
-    if (buffer_holder != nullptr) {
-        buffer_holder->hold_host(seed_h);
-        buffer_holder->hold_host(offset_h);
-    }
-    return {seed_d, offset_d};
-}
 
 void processLogits(const GreedyParams&  params,
                    const torch::Tensor& device_tokens,
@@ -224,7 +229,7 @@ static GreedyOutput flashinferSampleGreedy(const GreedyParams& params, const tor
 
     constexpr bool deterministic       = true;
     constexpr int  max_sampling_rounds = 32;
-    auto [seed_t, offset_t]            = makeSamplingSeedOffsetTensors(
+    auto [seed_t, offset_t]            = detail::makeSamplingSeedOffsetTensors(
         params.generator, dense_batch_size, static_cast<int>(max_sampling_rounds), params.buffer_holder);
     if (compact) {
         seed_t   = seed_t.index_select(0, rows);

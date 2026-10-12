@@ -1,4 +1,5 @@
 #include "rtp_llm/cpp/normal_engine/speculative/SpeculativeSampler.h"
+#include "rtp_llm/cpp/config/StaticConfig.h"
 
 #include <gtest/gtest.h>
 #include <torch/all.h>
@@ -20,6 +21,7 @@
 #include "rtp_llm/models_py/bindings/core/ExecOps.h"
 #include "rtp_llm/models_py/bindings/cuda/kernels/speculative_sampling/sampling.h"
 #include "rtp_llm/cpp/models/Sampler.h"
+#include "rtp_llm/models_py/bindings/cuda/Bf16GemmOp.h"
 #endif
 
 #include "rtp_llm/cpp/normal_engine/NormalGenerateStream.h"
@@ -500,6 +502,85 @@ TEST(DSparkSamplerTest, VerifiedPrefixPreservesMultiRoundProbabilitiesAndCudaRng
                         anchors = prefix.token_ids.select(1, k - 1).contiguous();
                     }
                     EXPECT_TRUE(torch::equal(logits, original_logits));
+                }
+            }
+        }
+    }
+}
+
+TEST(DSparkSamplerTest, TrimmedLmHeadMatchesActualBf16GemmFp32Rows) {
+    if (!torch::cuda::is_available()) GTEST_SKIP();
+    constexpr int64_t gamma = 7, prefix = 4, vocab = 200064, hidden = 6144;
+    const auto options = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kBFloat16);
+    auto weight = torch::randn({vocab, hidden}, options);
+    for (int64_t batch : {1, 3, 32}) {
+        auto features = torch::randn({batch * gamma, hidden}, options);
+        auto trimmed = features.view({batch, gamma, hidden}).narrow(1, 0, prefix)
+                           .contiguous().view({batch * prefix, hidden});
+        auto full = torch_ext::cublas_gemm_bf16_bf16_fp32(features, weight);
+        auto expected = full.view({batch, gamma, vocab}).narrow(1, 0, prefix).contiguous();
+        auto actual = torch_ext::cublas_gemm_bf16_bf16_fp32(trimmed, weight).view({batch, prefix, vocab});
+        // A change of M may change cuBLAS's reduction algorithm. Keep this
+        // exact gate separate from sampler/RNG tests on precomputed logits.
+        EXPECT_TRUE(torch::equal(actual.view(torch::kInt32), expected.view(torch::kInt32)));
+    }
+}
+
+TEST(DSparkSamplerTest, TrimmedLmHeadRejectsInvalidPrefixAndEmptyBatchContract) {
+    if (!torch::cuda::is_available()) GTEST_SKIP();
+    struct AssertionModeGuard {
+        bool previous = StaticConfig::user_ft_core_dump_on_exception;
+        AssertionModeGuard() { StaticConfig::user_ft_core_dump_on_exception = false; }
+        ~AssertionModeGuard() { StaticConfig::user_ft_core_dump_on_exception = previous; }
+    } assertion_mode_guard;
+    auto options = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32);
+    auto base = torch::zeros({4, 32}, options);
+    auto anchor = torch::zeros({1}, options.dtype(torch::kInt32));
+    auto temperature = torch::ones({1}, options);
+    auto w1 = torch::zeros({32, 256}, options), w2 = torch::zeros({32, 256}, options);
+    SpeculativeSampler sampler({}, 7, DraftProposalMode::SAMPLED);
+    EXPECT_ANY_THROW(sampler.sampleDSparkDraft(base, anchor, temperature, w1, w2, 32, 7, 4));
+    EXPECT_ANY_THROW(sampler.sampleDSparkDraft(base, anchor, temperature, w1, w2, 32, 4, 8));
+    EXPECT_ANY_THROW(sampler.sampleDSparkDraft(base.narrow(0, 0, 0), anchor.narrow(0, 0, 0),
+                                            temperature.narrow(0, 0, 0), w1, w2, 32, 4, 4));
+}
+
+TEST(DSparkSamplerTest, TrimmedLmHeadPreservesPrefixProbabilitiesAndSubsequentRng) {
+    if (!torch::cuda::is_available()) {
+        GTEST_SKIP() << "CUDA is required";
+    }
+    CudaGeneratorStateGuard rng;
+    constexpr int64_t gamma = 7, vocab = 257, padded_vocab = 320, rank = 256;
+    const auto options = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32);
+    for (int64_t batch : {1, 3, 32}) {
+        for (int64_t steps : {1, 4, 7}) {
+            for (bool mapped : {false, true}) {
+                auto w1 = (torch::randn({2 * vocab + 1, rank}, options) * .1f).to(torch::kBFloat16);
+                auto w2 = (torch::randn({vocab, rank}, options) * .1f).to(torch::kBFloat16);
+                auto map = mapped ? torch::arange(vocab, options.dtype(torch::kInt64)) * 2 + 1 : torch::Tensor();
+                auto base = torch::randn({batch * gamma, padded_vocab}, options);
+                auto trimmed = base.view({batch, gamma, padded_vocab}).narrow(1, 0, steps)
+                                   .contiguous().view({batch * steps, padded_vocab});
+                auto temperatures = torch::linspace(.3f, 1.5f, batch, options);
+                temperatures.select(0, 0).fill_(1e-6f);
+                auto anchors = torch::arange(batch, options.dtype(torch::kInt32));
+                if (mapped) anchors = anchors * 2 + 1;
+                auto next_probs = torch::randn({batch, vocab}, options).softmax(-1);
+                SpeculativeSampler sampler(map, gamma, DraftProposalMode::SAMPLED);
+                for (int round = 0; round < 3; ++round) {
+                    auto before = rng.state();
+                    auto expected = sampler.sampleDSparkDraft(base, anchors, temperatures, w1, w2, vocab, steps);
+                    auto expected_next = execSampleFromProbs(next_probs);
+                    auto expected_rand = torch::rand({batch, 13}, options);
+                    auto expected_state = rng.state();
+                    rng.restore(before);
+                    auto actual = sampler.sampleDSparkDraft(trimmed, anchors, temperatures, w1, w2, vocab, steps, steps);
+                    EXPECT_TRUE(torch::equal(actual.token_ids, expected.token_ids));
+                    EXPECT_TRUE(torch::equal(actual.all_probs.view(torch::kInt32), expected.all_probs.view(torch::kInt32)));
+                    EXPECT_TRUE(torch::equal(execSampleFromProbs(next_probs), expected_next));
+                    EXPECT_TRUE(torch::equal(torch::rand({batch, 13}, options), expected_rand));
+                    EXPECT_TRUE(torch::equal(rng.state(), expected_state));
+                    anchors = actual.token_ids.select(1, steps - 1).contiguous();
                 }
             }
         }

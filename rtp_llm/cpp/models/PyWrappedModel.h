@@ -6,6 +6,7 @@
 #include <optional>
 #include <string>
 #include <atomic>
+#include <array>
 #include <mutex>
 #include <c10/core/DeviceGuard.h>
 #include "rtp_llm/models_py/bindings/core/Types.h"
@@ -106,7 +107,7 @@ private:
 
 private:
     // Helper functions to reduce code duplication
-    torch_ext::PyAttentionInputs   buildPyAttentionInputs(const GptModelInputs& inputs);
+    torch_ext::PyAttentionInputs   buildPyAttentionInputs(const GptModelInputs& inputs, bool build_metadata = true);
     torch_ext::PyEmbeddingInputs   buildPyEmbeddingInputs(const GptModelInputs& inputs);
     torch_ext::PyMultimodalInputs  buildPyMultimodalInputs(const GptModelInputs& inputs);
     torch_ext::BertEmbeddingInputs buildBertEmbeddingInputs(const GptModelInputs& inputs);
@@ -172,6 +173,15 @@ private:
     static constexpr int kPinnedCheckForwardCount = 3;
     int                  pinned_check_remaining_{kPinnedCheckForwardCount};
 
+    void prepareLegacyAttentionInputs(const GptModelInputs& inputs, bool skip_forward_event_sync);
+    bool tryPrepareCommitMetadata(const GptModelInputs& inputs, bool skip_forward_event_sync);
+    bool preparedCommitSourceMatches(const GptModelInputs& inputs) const;
+    bool commit_metadata_producer_ = false;
+    bool prepared_commit_metadata_ = false;
+    std::array<PreparedGraphTensorIdentity, 9> prepared_commit_sources_;
+    bool prepared_commit_ragged_ = false;
+    bool prepared_commit_draft_prefill_ = false;
+    void resetPreparedCommitMetadata();
     std::atomic<bool>            prepared_attention_inputs_{false};
     torch_ext::PyAttentionInputs attention_inputs_;
     CudaGraphState               graph_state_;
@@ -351,6 +361,17 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
             RTP_LLM_CHECK_WITH_INFO(width > 0, "DSpARK CUDA graph input hidden width must be positive, got %ld", width);
             graph_params.input_hidden_size             = static_cast<size_t>(width);
             graph_params.require_exact_decode_geometry = true;
+        }
+        if (dspark_model_role_ == DSparkModelRole::COMMIT
+            && py::hasattr(py_instance, "cuda_graph_commit_table_overwrite")) {
+            graph_params.commit_table_overwrite =
+                py::cast<bool>(py_instance.attr("cuda_graph_commit_table_overwrite"));
+        }
+        if (dspark_model_role_ == DSparkModelRole::COMMIT
+            && py::hasattr(py_instance, "cuda_graph_commit_metadata_producer")) {
+            graph_params.commit_metadata_producer =
+                py::cast<bool>(py_instance.attr("cuda_graph_commit_metadata_producer"));
+            commit_metadata_producer_ = graph_params.commit_metadata_producer;
         }
         // Draft-prefill token layout is a model execution capability, independent of hidden-width expansion.
         // Models that need max-batch token capacity opt in explicitly; compact layout is the safe default

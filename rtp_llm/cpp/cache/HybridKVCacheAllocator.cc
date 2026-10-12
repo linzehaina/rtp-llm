@@ -292,6 +292,50 @@ MallocResult HybridKVCacheAllocator::incrMalloc(const MallocInfo& malloc_info) {
     const int   raw_seq_len  = malloc_info.incrSeqLen();
     const int   reserve_step = malloc_info.complete_token_ids->getReserveStep();
 
+    // FULL/SWA malloc cannot allocate or backfill when every table already
+    // covers the requested slots. Avoid copying the long block tables solely
+    // for rollback in that case. LINEAR may backfill existing NULL positions
+    // without growing its table, so it must keep the transactional path.
+    bool no_growth = linear_group_ids_.empty();
+    for (int b = 0; no_growth && b < batch_size; ++b) {
+        for (int gid = 0; gid < kv_resource->groupNums(); ++gid) {
+            const auto group_type = static_cast<size_t>(gid) < config_.group_types.size() ?
+                                        config_.group_types[static_cast<size_t>(gid)] :
+                                        CacheGroupType::FULL;
+            const int group_seq_len = cpEffectiveSeqLenForGroup(cp_mapper, group_type, raw_seq_len);
+            if (kv_cache_groups_[static_cast<size_t>(gid)]->needBlocksNum(
+                    group_seq_len, kv_resource->blocksNum(b, gid), reserve_step) != 0) {
+                no_growth = false;
+                break;
+            }
+        }
+    }
+    if (no_growth) {
+        for (int b = 0; b < batch_size; ++b) {
+            for (int gid = 0; gid < kv_resource->groupNums(); ++gid) {
+                const auto group_type = static_cast<size_t>(gid) < config_.group_types.size() ?
+                                            config_.group_types[static_cast<size_t>(gid)] :
+                                            CacheGroupType::FULL;
+                const int group_seq_len = cpEffectiveSeqLenForGroup(cp_mapper, group_type, raw_seq_len);
+                // Retain group-specific tail validation and skipped-block cleanup.
+                auto& block_ids = kv_resource->mutableBlockIds(b, gid);
+                if (!kv_cache_groups_[static_cast<size_t>(gid)]->malloc(
+                        block_ids, group_seq_len, malloc_info.reuse_cache, reserve_step)) {
+                    return {false, 0};
+                }
+            }
+        }
+        if (malloc_info.enable_remove_skipped_blocks) {
+            for (int b = 0; b < batch_size; ++b) {
+                for (int gid = 0; gid < kv_resource->groupNums(); ++gid) {
+                    kv_cache_groups_[static_cast<size_t>(gid)]->removeSkippedBlocks(
+                        kv_resource->mutableBlockIds(b, gid), malloc_info.reuse_cache, reserve_step);
+                }
+            }
+        }
+        return {true, 0};
+    }
+
     std::vector<std::vector<BlockIndicesType>> original_blocks(static_cast<size_t>(batch_size));
     for (int b = 0; b < batch_size; ++b) {
         original_blocks[static_cast<size_t>(b)].resize(static_cast<size_t>(kv_resource->groupNums()));

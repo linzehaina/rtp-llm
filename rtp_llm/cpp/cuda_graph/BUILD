@@ -30,6 +30,8 @@ filegroup(
         "cuda_graph_device_shims.h",
         "cuda_graph_utils.h",
         "cuda_graph_runner.h",
+        "table_overwrite_plan.h",
+        "commit_metadata_producer_plan.h",
     ],
     visibility = ["//visibility:public"],
 )
@@ -41,6 +43,8 @@ cc_library(
         "cuda_graph_device_shims.h",
         "cuda_graph_utils.h",
         "cuda_graph_runner.h",
+        "table_overwrite_plan.h",
+        "commit_metadata_producer_plan.h",
     ],
     deps = [
         "//rtp_llm/models_py/bindings:op_defs",
@@ -55,6 +59,8 @@ cc_library(
         "cuda_graph_device_shims.h",
         "cuda_graph_utils.h",
         "cuda_graph_runner.h",
+        "table_overwrite_plan.h",
+        "commit_metadata_producer_plan.h",
     ],
     srcs = [
         "cuda_graph_device_shims.cc",
@@ -76,6 +82,7 @@ cc_library(
         "//:using_cuda": [
             "//rtp_llm/models_py/bindings/cuda:cuda",
             "//rtp_llm/models_py/bindings/cuda/kernels:cuda_graph_prepare",
+            "//rtp_llm/models_py/bindings/cuda/kernels:commit_metadata_producer",
         ],
         "@//:using_rocm": [
             "@local_config_rocm//rocm:rocm_headers",

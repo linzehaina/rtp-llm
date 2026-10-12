@@ -61,7 +61,7 @@ __global__ __launch_bounds__(384,1) void grouped_cutlass_resident4(Params p) {
             int block=s.blocks[page];
             bool valid=s.physical[page]>=0&&query<stop;
             float inv,lp;
-            page_softmax<true>(t+chain*128,addr,block,limit,length,valid,p.alpha,inv,lp,nullptr,&s.p_half[chain],pbuf[chain]);
+            page_softmax<true>(t+chain*128,addr,block,limit,length,valid,p.alpha,inv,lp,&s.p_half[chain],pbuf[chain]);
             if(chain==0) wg_sync<1>(); else wg_sync<2>();
             if(local==0) cutlass::arch::ClusterBarrier::arrive(&s.p_ready[chain]);
             cutlass::arch::ClusterBarrier::wait(&s.pv_ready[chain],q2%2);after_sync();

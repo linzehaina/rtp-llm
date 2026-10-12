@@ -3,10 +3,39 @@
 #include <cstddef>
 #include <cstdint>
 #include <vector>
+#include <optional>
 
 namespace rtp_llm {
 
 using namespace torch_ext;
+
+// Weak ownership prevents TensorImpl-address reuse from matching an old prepare.
+// In-place Torch edits invalidate tracked versions; raw CUDA/CPU edits must use
+// the explicit update/invalidation API or obey prepare-to-forward immutability.
+struct PreparedGraphTensorIdentity {
+    using WeakTensor = c10::weak_intrusive_ptr<c10::TensorImpl, c10::UndefinedTensorImpl>;
+    std::optional<WeakTensor> owner;
+    bool tracks_version = false;
+    uint32_t version = 0;
+    void capture(const torch::Tensor& tensor) {
+        owner.reset();
+        tracks_version = false;
+        version = 0;
+        if (!tensor.defined()) return;
+        owner.emplace(tensor.getIntrusivePtr());
+        const auto& counter = tensor.unsafeGetTensorImpl()->version_counter();
+        tracks_version = counter.enabled();
+        if (tracks_version) version = counter.current_version();
+    }
+    bool matches(const torch::Tensor& tensor) const {
+        if (!owner) return !tensor.defined();
+        if (!tensor.defined()) return false;
+        const auto locked = owner->lock();
+        if (!locked || locked.get() != tensor.unsafeGetTensorImpl()) return false;
+        const auto& counter = tensor.unsafeGetTensorImpl()->version_counter();
+        return counter.enabled() == tracks_version && (!tracks_version || counter.current_version() == version);
+    }
+};
 
 // Current state of CUDA graph execution (used when calling canRun/forward with graph runner)
 struct CudaGraphState {
@@ -49,6 +78,10 @@ struct GraphParams {
     // DSpARK commit/propose side effects are only safe for the exact captured
     // request geometry. Missing buckets must use eager execution, not padding.
     bool require_exact_decode_geometry = false;
+    // Explicit model capability, restricted to the COMMIT runner by the wrapper.
+    bool commit_table_overwrite = false;
+    // Strong COMMIT-only capability: no dynamic CPU padding consumer.
+    bool commit_metadata_producer = false;
     // Some draft models intentionally execute prefill with a fixed max-batch token layout.
     // Keep this execution capability separate from hidden-width expansion.
     bool draft_prefill_requires_full_token_capacity = false;
@@ -75,6 +108,11 @@ public:
     virtual void prepareAttentionInputs(const PyModelInputs& inputs,
                                         CudaGraphState&      state,
                                         bool                 skip_forward_event_sync = false) = 0;
+
+    // Source attention may omit derived cu/padding; payload geometry is real.
+    virtual bool tryPrepareCommitMetadata(const PyModelInputs&, CudaGraphState&, bool = false) { return false; }
+    virtual bool preparedCommitMetadataMatches(const PyModelInputs&, const CudaGraphState&) const { return false; }
+    virtual void resetPreparedInputs() {}
 
     // Refresh only captured kv_cache_kernel_block_id state and FlashInfer plan
     // buffers after page-table changes. Other captured fields stay untouched.

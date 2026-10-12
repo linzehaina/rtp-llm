@@ -84,3 +84,12 @@ cc_test(
     },
     exec_properties = {'gpu':'H20'},
 )
+
+cc_test(
+    name = "compact_spec_vocab_mask_test",
+    srcs = ["CompactSpecVocabMaskTest.cc"],
+    copts = test_copts,
+    deps = test_deps + ["//rtp_llm/models_py/bindings/cuda/kernels:compact_spec_vocab_mask"],
+    env = {"TEST_USING_DEVICE": "CUDA"},
+    exec_properties = {'gpu':'H20'},
+)

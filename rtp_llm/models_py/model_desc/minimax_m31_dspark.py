@@ -133,6 +133,15 @@ class MiniMaxM31DSparkModel(DSparkProposerMixin, GptModelBase):
         self.cp_rank = int(parallelism_config.tp_rank) if self.cp_enabled else 0
         self.cache_cp_size = self.cp_size if cp.kv_cache_sharded else 1
         self.cache_cp_rank = self.cp_rank if cp.kv_cache_sharded else 0
+        # The C++ wrapper applies this capability only to forward_commit.
+        self.cuda_graph_commit_table_overwrite = (
+            self.cp_size == 1 and self.cache_cp_size == 1
+        )
+        # forward_commit uses device lengths/tables only; its attention context
+        # has no dynamic padding consumer. Wrapper restricts this to COMMIT.
+        self.cuda_graph_commit_metadata_producer = (
+            self.cp_size == 1 and self.cache_cp_size == 1
+        )
         self.page_size = int(config.attn_config.tokens_per_block)
         kernel_page = int(config.attn_config.kernel_tokens_per_block) or self.page_size
         if kernel_page != self.page_size:

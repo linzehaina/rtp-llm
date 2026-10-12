@@ -105,6 +105,7 @@ cc_library(
     name = "exec_ops_hdr",
     hdrs = [
         "ExecOps.h",
+        "SamplingSeedOffset.h",
     ],
     deps = [
         ":runtime_device_hdr",

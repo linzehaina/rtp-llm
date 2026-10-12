@@ -343,3 +343,24 @@ cc_library(
     include_prefix = "src",
     visibility = ["//visibility:public"],
 )
+
+cc_library(
+    name = "compact_spec_vocab_mask",
+    srcs = ["compact_spec_vocab_mask.cu"],
+    hdrs = ["compact_spec_vocab_mask.h"],
+    deps = [
+        "@local_config_cuda//cuda:cuda_headers",
+        "@local_config_cuda//cuda:cudart",
+    ] + torch_deps(),
+    copts = cuda_copts(),
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "commit_metadata_producer",
+    srcs = ["commit_metadata_producer.cu"],
+    hdrs = ["commit_metadata_producer.h"],
+    deps = cuda_deps + [":cuda_graph_prepare"],
+    copts = cuda_copts(),
+    visibility = ["//visibility:public"],
+)

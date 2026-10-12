@@ -1,6 +1,4 @@
-#include <chrono>
 #include <csignal>
-#include <cstring>
 #include <memory>
 #include <limits>
 #include "torch/all.h"
@@ -40,47 +38,6 @@ template<typename T>
 std::vector<T> toVec(const torch::Tensor& t) {
     auto c = t.is_cuda() ? t.cpu().contiguous() : t.contiguous();
     return std::vector<T>(c.data_ptr<T>(), c.data_ptr<T>() + c.numel());
-}
-
-void fillScoreTokenIdsWithMemcpy(torch::Tensor&                    token_ids,
-                                 const std::vector<torch::Tensor>& complete_token_ids,
-                                 const std::vector<int64_t>&       seq_lens,
-                                 int64_t                           score_len) {
-    int64_t    batch_idx  = 0;
-    auto*      dst        = token_ids.data_ptr<int32_t>();
-    const auto dst_stride = token_ids.size(1);
-    for (size_t stream_idx = 0; stream_idx < complete_token_ids.size(); ++stream_idx) {
-        auto* src     = complete_token_ids[stream_idx].data_ptr<int32_t>();
-        auto  seq_len = seq_lens[stream_idx];
-        for (int64_t i = 0; i < score_len; ++i) {
-            std::memcpy(dst + batch_idx * dst_stride, src, seq_len * sizeof(int32_t));
-            ++batch_idx;
-        }
-    }
-}
-
-void fillScoreTokenIdsWithTorchCopy(torch::Tensor&                    token_ids,
-                                    const std::vector<torch::Tensor>& complete_token_ids,
-                                    const std::vector<int64_t>&       seq_lens,
-                                    int64_t                           score_len) {
-    int64_t batch_idx = 0;
-    for (size_t stream_idx = 0; stream_idx < complete_token_ids.size(); ++stream_idx) {
-        auto seq_len = seq_lens[stream_idx];
-        token_ids.narrow(0, batch_idx, score_len)
-            .narrow(1, 0, seq_len)
-            .copy_(complete_token_ids[stream_idx].narrow(1, 0, seq_len).expand({score_len, seq_len}));
-        batch_idx += score_len;
-    }
-}
-
-template<typename Func>
-double benchmarkUs(Func&& func, int iterations) {
-    auto start = std::chrono::steady_clock::now();
-    for (int i = 0; i < iterations; ++i) {
-        func();
-    }
-    auto end = std::chrono::steady_clock::now();
-    return std::chrono::duration<double, std::micro>(end - start).count() / iterations;
 }
 
 class MtpBatchStreamProcessorTest: public DeviceTestBase {
@@ -439,7 +396,16 @@ TEST_F(MtpBatchStreamProcessorTest, testDSparkVerifyBudgetKeepsProposalWidthSeve
         processor.prepareDSparkProposeModelInput(state, proposal_input, holder);
         EXPECT_EQ(proposal_input.combo_tokens.numel(), 14);
         EXPECT_EQ(toVec<int32_t>(proposal_input.input_lengths), (std::vector<int32_t>{7, 7}));
-        EXPECT_EQ(proposal_input.lm_output_indexes.numel(), 14);
+        // Full gamma7 backbone and LM head stay independent of verify budget.
+        const int head_steps = 7;
+        EXPECT_EQ(proposal_input.lm_output_indexes.numel(), 2 * head_steps);
+        std::vector<int32_t> expected_proposal_indexes;
+        for (int row = 0; row < 2; ++row) {
+            for (int col = 0; col < head_steps; ++col) {
+                expected_proposal_indexes.push_back(row * 7 + col);
+            }
+        }
+        EXPECT_EQ(toVec<int32_t>(proposal_input.lm_output_indexes), expected_proposal_indexes);
         EXPECT_EQ(proposal_input.combo_position_ids.numel(), 14);
 
         // Match the executor's prefix view of a full B*7 proposal tensor;
@@ -901,7 +867,8 @@ TEST_F(MtpBatchStreamProcessorTest, testDSparkCompactThinkMatchesFullHistoryWith
                                            0});
                     artifact = runner.buildInline(task);
                     ASSERT_TRUE(artifact.has_active_processor);
-                    ASSERT_TRUE(artifact.spec_vocab_mask_gpu.defined());
+                    ASSERT_TRUE(artifact.spec_vocab_bitmask_gpu.defined());
+                    ASSERT_FALSE(artifact.spec_vocab_mask_gpu.defined());
                     ASSERT_TRUE(artifact.spec_cap_gpu.defined());
                     ASSERT_NE(artifact.ready_event, nullptr);
                     ASSERT_NE(artifact.consumed_event, nullptr);
@@ -925,7 +892,8 @@ TEST_F(MtpBatchStreamProcessorTest, testDSparkCompactThinkMatchesFullHistoryWith
                     EXPECT_EQ(compact.spec_mask_consumed_event, artifact.consumed_event);
                     EXPECT_EQ(compact.spec_applied_processors, artifact.applied_processors);
                     EXPECT_EQ(compact.spec_propose_step, verify);
-                    EXPECT_TRUE(torch::equal(compact.spec_vocab_mask_gpu, artifact.spec_vocab_mask_gpu));
+                    EXPECT_TRUE(torch::equal(compact.spec_vocab_bitmask_gpu, artifact.spec_vocab_bitmask_gpu));
+                    EXPECT_FALSE(compact.spec_vocab_mask_gpu.defined());
                     EXPECT_TRUE(torch::equal(compact.spec_cap_gpu, artifact.spec_cap_gpu));
                 }
                 // Same live processor snapshot, semantic lengths, row order and
@@ -1139,44 +1107,6 @@ TEST_F(MtpBatchStreamProcessorTest, testSingleRequestDSparkSyntheticRound) {
     processor.buildDSparkProposeInput(
         proposal_input, torch::tensor({2}, torch::kInt32), torch::tensor({11}, torch::kInt32), holder);
     EXPECT_EQ(toVec<int32_t>(proposal_input.combo_tokens), (std::vector<int32_t>{2, 5, 5}));
-}
-
-TEST_F(MtpBatchStreamProcessorTest, DISABLED_benchmarkScoreTokenIdsTorchCopyVsMemcpy) {
-    constexpr int64_t stream_count = 64;
-    constexpr int64_t score_len    = 4;
-    constexpr int64_t max_seq_len  = 65536;
-    constexpr int     iterations   = 20;
-
-    auto src_storage = torch::empty({stream_count, max_seq_len}, torch::kInt32);
-    src_storage.random_(0, 32000);
-
-    std::vector<torch::Tensor> complete_token_ids;
-    std::vector<int64_t>       seq_lens;
-    complete_token_ids.reserve(stream_count);
-    seq_lens.reserve(stream_count);
-    for (int64_t i = 0; i < stream_count; ++i) {
-        complete_token_ids.push_back(src_storage.narrow(0, i, 1));
-        seq_lens.push_back(max_seq_len - (i % 8) * 128);
-    }
-
-    auto pinned_i32 = torch::TensorOptions(torch::kInt32).pinned_memory(true);
-    auto dst_memcpy = torch::empty({stream_count * score_len, max_seq_len + score_len}, pinned_i32);
-    auto dst_torch  = torch::empty({stream_count * score_len, max_seq_len + score_len}, pinned_i32);
-
-    dst_memcpy.fill_(-1);
-    dst_torch.fill_(-1);
-    fillScoreTokenIdsWithMemcpy(dst_memcpy, complete_token_ids, seq_lens, score_len);
-    fillScoreTokenIdsWithTorchCopy(dst_torch, complete_token_ids, seq_lens, score_len);
-    ASSERT_TRUE(torch::equal(dst_memcpy, dst_torch));
-
-    auto memcpy_us = benchmarkUs(
-        [&]() { fillScoreTokenIdsWithMemcpy(dst_memcpy, complete_token_ids, seq_lens, score_len); }, iterations);
-    auto torch_us = benchmarkUs(
-        [&]() { fillScoreTokenIdsWithTorchCopy(dst_torch, complete_token_ids, seq_lens, score_len); }, iterations);
-
-    std::cout << "[mtp-score-token-ids-copy] streams=" << stream_count << " score_len=" << score_len
-              << " max_seq_len=" << max_seq_len << " iterations=" << iterations << " memcpy_us=" << memcpy_us
-              << " torch_copy_us=" << torch_us << " speedup=" << (memcpy_us / torch_us) << std::endl;
 }
 
 TEST_F(MtpBatchStreamProcessorTest, testGatherSpecSamplerInputReplicatesScoreTokenIds) {
@@ -2464,3 +2394,423 @@ TEST_F(MtpBatchStreamProcessorTest, updateMultiStepDraftSamplerOutput) {
 }
 
 }  // namespace rtp_llm
+
+namespace rtp_llm {
+TEST_F(MtpBatchStreamProcessorTest, testDSparkStaticBudgetKeepsFullHeadAndQueryGeometry) {
+    ModelConfig model;
+    model.max_seq_len = 128;
+    model.vocab_size = 16;
+    model.num_layers = 1;
+    SpeculativeExecutionConfig spec;
+    spec.type = SP_TYPE_DSPARK;
+    spec.gen_num_per_cycle = 7;
+    spec.sp_dspark_verify_tokens = 4;
+    spec.sp_dspark_mask_token_id = 15;
+    PDSepConfig pd;
+    ProfilingDebugLoggingConfig profiling;
+    CacheConfig cache;
+    cache.group_types = {CacheGroupType::FULL};
+    for (bool sample_anchor : {false, true}) {
+        spec.sp_dspark_sample_from_anchor = sample_anchor;
+        MtpBatchStreamProcessor processor(model, pd, profiling, cache, spec, false);
+        TensorHolder holder;
+        // Exercise larger-cache reuse after shrinking B, then grow it again.
+        for (int batch : {3, 1, 2, 4}) {
+            GptModelInputs input;
+            input.need_all_logits = true;
+            processor.buildDSparkProposeInput(input, torch::zeros({batch}, torch::kInt32),
+                                             torch::full({batch}, 80, torch::kInt32), holder);
+            const int query_width = sample_anchor ? 7 : 8;
+            const int head_steps = 7;
+            EXPECT_EQ(input.combo_tokens.numel(), batch * query_width);
+            EXPECT_EQ(toVec<int32_t>(input.input_lengths), std::vector<int32_t>(batch, query_width));
+            std::vector<int32_t> expected;
+            for (int row = 0; row < batch; ++row) {
+                for (int column = 0; column < head_steps; ++column) {
+                    expected.push_back(row * query_width + column + !sample_anchor);
+                }
+            }
+            EXPECT_EQ(toVec<int32_t>(input.lm_output_indexes), expected);
+            EXPECT_TRUE(input.need_all_logits);
+        }
+    }
+}
+
+TEST_F(MtpBatchStreamProcessorTest, testDSparkBatchOwnerRejectsChangedCohortAndEpoch) {
+    ModelConfig model;
+    model.max_seq_len = 128;
+    RuntimeConfig runtime;
+    ResourceContext resources;
+    auto a = createContextStream(model, runtime, resources, {1, 2}, 1);
+    auto b = createContextStream(model, runtime, resources, {3, 4}, 2);
+    auto owner = std::make_shared<GenerateStream::MtpBatchDeviceState>();
+    owner->stream_ids = {a->streamId(), b->streamId()};
+    owner->accept_len_gpu = torch::ones({2}, torch::kInt32);
+    owner->accept_tokens_gpu = torch::zeros({2, 5}, torch::kInt32);
+    owner->next_seq_len_gpu = torch::full({2}, 2, torch::kInt32);
+    owner->dspark_anchor_gpu = torch::zeros({2}, torch::kInt32);
+    owner->dspark_committed_end_gpu = torch::ones({2}, torch::kInt32);
+    GenerateStream::MtpAsyncDeviceState sa, sb;
+    sa.batch_owner = owner;
+    sa.batch_row = 0;
+    sb.batch_owner = owner;
+    sb.batch_row = 1;
+    owner->stream_epochs = {a->setMtpAsyncDeviceState(sa), b->setMtpAsyncDeviceState(sb)};
+    // CPU-only owners remain valid for lazy-row getter tests, but cannot be
+    // consumed by the CUDA device-state fast path.
+    EXPECT_EQ(MtpBatchStreamProcessor::dsparkBatchDeviceState({a, b}), nullptr);
+    owner->accept_len_gpu = owner->accept_len_gpu.to(torch::kCUDA);
+    owner->accept_tokens_gpu = owner->accept_tokens_gpu.to(torch::kCUDA);
+    owner->next_seq_len_gpu = owner->next_seq_len_gpu.to(torch::kCUDA);
+    owner->dspark_anchor_gpu = owner->dspark_anchor_gpu.to(torch::kCUDA);
+    owner->dspark_committed_end_gpu = owner->dspark_committed_end_gpu.to(torch::kCUDA);
+    EXPECT_EQ(MtpBatchStreamProcessor::dsparkBatchDeviceState({a, b}), owner);
+    auto valid_anchor = owner->dspark_anchor_gpu;
+    owner->dspark_anchor_gpu = valid_anchor.cpu();
+    EXPECT_EQ(MtpBatchStreamProcessor::dsparkBatchDeviceState({a, b}), nullptr);
+    owner->dspark_anchor_gpu = torch::zeros({2, 2}, valid_anchor.options()).select(1, 0);
+    EXPECT_FALSE(owner->dspark_anchor_gpu.is_contiguous());
+    EXPECT_EQ(MtpBatchStreamProcessor::dsparkBatchDeviceState({a, b}), nullptr);
+    owner->dspark_anchor_gpu = valid_anchor;
+    EXPECT_EQ(MtpBatchStreamProcessor::dsparkBatchDeviceState({b, a}), nullptr);
+    EXPECT_EQ(MtpBatchStreamProcessor::dsparkBatchDeviceState({a}), nullptr);
+    EXPECT_EQ(MtpBatchStreamProcessor::dsparkBatchDeviceState({}), nullptr);
+    const auto old_epoch = owner->stream_epochs[0];
+    a->setMtpAsyncDeviceState(sa);
+    EXPECT_EQ(MtpBatchStreamProcessor::dsparkBatchDeviceState({a, b}), nullptr);
+    EXPECT_FALSE(a->clearMtpAsyncDeviceState(old_epoch));
+    a->clearSpecDecodeDeviceState();
+    EXPECT_EQ(MtpBatchStreamProcessor::dsparkBatchDeviceState({a, b}), nullptr);
+}
+}  // namespace rtp_llm
+
+namespace rtp_llm {
+class HiddenGatherContractProcessor: public MtpBatchStreamProcessor {
+public:
+    using MtpBatchStreamProcessor::MtpBatchStreamProcessor;
+    using MtpBatchStreamProcessor::gatherHiddenStates;
+};
+TEST_F(MtpBatchStreamProcessorTest, testLegacyHiddenGetterReturnsOwnedTensorDuringGather) {
+    ModelConfig model;
+    model.max_seq_len = 128;
+    model.vocab_size = 16;
+    model.num_layers = 1;
+    RuntimeConfig runtime;
+    ResourceContext resources;
+    auto stream = createContextStream(model, runtime, resources, {1, 2}, 1);
+    SpeculativeExecutionConfig spec;
+    spec.gen_num_per_cycle = 3;
+    CacheConfig cache;
+    cache.group_types = {CacheGroupType::FULL};
+    HiddenGatherContractProcessor processor(model, PDSepConfig{}, ProfilingDebugLoggingConfig{}, cache, spec, false);
+    GenerateStream::MtpAsyncDeviceState state;
+    state.last_hidden_states_gpu = torch::tensor({1.f, 2.f, 3.f, 4.f}).view({2, 2});
+    auto expected = state.last_hidden_states_gpu.clone();
+    const auto epoch = stream->setMtpAsyncDeviceState(std::move(state));
+    auto buffer = std::make_shared<SpeculativeExecutorStreamOutput>();
+    buffer->hidden_states = torch::zeros({2, 2});  // published device state takes precedence
+    stream->setSPOutputBuffer(buffer);
+    GptModelInputs input;
+    processor.gatherHiddenStates(StreamGroups({stream}), input);
+    EXPECT_TRUE(torch::equal(input.last_hidden_states, expected));
+    EXPECT_TRUE(stream->clearMtpAsyncDeviceState(epoch));
+    // Returned model input keeps its own Tensor handle after getter temporaries
+    // and the original stream state are gone.
+    EXPECT_TRUE(torch::equal(input.last_hidden_states, expected));
+    processor.gatherHiddenStates(StreamGroups({stream}), input);
+    EXPECT_TRUE(torch::equal(input.last_hidden_states, buffer->hidden_states));
+}
+}  // namespace rtp_llm
+
+namespace rtp_llm {
+class DeferredDecodeCoreTestProcessor : public MtpBatchStreamProcessor {
+public:
+    using MtpBatchStreamProcessor::MtpBatchStreamProcessor;
+    using NormalBatchStreamProcessor::gatherModelInputWithDeferredDecodeCore;
+};
+
+TEST_F(MtpBatchStreamProcessorTest, testDeferredDecodeCorePreservesCanonicalGatherMetadata) {
+    ModelConfig model;
+    model.max_seq_len = 128;
+    model.vocab_size = 32;
+    model.num_layers = 1;
+    RuntimeConfig runtime;
+    ResourceContext resources;
+    SpeculativeExecutionConfig sp;
+    sp.type = SP_TYPE_DSPARK;
+    sp.gen_num_per_cycle = 4;
+    sp.sp_dspark_mask_token_id = 31;
+    sp.sp_dspark_sample_from_anchor = true;
+    CacheConfig cache;
+    cache.seq_size_per_block = 128;
+    cache.kernel_seq_size_per_block = 128;
+    cache.group_types = {CacheGroupType::FULL};
+    cache.layer_to_group_id = {0};
+    auto a = createContextStream(model, runtime, resources, {1, 2}, 1);
+    auto b = createContextStream(model, runtime, resources, {3, 4, 5}, 2);
+    a->setIsContextStream(false);
+    b->setIsContextStream(false);
+    // Inject a real nonempty update payload without changing production APIs.
+    auto& updates = const_cast<std::vector<BlockIdPair>&>(a->streamCacheResource().getKVBlockUpdateMapping());
+    updates.push_back({11, 12});
+    DeferredDecodeCoreTestProcessor processor(model, PDSepConfig{}, ProfilingDebugLoggingConfig{}, cache, sp, false);
+    StreamGroups groups({a, b});
+    const auto a_iter = a->iterCount();
+    TensorHolder legacy_holder, deferred_holder;
+    auto legacy = processor.gatherModelInput(groups, legacy_holder);
+    auto deferred = processor.gatherModelInputWithDeferredDecodeCore(groups, deferred_holder);
+    ASSERT_TRUE(legacy.ok());
+    ASSERT_TRUE(deferred.ok());
+    const auto& x = deferred.value();
+    EXPECT_TRUE(legacy->combo_tokens.is_cuda());
+    EXPECT_TRUE(legacy->input_lengths.is_cuda());
+    EXPECT_TRUE(legacy->sequence_lengths.is_cuda());
+    EXPECT_TRUE(x.combo_tokens.device().is_cpu());
+    EXPECT_TRUE(x.input_lengths.device().is_cpu());
+    EXPECT_TRUE(x.sequence_lengths.device().is_cpu());
+    EXPECT_FALSE(x.combo_tokens.is_pinned());
+    EXPECT_FALSE(x.input_lengths.is_pinned());
+    EXPECT_FALSE(x.sequence_lengths.is_pinned());
+    EXPECT_EQ(toVec<int32_t>(x.combo_tokens), (vector<int32_t>{2, 5}));
+    EXPECT_EQ(toVec<int32_t>(x.input_lengths), (vector<int32_t>{2, 3}));
+    EXPECT_EQ(toVec<int32_t>(x.sequence_lengths), (vector<int32_t>{1, 2}));
+    EXPECT_EQ(toVec<int32_t>(x.kv_cache_block_id), (vector<int32_t>{1, 2}));
+    EXPECT_EQ(toVec<int32_t>(x.kv_cache_kernel_block_id), (vector<int32_t>{1, 2}));
+    EXPECT_TRUE(x.kv_cache_kernel_block_id.is_cuda());
+    EXPECT_EQ(toVec<int32_t>(x.kv_cache_update_mapping), (vector<int32_t>{11, 12}));
+    EXPECT_EQ(toVec<int32_t>(x.kv_cache_layer_to_group), (vector<int32_t>{0}));
+    EXPECT_EQ(toVec<int32_t>(x.kv_cache_group_types),
+              (vector<int32_t>{static_cast<int32_t>(CacheGroupType::FULL)}));
+    EXPECT_EQ(x.trace_ids, (vector<string>{a->traceId(), b->traceId()}));
+    EXPECT_EQ(x.kv_block_stride_bytes, legacy->kv_block_stride_bytes);
+    EXPECT_EQ(x.seq_size_per_block, 128);
+    EXPECT_EQ(x.warmup, legacy->warmup);
+    EXPECT_EQ(a->iterCount(), a_iter + 2); // both gather paths retain stream.step
+    EXPECT_EQ(toVec<int32_t>(x.combo_tokens), toVec<int32_t>(legacy->combo_tokens));
+    EXPECT_EQ(toVec<int32_t>(x.kv_cache_update_mapping), toVec<int32_t>(legacy->kv_cache_update_mapping));
+    // Fresh buffers remain immutable across a later gather, no pooled alias.
+    auto second = processor.gatherModelInputWithDeferredDecodeCore(groups, deferred_holder);
+    ASSERT_TRUE(second.ok());
+    EXPECT_NE(second->combo_tokens.data_ptr(), x.combo_tokens.data_ptr());
+    second->combo_tokens.fill_(17);
+    EXPECT_EQ(toVec<int32_t>(x.combo_tokens), (vector<int32_t>{2, 5}));
+}
+
+TEST_F(MtpBatchStreamProcessorTest, testDSparkDeferredCoreOwnerLossStillPreparesCudaInputs) {
+    ModelConfig model;
+    model.max_seq_len = 128;
+    model.vocab_size = 32;
+    model.num_layers = 1;
+    RuntimeConfig runtime;
+    ResourceContext resources;
+    SpeculativeExecutionConfig sp;
+    sp.type = SP_TYPE_DSPARK;
+    sp.gen_num_per_cycle = 4;
+    sp.sp_dspark_mask_token_id = 31;
+    sp.sp_dspark_sample_from_anchor = true;
+    CacheConfig cache;
+    cache.seq_size_per_block = cache.kernel_seq_size_per_block = 128;
+    cache.group_types = {CacheGroupType::FULL};
+    auto a = createContextStream(model, runtime, resources, {1, 2}, 1);
+    auto b = createContextStream(model, runtime, resources, {3, 4, 5}, 2);
+    a->setIsContextStream(false);
+    b->setIsContextStream(false);
+    DeferredDecodeCoreTestProcessor processor(model, PDSepConfig{}, ProfilingDebugLoggingConfig{}, cache, sp, false);
+    const auto opts = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+    TensorHolder holder;
+    auto first = processor.gatherDecodeModelInput(StreamGroups({a, b}), holder);
+    ASSERT_TRUE(first.ok());
+    EXPECT_TRUE(first->combo_tokens.is_cuda()); // no owner: first-cohort legacy
+    EXPECT_TRUE(first->sequence_lengths.is_cuda());
+    auto owner = std::make_shared<GenerateStream::MtpBatchDeviceState>();
+    owner->stream_ids = {a->streamId(), b->streamId()};
+    owner->accept_len_gpu = torch::ones({2}, opts);
+    owner->accept_tokens_gpu = torch::zeros({2, 5}, opts);
+    owner->next_seq_len_gpu = torch::tensor({11, 22}, opts);
+    owner->dspark_anchor_gpu = torch::tensor({7, 9}, opts);
+    owner->dspark_committed_end_gpu = torch::tensor({10, 21}, opts);
+    GenerateStream::MtpAsyncDeviceState sa, sb;
+    sa.batch_owner = sb.batch_owner = owner;
+    sa.batch_row = 0;
+    sb.batch_row = 1;
+    owner->stream_epochs = {a->setMtpAsyncDeviceState(sa), b->setMtpAsyncDeviceState(sb)};
+    auto input = processor.gatherDecodeModelInput(StreamGroups({a, b}), holder);
+    ASSERT_TRUE(input.ok());
+    // DSpARK preparation already publishes CUDA core unconditionally. A valid
+    // cohort may defer the intermediate gather with the global flag off or on.
+    EXPECT_TRUE(input->combo_tokens.device().is_cpu());
+    EXPECT_TRUE(input->input_lengths.device().is_cpu());
+    EXPECT_TRUE(input->sequence_lengths.device().is_cpu());
+    auto reordered = processor.gatherDecodeModelInput(StreamGroups({b, a}), holder);
+    ASSERT_TRUE(reordered.ok());
+    EXPECT_TRUE(reordered->combo_tokens.is_cuda());
+    a->setIsFakeStream(true);
+    b->setIsFakeStream(true);
+    auto fake = processor.gatherDecodeModelInput(StreamGroups({a, b}), holder);
+    ASSERT_TRUE(fake.ok());
+    EXPECT_TRUE(fake->combo_tokens.is_cuda());
+    a->setIsFakeStream(false);
+    b->setIsFakeStream(false);
+    ASSERT_TRUE(a->clearMtpAsyncDeviceState(owner->stream_epochs[0]));
+    auto round = processor.buildDSparkRoundState(StreamGroups({a, b}), input.value(), holder);
+    EXPECT_EQ(toVec<int32_t>(round.anchors), (vector<int32_t>{2, 9}));
+    EXPECT_EQ(toVec<int32_t>(round.committed_ends), (vector<int32_t>{1, 21}));
+    auto proposal = input.value();
+    processor.prepareDSparkProposeModelInput(round, proposal, holder);
+    EXPECT_TRUE(proposal.combo_tokens.is_cuda());
+    EXPECT_TRUE(proposal.input_lengths.is_cuda());
+    EXPECT_TRUE(proposal.sequence_lengths.is_cuda());
+    EXPECT_TRUE(proposal.prefix_lengths.is_cuda());
+    EXPECT_EQ(toVec<int32_t>(proposal.prefix_lengths), (vector<int32_t>{1, 21}));
+    EXPECT_EQ(toVec<int32_t>(proposal.input_lengths), (vector<int32_t>{4, 4}));
+    const auto proposals = torch::tensor({{6, 7, 8, 9}, {10, 11, 12, 13}}, opts);
+    auto target = input.value();
+    processor.prepareDSparkTargetVerifyModelInput(round, target, proposals, holder);
+    EXPECT_TRUE(target.combo_tokens.is_cuda());
+    EXPECT_TRUE(target.input_lengths.is_cuda());
+    EXPECT_TRUE(target.sequence_lengths.is_cuda());
+    EXPECT_EQ(toVec<int32_t>(target.combo_tokens), (vector<int32_t>{2, 6, 7, 8, 9, 9, 10, 11, 12, 13}));
+    EXPECT_EQ(toVec<int32_t>(target.input_lengths), (vector<int32_t>{5, 5}));
+    auto compact = input.value();
+    processor.prepareCompactDSparkTargetVerifyModelInput(
+        round, compact, proposals, torch::tensor({1, 3}, opts), torch::tensor({0, 5, 6, 7}, opts), holder);
+    EXPECT_TRUE(compact.combo_tokens.is_cuda());
+    EXPECT_TRUE(compact.input_lengths.is_cuda());
+    EXPECT_TRUE(compact.sequence_lengths.is_cuda());
+    EXPECT_EQ(toVec<int32_t>(compact.combo_tokens), (vector<int32_t>{2, 9, 10, 11}));
+    EXPECT_EQ(toVec<int32_t>(compact.input_lengths), (vector<int32_t>{1, 3}));
+    // Clearing/reordering the cohort at entry must not activate deferred gather.
+    auto fallback = processor.gatherDecodeModelInput(StreamGroups({b, a}), holder);
+    ASSERT_TRUE(fallback.ok());
+    EXPECT_TRUE(fallback->combo_tokens.is_cuda());
+    EXPECT_TRUE(fallback->sequence_lengths.is_cuda());
+}
+
+TEST_F(MtpBatchStreamProcessorTest, testDeferredDecodeCoreRetainsTokenValidation) {
+    ModelConfig model;
+    model.max_seq_len = 128;
+    model.vocab_size = 4;
+    model.num_layers = 1;
+    CacheConfig cache;
+    cache.seq_size_per_block = cache.kernel_seq_size_per_block = 128;
+    cache.group_types = {CacheGroupType::FULL};
+    SpeculativeExecutionConfig sp;
+    sp.type = SP_TYPE_DSPARK;
+    sp.gen_num_per_cycle = 4;
+    sp.sp_dspark_mask_token_id = 3;
+    auto stream = createContextStream(model, RuntimeConfig{}, ResourceContext{}, {1, 9}, 1);
+    stream->setIsContextStream(false);
+    DeferredDecodeCoreTestProcessor processor(model, PDSepConfig{}, ProfilingDebugLoggingConfig{}, cache, sp, false);
+    TensorHolder holder;
+    auto input = processor.gatherModelInputWithDeferredDecodeCore(StreamGroups({stream}), holder);
+    EXPECT_FALSE(input.ok());
+    EXPECT_EQ(input.status().code(), absl::StatusCode::kInvalidArgument);
+}
+
+TEST_F(MtpBatchStreamProcessorTest, testDeferredDecodeCorePreservesMropeAndPreShardedPageMetadata) {
+    ModelConfig model;
+    model.max_seq_len = 1024;
+    model.vocab_size = 32;
+    model.num_layers = 2;
+    model.has_positional_encoding = true;
+    model.mm_model_config.mm_position_ids_style = static_cast<int64_t>(PositionIdsStyle::MROPE);
+    model.attn_config.rope_config.index_factor = 3;
+    auto cache = test::makeSimpleMhaCacheConfig(2, 64, 128, TYPE_BF16, 4, 128);
+    cache.kernel_seq_size_per_block = 64;
+    cache.group_types = {CacheGroupType::FULL, CacheGroupType::FULL};
+    cache.layer_to_group_id = {0, 1};
+    // groupNums() derives from cache_specs, not group_types. Split the fully
+    // initialized two-layer fixture into two one-layer FULL cache groups.
+    auto group_spec = std::make_shared<MHAKVCacheSpec>();
+    group_spec->type = KVCacheSpecType::MultiHeadAttention;
+    group_spec->dtype = TYPE_BF16;
+    group_spec->seq_size_per_block = 128;
+    group_spec->layer_num = 1;
+    group_spec->local_head_num_kv = 4;
+    group_spec->size_per_head = 128;
+    cache.cache_specs = {group_spec, group_spec};
+    cache.layer_ids = {{0}, {1}};
+    cache.global_layer_ids = cache.layer_ids;
+    ASSERT_EQ(cache.groupNums(), 2);
+    SpeculativeExecutionConfig sp;
+    sp.type = SP_TYPE_DSPARK;
+    sp.gen_num_per_cycle = 4;
+    sp.sp_dspark_mask_token_id = 31;
+    sp.sp_dspark_sample_from_anchor = true;
+    auto a = createContextStream(model, RuntimeConfig{}, ResourceContext{}, vector<int>(512, 2), 1);
+    auto b = createContextStream(model, RuntimeConfig{}, ResourceContext{}, vector<int>(256, 5), 2);
+    // Generate the real nondefault three-axis context positions before Decode,
+    // exactly as context gather does. Without this, generateNextPositionId is
+    // a no-op and a mock position test could compare uninitialized memory.
+    a->generateContextPositionIds();
+    b->generateContextPositionIds();
+    a->setIsContextStream(false);
+    b->setIsContextStream(false);
+    // Supply already rank-local CP2 physical tables, with capacity derived by
+    // the real mapper. This tests preservation at the gather boundary only;
+    // it does not simulate distributed CP allocation/attention/collectives.
+    CPSlotMapper mapper(/*cp_rank=*/1, /*cp_size=*/2, /*block_size=*/128);
+    ASSERT_EQ(mapper.localBlockCount(a->seqLength()), 2);
+    ASSERT_EQ(mapper.localBlockCount(b->seqLength()), 1);
+    BatchKVCacheResource a_pages, b_pages;
+    for (auto* pages : {&a_pages, &b_pages}) {
+        pages->resetBatchSize(1);
+        pages->initGroups(2, 2, {0, 1}, cache.kernelBlocksPerKvBlock(), cache.group_types);
+    }
+    a_pages.setBatchBlocks(0, 0, {11, 19});
+    a_pages.setBatchBlocks(0, 1, {31, 37});
+    b_pages.setBatchBlocks(0, 0, {23});
+    b_pages.setBatchBlocks(0, 1, {41});
+    a->setKVCache(a_pages);
+    b->setKVCache(b_pages);
+    DeferredDecodeCoreTestProcessor processor(model, PDSepConfig{}, ProfilingDebugLoggingConfig{}, cache, sp, false);
+    StreamGroups groups({a, b});
+    TensorHolder legacy_holder, deferred_holder;
+    auto legacy = processor.gatherModelInput(groups, legacy_holder);
+    auto deferred = processor.gatherModelInputWithDeferredDecodeCore(groups, deferred_holder);
+    ASSERT_TRUE(legacy.ok());
+    ASSERT_TRUE(deferred.ok());
+    const auto same_i32_bytes = [](const torch::Tensor& x, const torch::Tensor& y) {
+        ASSERT_EQ(x.scalar_type(), torch::kInt32);
+        ASSERT_EQ(y.scalar_type(), torch::kInt32);
+        ASSERT_EQ(x.sizes().vec(), y.sizes().vec());
+        // Exact int32 equality plus identical shape is exact byte equality.
+        EXPECT_EQ(toVec<int32_t>(x), toVec<int32_t>(y));
+    };
+    same_i32_bytes(legacy->combo_tokens, deferred->combo_tokens);
+    same_i32_bytes(legacy->input_lengths, deferred->input_lengths);
+    same_i32_bytes(legacy->sequence_lengths, deferred->sequence_lengths);
+    same_i32_bytes(legacy->combo_position_ids, deferred->combo_position_ids);
+    same_i32_bytes(legacy->kv_cache_block_id, deferred->kv_cache_block_id);
+    same_i32_bytes(legacy->kv_cache_kernel_block_id, deferred->kv_cache_kernel_block_id);
+    same_i32_bytes(legacy->kv_cache_layer_to_group, deferred->kv_cache_layer_to_group);
+    same_i32_bytes(legacy->kv_cache_group_types, deferred->kv_cache_group_types);
+    EXPECT_EQ(toVec<int32_t>(deferred->combo_position_ids), (vector<int32_t>{511, 511, 511, 255, 255, 255}));
+    EXPECT_EQ(deferred->combo_position_ids.numel(), 2 * 3);
+    EXPECT_EQ(toVec<int32_t>(deferred->kv_cache_block_id), (vector<int32_t>{11, 19, 23, 0, 31, 37, 41, 0}));
+    EXPECT_EQ(toVec<int32_t>(deferred->kv_cache_kernel_block_id),
+              (vector<int32_t>{22, 23, 38, 39, 46, 47, 0, 0, 62, 63, 74, 75, 82, 83, 0, 0}));
+    EXPECT_EQ(deferred->kv_cache_block_id.size(0), 2);
+    EXPECT_EQ(deferred->kv_cache_kernel_block_id.size(2), 4);
+    EXPECT_EQ(deferred->seq_size_per_block, legacy->seq_size_per_block);
+    EXPECT_EQ(deferred->trace_ids, legacy->trace_ids);
+    // Compare real DSpARK position-base collection and expansion from both
+    // gather variants, independent of the globally cached device-input flag.
+    auto legacy_round = processor.buildDSparkRoundState(groups, legacy.value(), legacy_holder);
+    auto deferred_round = processor.buildDSparkRoundState(groups, deferred.value(), deferred_holder);
+    same_i32_bytes(legacy_round.position_bases, deferred_round.position_bases);
+    auto legacy_proposal = legacy.value();
+    auto deferred_proposal = deferred.value();
+    processor.prepareDSparkProposeModelInput(legacy_round, legacy_proposal, legacy_holder);
+    processor.prepareDSparkProposeModelInput(deferred_round, deferred_proposal, deferred_holder);
+    same_i32_bytes(legacy_proposal.combo_position_ids, deferred_proposal.combo_position_ids);
+    EXPECT_EQ(deferred_proposal.combo_position_ids.numel(), 2 * 4 * 3);
+    std::vector<int32_t> expected;
+    for (int base : {511, 255}) {
+        for (int step = 0; step < 4; ++step) {
+            expected.insert(expected.end(), 3, base + step);
+        }
+    }
+    EXPECT_EQ(toVec<int32_t>(deferred_proposal.combo_position_ids), expected);
+}
+} // namespace rtp_llm

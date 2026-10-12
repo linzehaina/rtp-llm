@@ -127,6 +127,7 @@ public:
     virtual ~ModelBase()                                          = default;
     virtual GptModelOutputs forward(const GptModelInputs& inputs) = 0;
     virtual void            releaseBuffers() {}
+    // Shutdown only, after graph producers stop and device drain succeeds.
     // Exceptional-only barrier for model-owned KV readers outside the executor's
     // GPU streams. Call after prepare/forward producers stop, while KV is leased.
     virtual void drainPendingCacheStore() {}

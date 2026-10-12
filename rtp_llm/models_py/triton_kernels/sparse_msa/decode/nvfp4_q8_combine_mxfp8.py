@@ -205,18 +205,25 @@ def _store_mxfp8(rounded, fp8_ptr, packed_ptr, batch, kv_head, ALIGNED_M: tl.con
 @triton.jit
 def _quantize_bf16_attention_mxfp8(
     bf16_ptr, fp8_ptr, packed_ptr, ALIGNED_M: tl.constexpr,
+    LENS=None, MASK=None, LS: tl.constexpr = 1, MS: tl.constexpr = 0,
+    HAS_LENS: tl.constexpr = False, HAS_MASK: tl.constexpr = False,
 ):
     """Quantize contiguous [rows,64,128] BF16 into caller-owned MXFP8 buffers.
 
     Launch grid is (rows,4). FP8 output is contiguous [rows,64,128]; packed
     int32 scales have shape [rows,64], strides (1,ALIGNED_M), ALIGNED_M>=rows.
-    Each KV head owns sixteen query heads. There are no allocations or masks;
-    callers must clear padded query rows before launching this conversion.
+    Each KV head owns sixteen query heads. Optional row validity replaces
+    padded BF16 values before quantization, including invalid NaN/Inf values.
     """
     batch = tl.program_id(0)
     kv_head = tl.program_id(1)
     group = tl.arange(0, 16)
     dim = tl.arange(0, 128)
     feature = (kv_head * 16 + group)[:, None] * 128 + dim[None, :]
-    rounded = tl.load(bf16_ptr + batch * 8192 + feature)
+    active = True
+    if HAS_LENS:
+        active = tl.load(LENS + batch * LS) > 0
+    if HAS_MASK:
+        active = active & tl.load(MASK + batch * MS)
+    rounded = tl.load(bf16_ptr + batch * 8192 + feature, mask=active, other=0)
     _store_mxfp8(rounded, fp8_ptr, packed_ptr, batch, kv_head, ALIGNED_M)

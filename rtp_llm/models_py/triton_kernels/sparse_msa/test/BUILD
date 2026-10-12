@@ -1,4 +1,16 @@
 py_test(
+    name = "test_minimax_decode_topk_reg16",
+    srcs = ["test_minimax_decode_topk_reg16.py"],
+    deps = [
+        "//rtp_llm/models_py/triton_kernels:sparse_msa",
+        "//rtp_llm/models_py/standalone:py_standalone_testlib",
+    ],
+    env = {"GPU_COUNT": "1"},
+    tags = ["SM100_X86"],
+    exec_properties = {"gpu": "SM100_X86", "gpu_count": "1"},
+)
+
+py_test(
     name = "test_cake_attention",
     srcs = ["test_cake_attention.py"],
     deps = [
@@ -173,4 +185,15 @@ py_test(
     env = {"GPU_COUNT": "1"},
     tags = ["SM100_X86"],
     exec_properties = {"gpu": "SM100_X86", "gpu_count": "1"},
+)
+
+py_test(
+    name = "test_native_hybrid_decode_dispatch",
+    srcs = ["test_native_hybrid_decode_dispatch.py"],
+    deps = [
+        "//rtp_llm/models_py/triton_kernels:sparse_msa",
+        "//rtp_llm:torch",
+        "//rtp_llm:triton",
+    ],
+    env = {"CUDA_VISIBLE_DEVICES": ""},
 )

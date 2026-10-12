@@ -18,6 +18,22 @@ struct CudaGraphPrepareFillParams {
     CudaGraphPrepareFillRegion regions[kMaxCudaGraphPrepareFillRegions];
 };
 
+// Full overwrite of captured int32 tables: live rectangle from this round,
+// zero everywhere else. Descriptors are rebuilt for every preparation.
+struct CudaGraphTableOverwriteTask {
+    const int32_t* src = nullptr;
+    int32_t* dst = nullptr;
+    int64_t src_rows = 0, src_cols = 0, src_stride = 0;
+    int64_t dst_rows = 0, dst_cols = 0;
+};
+
+struct CudaGraphTableOverwriteParams {
+    int32_t count = 0;
+    CudaGraphTableOverwriteTask tasks[kMaxCudaGraphPrepareFillRegions];
+};
+
+void invokeCudaGraphTableOverwrite(CudaGraphTableOverwriteParams params, cudaStream_t stream);
+
 void invokeCudaGraphPrepareFill(CudaGraphPrepareFillParams params, cudaStream_t stream);
 
 void invokePrepareFlashInferDecodeParams(const int32_t* sequence_lengths_plus_1,

@@ -20,7 +20,8 @@ SamplerOutput Sampler::forward(const SamplerInputs& inputs) {
         RTP_LLM_CHECK_WITH_INFO(inputs.phase == LogitsProcessorPhase::MTP_VERIFY && inputs.compact_token_ids
                                     && !inputs.logits_processor_states_ptr && !inputs.cum_log_probs.defined()
                                     && inputs.all_probs.defined() && !inputs.return_original_all_probs
-                                    && !inputs.spec_vocab_mask_gpu.defined() && !inputs.spec_cap_gpu.defined()
+                                    && !inputs.spec_vocab_mask_gpu.defined() && !inputs.spec_vocab_bitmask_gpu.defined()
+                                    && !inputs.spec_cap_gpu.defined()
                                     && inputs.spec_applied_processors.empty(),
                                 "verify sampling subset requires history-free unconstrained probability output");
     }
@@ -41,7 +42,8 @@ SamplerOutput Sampler::forward(const SamplerInputs& inputs) {
                 && inputs.token_ids.size(1) == 1 && inputs.batch_size == inputs.batch_size_out
                 && (inputs.logits_processor_states_ptr ?
                         !inputs.logits_processor_states_ptr->requiresTokenHistory() :
-                        (!inputs.spec_vocab_mask_gpu.defined() && !inputs.spec_cap_gpu.defined()
+                        (!inputs.spec_vocab_mask_gpu.defined() && !inputs.spec_vocab_bitmask_gpu.defined()
+                         && !inputs.spec_cap_gpu.defined()
                          && inputs.spec_applied_processors.empty()))
                 && neutral(inputs.num_beams_in, int64_t{1}) && neutral(inputs.num_beams_out, int64_t{1})
                 && neutral(inputs.repetition_penalty, 1.0f) && neutral(inputs.presence_penalty, 0.0f)

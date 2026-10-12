@@ -45,6 +45,11 @@ absl::StatusOr<GptModelInputs> NormalBatchStreamProcessor::gatherModelInput(cons
     return model_input_gatherer_->gather(stream_groups, host_holder);
 }
 
+absl::StatusOr<GptModelInputs> NormalBatchStreamProcessor::gatherModelInputWithDeferredDecodeCore(
+    const StreamGroups& stream_groups, TensorHolder& host_holder) const {
+    return model_input_gatherer_->gather(stream_groups, host_holder, /*defer_decode_core_publication=*/true);
+}
+
 absl::StatusOr<SamplerInputs> NormalBatchStreamProcessor::gatherSamplerInput(
     const StreamGroups& stream_groups, const GptModelInputs& model_inputs, const GptModelOutputs& model_output) const {
     return sampler_input_gatherer_->gather(stream_groups, model_inputs, model_output);

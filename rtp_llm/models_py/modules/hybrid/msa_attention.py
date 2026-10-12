@@ -69,6 +69,10 @@ import torch.nn.functional as F
 
 from rtp_llm.device.device_type import DeviceType, get_device_type
 from rtp_llm.models_py.distributed.collective_torch import Group, all_gather, all_reduce
+from rtp_llm.models_py.modules.attention_output import (
+    DeferredMaskedAttentionOutput,
+    mask_attention_output,
+)
 from rtp_llm.models_py.modules.hybrid.cp_same_layer_workspace import PrefixGather, get_workspace
 from rtp_llm.models_py.modules.factory import LinearFactory
 from rtp_llm.models_py.modules.factory.attention.cuda_cp_impl.prefill_mha.cp_utils import (
@@ -90,6 +94,9 @@ from rtp_llm.models_py.triton_kernels.common.nvfp4_kv_cache import (
 )
 from rtp_llm.models_py.triton_kernels.common.nvfp4_kv_cache import (
     quantize_cp_main_index_rows_to_planes as nvfp4_quantize_cp_main_index_rows_to_planes,
+)
+from rtp_llm.models_py.triton_kernels.common.nvfp4_kv_cache import (
+    quantize_decode_main_index_rows as nvfp4_quantize_decode_main_index_rows,
 )
 from rtp_llm.models_py.triton_kernels.common.nvfp4_kv_cache import (
     quantize_main_index_rows as nvfp4_quantize_main_index_rows,
@@ -2614,6 +2621,7 @@ class MSAAttention(nn.Module):
         *,
         contiguous_outputs=None,
         query_fp8_outputs=None,
+        index_query_fp8_output=None,
         prefill_outputs=None,
     ):
         """M3.1 raw-weight producer; callers must skip legacy norm and RoPE."""
@@ -2640,9 +2648,27 @@ class MSAAttention(nn.Module):
             eps=self.layernorm_eps,
             contiguous_outputs=contiguous_outputs,
             query_fp8_outputs=query_fp8_outputs,
+            index_query_fp8_output=index_query_fp8_output,
             prefill_outputs=prefill_outputs,
         )
         return True
+
+    def _decode_index_query_fp8_output(self, qkv, idx_q, block_table):
+        if (
+            not self.nvfp4_kv_cache
+            or getattr(self, "_m31_raw_attention_norms", None) is None
+            or (self.head_num, self.kv_head_num, self.num_idx_heads) != (64, 4, 4)
+            or self.head_dim != 128 or self.idx_head_dim != 128
+            or qkv.dtype != torch.bfloat16
+            or int(block_table.shape[-1]) <= 4
+            or not qkv.is_cuda
+            or torch.cuda.get_device_capability(qkv.device) != (10, 3)
+        ):
+            return None
+        from rtp_llm.models_py.triton_kernels.sparse_msa.decode.q8kv4_decode import (
+            decode_index_query_fp8_buffer,
+        )
+        return decode_index_query_fp8_buffer(idx_q)
 
     def _legacy_index_norm(self, rows, weight, eps):
         if getattr(self, "_m31_raw_attention_norms", None) is not None:
@@ -3391,6 +3417,14 @@ class MSAAttention(nn.Module):
                 self.physical_page_size,
                 self.head_dim,
             )
+            if self.page_size == layout.page_size:
+                # Compute each row's slot in the persistent writer rather than
+                # materializing a temporary slot tensor at every Decode layer.
+                nvfp4_quantize_decode_main_index_rows(
+                    k.contiguous(), v, idx_k.contiguous(),
+                    seq_lens, phys_block_table, layout, mma_scale_layout=True,
+                )
+                return ()
             physical_slots = build_decode_physical_slots(
                 seq_lens, phys_block_table, page_size=self.page_size
             )
@@ -5306,7 +5340,14 @@ class MSAAttention(nn.Module):
             )
         else:
             qkv, idx_q, idx_k = self._project_qkv_idx(hidden_states, x_fp8, x_scale)
-            m31_fused = self._fuse_m31_projected_norm_rope(qkv, idx_q, idx_k, positions)
+            index_query_fp8_output = self._decode_index_query_fp8_output(
+                qkv, idx_q, phys_block_table
+            )
+            m31_fused = self._fuse_m31_projected_norm_rope(qkv, idx_q, idx_k, positions,
+                index_query_fp8_output=index_query_fp8_output,
+            )
+            if not m31_fused:
+                index_query_fp8_output = None
             if self.qk_fuse_norm is not None and not m31_fused:
                 qkv = self.qk_fuse_norm(qkv)
             q, k, v = torch.split(
@@ -5376,6 +5417,7 @@ class MSAAttention(nn.Module):
                     score_type=self.score_type,
                     mma_scale_layout=True,
                     fuse_bf16_query_rounding=fuse_bf16_query_rounding,
+                    index_query_fp8_output=index_query_fp8_output,
                     bf16_main_query=True,
                     max_seq_len=self._cuda_graph_max_seq_len,
                 )
@@ -5423,7 +5465,7 @@ class MSAAttention(nn.Module):
             type(self.o_proj) is CudaMxfp8Linear
             and self.o_proj.K == 8192
             and q.is_cuda
-            and 0 < q.shape[0] <= 100
+            and 0 < q.shape[0] <= 160
             and tuple(q.shape[1:]) == (64, 128)
             and layout.num_heads == 4
             and layout.head_dim == 128
@@ -5453,7 +5495,8 @@ class MSAAttention(nn.Module):
         x_scale: Optional[torch.Tensor] = None,
         use_fused_addressing: bool = False,
         use_paged_capacity_bound: bool = False,
-    ) -> torch.Tensor:
+        defer_output_mask: bool = False,
+    ) -> torch.Tensor | DeferredMaskedAttentionOutput:
         from rtp_llm.models_py.triton_kernels.sparse_msa.minimax_sparse import (
             minimax_paged_sparse_decode,
         )
@@ -5494,7 +5537,7 @@ class MSAAttention(nn.Module):
             and hidden_states.dtype == torch.bfloat16
             and (self.head_num, self.kv_head_num, self.num_idx_heads) == (64, 4, 4)
             and self.head_dim == self.idx_head_dim == 128
-            and 1 < total_tokens <= 128
+            and 1 < total_tokens <= 160
         ):
             # Replace the four existing contiguous copies, without introducing
             # history workspace or per-layer persistent storage. M1 previously
@@ -5534,9 +5577,15 @@ class MSAAttention(nn.Module):
             )
         else:
             qkv, idx_q, idx_k = self._project_qkv_idx(hidden_states, x_fp8, x_scale)
-            m31_fused = self._fuse_m31_projected_norm_rope(
-                qkv, idx_q, idx_k, positions, contiguous_outputs=norm_rope_outputs
+            index_query_fp8_output = self._decode_index_query_fp8_output(
+                qkv, idx_q, score_block_table
             )
+            m31_fused = self._fuse_m31_projected_norm_rope(
+                qkv, idx_q, idx_k, positions, contiguous_outputs=norm_rope_outputs,
+                index_query_fp8_output=index_query_fp8_output
+            )
+            if not m31_fused:
+                index_query_fp8_output = None
             if self.qk_fuse_norm is not None and not m31_fused:
                 qkv = self.qk_fuse_norm(qkv)
             q, k, v = torch.split(
@@ -5613,6 +5662,7 @@ class MSAAttention(nn.Module):
                     score_type=self.score_type,
                     mma_scale_layout=True,
                     fuse_bf16_query_rounding=fuse_bf16_query_rounding,
+                    index_query_fp8_output=index_query_fp8_output,
                     bf16_main_query=True,
                     # Addressing expands one shared page table per request
                     # into contiguous query rows with individual causal lengths.
@@ -5627,9 +5677,13 @@ class MSAAttention(nn.Module):
                     max_seq_len=self._cuda_graph_max_seq_len,
                 )
                 output = self._project_q8kv4_output(q8kv4, input_shape)
-                output = torch.where(
-                    valid_token_mask[:, None], output, torch.zeros_like(output)
+                output = mask_attention_output(
+                    output,
+                    valid_token_mask,
+                    defer_mask=defer_output_mask and self.tp_size == 1,
                 )
+                if isinstance(output, DeferredMaskedAttentionOutput):
+                    return output
                 if self.tp_size > 1:
                     output = all_reduce(output, group=Group.TP)
                 return output
@@ -5738,7 +5792,8 @@ class MSAAttention(nn.Module):
         kv_cache: Optional[LayerKVCache],
         x_fp8: Optional[torch.Tensor] = None,
         x_scale: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        defer_output_mask: bool = False,
+    ) -> torch.Tensor | DeferredMaskedAttentionOutput:
         assert kv_cache is not None, "MSAAttention requires a KV cache"
         assert (
             attn_inputs.kv_cache_kernel_block_id_device is not None
@@ -5751,6 +5806,7 @@ class MSAAttention(nn.Module):
                 kv_cache,
                 x_fp8=x_fp8,
                 x_scale=x_scale,
+                defer_output_mask=defer_output_mask,
             )
 
         if not attn_inputs.is_prefill:

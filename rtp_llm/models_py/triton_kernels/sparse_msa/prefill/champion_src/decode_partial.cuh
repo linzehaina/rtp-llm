@@ -57,7 +57,7 @@ __global__ __launch_bounds__(256,2) void grouped_cutlass_decode_partial(Params p
             int block=s.blocks[0];
             bool valid=s.physical[0]>=0;
             float inv,lp;
-            page_softmax<true>(t,addr,block,length-1,length,valid,p.alpha,inv,lp,nullptr,&s.p_half,s.p);
+            page_softmax<true>(t,addr,block,length-1,length,valid,p.alpha,inv,lp,&s.p_half,s.p);
             wg_sync<1>();if(local==0) cutlass::arch::ClusterBarrier::arrive(&s.p_ready);
             cutlass::arch::ClusterBarrier::wait(&s.pv_ready,page%2);after_sync();
             #pragma unroll 1

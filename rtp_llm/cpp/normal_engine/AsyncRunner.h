@@ -23,6 +23,8 @@ public:
     // runs. Its external CPU claims still need exactly-once cleanup.
     void launch(std::function<void()> fn, std::function<void(std::exception_ptr)> on_unstarted_failure = {});
     void sync(const torch::Stream& wait_stream);
+    // Wait for current-task host publication/errors, then order wait_stream
+    // behind its event. Same barrier as sync(), without a GPU completion wait.
     void streamWait(const torch::Stream& wait_stream);
     // Exceptional teardown only: wait for the CPU task and its actual GPU stream,
     // even when the task threw before recording event_. Return the task error

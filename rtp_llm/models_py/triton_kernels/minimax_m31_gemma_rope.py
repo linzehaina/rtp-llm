@@ -39,6 +39,7 @@ def _gemma_norm_rope(
     Q8=None,
     IQ8=None,
     WRITE_Q8: tl.constexpr = False,
+    WRITE_MAIN_Q8: tl.constexpr = True,
     PREFILL_Q=None,
     PREFILL_IQ=None,
     PREFILL_KV=None,
@@ -125,10 +126,12 @@ def _gemma_norm_rope(
         if WRITE_Q8:
             # Match the existing BF16 store followed by scale-one E4M3 cast.
             # Casting FP32 directly would skip a rounding boundary.
-            rounded = out.to(tl.bfloat16).to(tl.float8e4nv)
             if head < HQ:
-                tl.store(Q8 + row * (HQ * 128) + head * 128 + d, rounded, mask=valid)
+                if WRITE_MAIN_Q8:
+                    rounded = out.to(tl.bfloat16).to(tl.float8e4nv)
+                    tl.store(Q8 + row * (HQ * 128) + head * 128 + d, rounded, mask=valid)
             elif head >= HQ + HK and head < HQ + HK + HI:
+                rounded = out.to(tl.bfloat16).to(tl.float8e4nv)
                 tl.store(
                     IQ8 + row * (HI * 128) + (head - HQ - HK) * 128 + d,
                     rounded,
@@ -160,6 +163,7 @@ def minimax_m31_gemma_norm_rope_(
     eps=1e-6,
     contiguous_outputs=None,
     query_fp8_outputs=None,
+    index_query_fp8_output=None,
     prefill_outputs=None,
 ):
     """Normalize/rotate projected BF16 rows; leave V untouched.
@@ -173,6 +177,8 @@ def minimax_m31_gemma_norm_rope_(
     before capture and rewrites projections before every replay.
     Optional independent E4M3 Q/index-Q outputs fuse the existing scale-one
     cast after BF16 rounding; K/index-K/V and in-place projections are unchanged.
+    ``index_query_fp8_output`` writes only index Q for BF16-Q decode readers
+    and may accompany independent contiguous BF16 outputs.
     ``prefill_outputs=(Q_bf16, index_Q_e4m3, packed_KV_bf16)`` instead
     writes independent final Prefill producers without changing any projection
     input. Packed rows are [K_rope | V | index_K_rope]. This mode is exclusive
@@ -180,6 +186,7 @@ def minimax_m31_gemma_norm_rope_(
     """
     if prefill_outputs is not None and (
         contiguous_outputs is not None or query_fp8_outputs is not None
+        or index_query_fp8_output is not None
     ):
         raise ValueError("prefill producer outputs cannot be combined with legacy outputs")
     heads = (num_q_heads, num_kv_heads, num_index_heads)
@@ -215,6 +222,22 @@ def minimax_m31_gemma_norm_rope_(
     tensors = (qkv, index_q, index_k, *raw_weights, positions, cos_sin_cache)
     if not qkv.is_cuda or any(x.device != qkv.device for x in tensors):
         raise ValueError("all tensors must share a CUDA device")
+    if index_query_fp8_output is not None:
+        if query_fp8_outputs is not None:
+            raise ValueError("index-Q output cannot duplicate query_fp8_outputs")
+        output = index_query_fp8_output
+        if (
+            output.shape != (rows, num_index_heads, 128)
+            or output.dtype != torch.float8_e4m3fn
+            or output.device != qkv.device
+            or not output.is_contiguous()
+        ):
+            raise ValueError("index-Q output must be contiguous E4M3 [T,Hi,128]")
+        peers = (*tensors, *(contiguous_outputs or ()))
+        if rows and output.untyped_storage().data_ptr() in {
+            x.untyped_storage().data_ptr() for x in peers
+        }:
+            raise ValueError("index-Q output must have independent storage")
     if prefill_outputs is not None:
         specifications = (
             ((rows, num_q_heads, 128), torch.bfloat16),
@@ -305,8 +328,9 @@ def minimax_m31_gemma_norm_rope_(
             OIK=contiguous_outputs[3] if contiguous_outputs is not None else None,
             WRITE_CONTIGUOUS=contiguous_outputs is not None,
             Q8=query_fp8_outputs[0] if query_fp8_outputs is not None else None,
-            IQ8=query_fp8_outputs[1] if query_fp8_outputs is not None else None,
-            WRITE_Q8=query_fp8_outputs is not None,
+            IQ8=query_fp8_outputs[1] if query_fp8_outputs is not None else index_query_fp8_output,
+            WRITE_Q8=query_fp8_outputs is not None or index_query_fp8_output is not None,
+            WRITE_MAIN_Q8=query_fp8_outputs is not None,
             PREFILL_Q=prefill_outputs[0] if prefill_outputs is not None else None,
             PREFILL_IQ=prefill_outputs[1] if prefill_outputs is not None else None,
             PREFILL_KV=prefill_outputs[2] if prefill_outputs is not None else None,

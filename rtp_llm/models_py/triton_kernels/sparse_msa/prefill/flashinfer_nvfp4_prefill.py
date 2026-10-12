@@ -1,8 +1,6 @@
 """FlashInfer NVFP4 sparse prefill over direct working pages or legacy planes."""
 
 from functools import lru_cache
-import json
-import logging
 import os
 from pathlib import Path
 
@@ -116,21 +114,6 @@ class _PlanarPages:
 
 
 _PLANAR_PAGES = _PlanarPages()
-_Q8_SHADOW_COUNTS = {}
-_Q8_SHADOW_CAPTURE_WARNED = False
-_logger = logging.getLogger(__name__)
-
-
-def _q8_shadow_capture_active(q):
-    global _Q8_SHADOW_CAPTURE_WARNED
-    if not q.is_cuda or not torch.cuda.is_current_stream_capturing():
-        return False
-    if not _Q8_SHADOW_CAPTURE_WARNED:
-        _logger.warning("M3 Q8 shadow diagnostic skipped during CUDA Graph capture")
-        _Q8_SHADOW_CAPTURE_WARNED = True
-    return True
-
-
 @lru_cache(maxsize=3)
 def _q8kv4_module(target):
     from flashinfer.jit import core as jit_core
@@ -255,43 +238,5 @@ def flashinfer_sparse_prefill_from_topk_fp4(
                page_table=page_table, seqused_k=seqused_k, out=out,
                causal=True, softmax_scale=sm_scale,
                k_global_scale=1.0, v_global_scale=1.0)
-    shadow_dir = os.environ.get("M3_FI_Q8_SHADOW_DIR")
-    shadow_call = _Q8_SHADOW_COUNTS.get(layer_idx, 0)
-    if (shadow_dir and q8_module is not None and layer_idx is not None
-            and shadow_call < int(os.environ.get("M3_FI_Q8_SHADOW_LIMIT", "1"))):
-        if _q8_shadow_capture_active(q):
-            return out
-        _Q8_SHADOW_COUNTS[layer_idx] = shadow_call + 1
-        msa_prefill_nvfp4_specialized_warmup(q.device)
-        shadow = torch.empty_like(out)
-        msa_sparse_attention(q=q, k=k, v=v, k_scale=ks, v_scale=vs,
-               q2k_indices=ordered_topk, cu_seqlens_q=cu_seqlens_q,
-               page_table=page_table, seqused_k=seqused_k, out=shadow,
-               causal=True, softmax_scale=sm_scale,
-               k_global_scale=1.0, v_global_scale=1.0)
-        q_f = q.float()
-        q8_f = q.to(torch.float8_e4m3fn).float()
-        delta = out.float() - shadow.float()
-        shadow_rms = shadow.float().square().mean().sqrt()
-        record = {
-            "pid": os.getpid(), "layer_idx": layer_idx,
-            "call_index": shadow_call, "q_shape": list(q.shape),
-            "q_abs_max": q_f.abs().max().item(),
-            "q_rms": q_f.square().mean().sqrt().item(),
-            "q_e4m3_rel_rms": ((q_f - q8_f).square().mean().sqrt()
-                                  / q_f.square().mean().sqrt().clamp_min(1e-30)).item(),
-            "q_gt_448": (q_f.abs() > 448).sum().item(),
-            "out_rel_rms": (delta.square().mean().sqrt()
-                              / shadow_rms.clamp_min(1e-30)).item(),
-            "out_max_abs": delta.abs().max().item(),
-            "shadow_rms": shadow_rms.item(),
-        }
-        path = Path(shadow_dir)
-        try:
-            path.mkdir(parents=True, exist_ok=True)
-            (path / f"pid_{os.getpid()}_layer_{layer_idx}_call_{shadow_call}.json").write_text(
-                json.dumps(record) + "\n"
-            )
-        except OSError:
-            _logger.exception("M3 Q8 shadow diagnostic record could not be written: %s", path)
+
     return out

@@ -701,7 +701,16 @@ absl::Status MtpBatchStreamProcessor::dispatchDecode(const StreamGroups&        
 
 absl::StatusOr<GptModelInputs> MtpBatchStreamProcessor::gatherDecodeModelInput(const StreamGroups& stream_groups,
                                                                                TensorHolder&       host_holder) const {
-    auto model_input = NormalBatchStreamProcessor::gatherModelInput(stream_groups, host_holder);
+    // The stable-owner DSpARK path replaces these three core vectors before
+    // any forward. Preserve fresh CPU values for validation and owner-loss
+    // fallback, while avoiding unused pinned allocations and initial H2D.
+    // DSpARK builds CUDA inputs independently of the legacy device-input flag.
+    const bool defer_decode_core = is_dspark_ && !stream_groups.isFakeStream()
+                                   && stream_groups.totalContextBatchSize() == 0
+                                   && stream_groups.totalDecodeBatchSize() > 0
+                                   && dsparkBatchDeviceState(stream_groups.allStreams()) != nullptr;
+    auto model_input = defer_decode_core ? gatherModelInputWithDeferredDecodeCore(stream_groups, host_holder) :
+                                          NormalBatchStreamProcessor::gatherModelInput(stream_groups, host_holder);
 
     RTP_LLM_CHECK(model_input.ok());
 
@@ -738,7 +747,8 @@ MtpBatchStreamProcessor::gatherSpecSamplerInput(const StreamGroups&             
     const bool compact_token_ids =
         is_dspark_
         && (spec_logits_result.has_active_processor
-            || (!spec_logits_result.spec_vocab_mask_gpu.defined() && !spec_logits_result.spec_cap_gpu.defined()
+            || (!spec_logits_result.spec_vocab_mask_gpu.defined() && !spec_logits_result.spec_vocab_bitmask_gpu.defined()
+                && !spec_logits_result.spec_cap_gpu.defined()
                 && spec_logits_result.applied_processors.empty()))
         && std::all_of(all_streams.begin(), all_streams.end(), [](const auto& stream) {
                const auto& config     = *stream->generateConfig();
@@ -762,6 +772,7 @@ MtpBatchStreamProcessor::gatherSpecSamplerInput(const StreamGroups&             
     sampler_inputs.phase = LogitsProcessorPhase::MTP_VERIFY;
     if (spec_logits_result.has_active_processor) {
         sampler_inputs.spec_vocab_mask_gpu      = spec_logits_result.spec_vocab_mask_gpu;
+        sampler_inputs.spec_vocab_bitmask_gpu   = spec_logits_result.spec_vocab_bitmask_gpu;
         sampler_inputs.spec_cap_gpu             = spec_logits_result.spec_cap_gpu;
         sampler_inputs.spec_mask_ready_event    = spec_logits_result.ready_event;
         sampler_inputs.spec_mask_consumed_event = spec_logits_result.consumed_event;
@@ -1207,11 +1218,56 @@ void MtpBatchStreamProcessor::buildDSparkProposeInput(GptModelInputs&      model
     model_input.is_target_verify  = true;
 }
 
+std::shared_ptr<const GenerateStream::MtpBatchDeviceState>
+MtpBatchStreamProcessor::dsparkBatchDeviceState(const std::list<GenerateStreamPtr>& streams) {
+    if (streams.empty()) {
+        return {};
+    }
+    const auto owner = streams.front()->getMtpAsyncDeviceStateMetadata().batch_owner;
+    if (!owner || owner->stream_ids.size() != streams.size() || owner->stream_epochs.size() != streams.size()) {
+        return {};
+    }
+    const int64_t rows = static_cast<int64_t>(streams.size());
+    if (!owner->accept_len_gpu.defined() || !owner->accept_len_gpu.is_cuda()) {
+        return {};
+    }
+    const auto owner_device = owner->accept_len_gpu.device();
+    const auto valid_vector = [rows, owner_device](const torch::Tensor& tensor) {
+        return tensor.defined() && tensor.is_cuda() && tensor.device() == owner_device && tensor.is_contiguous()
+               && tensor.dim() == 1 && tensor.size(0) == rows && tensor.scalar_type() == torch::kInt32;
+    };
+    if (!valid_vector(owner->accept_len_gpu) || !valid_vector(owner->next_seq_len_gpu)
+        || !valid_vector(owner->dspark_anchor_gpu) || !valid_vector(owner->dspark_committed_end_gpu)
+        || !owner->accept_tokens_gpu.defined() || owner->accept_tokens_gpu.dim() != 2
+        || owner->accept_tokens_gpu.size(0) != rows || owner->accept_tokens_gpu.size(1) < 1
+        || owner->accept_tokens_gpu.scalar_type() != torch::kInt32 || !owner->accept_tokens_gpu.is_cuda()
+        || owner->accept_tokens_gpu.device() != owner_device || !owner->accept_tokens_gpu.is_contiguous()) {
+        return {};
+    }
+    int64_t row = 0;
+    for (const auto& stream : streams) {
+        const auto& state = stream->getMtpAsyncDeviceStateMetadata();
+        if (state.batch_owner != owner || state.batch_row != row || state.epoch != owner->stream_epochs[row]
+            || stream->streamId() != owner->stream_ids[row] || stream->nextBatchSize() != 1 || stream->hasNumBeams()) {
+            return {};
+        }
+        ++row;
+    }
+    return owner;
+}
+
 MtpBatchStreamProcessor::DSparkRoundState MtpBatchStreamProcessor::buildDSparkRoundState(
     const StreamGroups& stream_groups, const GptModelInputs& model_input, TensorHolder& host_holder) const {
     const int64_t batch_size = static_cast<int64_t>(stream_groups.size());
     if (batch_size == 0) {
         return {};
+    }
+
+    if (const auto owner = dsparkBatchDeviceState(stream_groups.allStreams())) {
+        if (owner->ready_event) {
+            owner->ready_event->block(cuda_graph::graphGetCurrentStream());
+        }
+        return {owner->dspark_anchor_gpu, owner->dspark_committed_end_gpu, collectDSparkPositionBases(stream_groups)};
     }
 
     std::vector<torch::Tensor> anchors;
@@ -1221,7 +1277,7 @@ MtpBatchStreamProcessor::DSparkRoundState MtpBatchStreamProcessor::buildDSparkRo
     auto    host_seq_lens = toCudaInt32(model_input.sequence_lengths, host_holder);
     int64_t row           = 0;
     for (const auto& stream : stream_groups.allStreams()) {
-        const auto state = stream->getMtpAsyncDeviceState();
+        const auto state = stream->materializeMtpAsyncDeviceState();
         if (state.dspark_anchor_gpu.defined()) {
             RTP_LLM_CHECK_WITH_INFO(state.dspark_anchor_gpu.is_cuda()
                                         && state.dspark_anchor_gpu.scalar_type() == torch::kInt32
@@ -1676,8 +1732,8 @@ void MtpBatchStreamProcessor::gatherHiddenStates(const StreamGroups& stream_grou
     // Prefer main-thread device-state hidden_states to avoid racing worker
     // writes to sp_output_buffer when DROP_BROAD_SYNC=1. Fallback covers older
     // or first-step streams without published device state.
-    auto pick_hidden_states = [](const GenerateStreamPtr& stream) -> const torch::Tensor& {
-        const auto& dev = stream->getLastHiddenStatesGpu();
+    auto pick_hidden_states = [](const GenerateStreamPtr& stream) -> torch::Tensor {
+        auto dev = stream->getLastHiddenStatesGpu();
         if (dev.defined()) {
             return dev;
         }

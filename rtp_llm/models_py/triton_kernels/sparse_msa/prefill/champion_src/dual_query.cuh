@@ -23,7 +23,7 @@ __device__ __forceinline__ void dual_query_softmax(Params p,DualQueryShared& s,u
         int physical=valid?p.table[batch*p.tb+block]:-1;
         valid=valid&&physical>=0&&physical<p.pages&&query<stop;
         float inv,lp;
-        page_softmax<true>(t+Qid*128,row_addr,block,limit,length,valid,p.alpha,inv,lp,nullptr,&s.p_half[Qid],s.p[Qid]);
+        page_softmax<true>(t+Qid*128,row_addr,block,limit,length,valid,p.alpha,inv,lp,&s.p_half[Qid],s.p[Qid]);
         if(page>0) cutlass::arch::ClusterBarrier::wait(&s.stats_free[Qid],(page-1)%2);
         s.inv[Qid][local]=inv;s.lp[Qid][local]=lp;
         before_sync();wg_sync<Qid+1>();

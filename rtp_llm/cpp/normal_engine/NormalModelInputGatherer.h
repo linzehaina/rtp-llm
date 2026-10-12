@@ -43,7 +43,11 @@ class NormalModelInputGatherer {
 public:
     explicit NormalModelInputGatherer(const NormalModelInputGathererConfig& config);
 
-    absl::StatusOr<GptModelInputs> gather(const StreamGroups& stream_groups, TensorHolder& host_holder) const;
+    // Native DSpARK preparation can defer publication of three decode core
+    // vectors it replaces before forward. The default remains model-ready.
+    absl::StatusOr<GptModelInputs> gather(const StreamGroups& stream_groups,
+                                        TensorHolder& host_holder,
+                                        bool defer_decode_core_publication = false) const;
 
     // Build only the CUDA kv_cache_kernel_block_id tensor in 3-D layout.
     // Read-only over streams: no step(), no sibling kv_cache_block_id, no
@@ -52,7 +56,8 @@ public:
                                                              TensorHolder&       host_holder) const;
 
 private:
-    GptModelInputs allocateModelInputBuffers(const StreamGroups& stream_groups) const;
+    GptModelInputs allocateModelInputBuffers(const StreamGroups& stream_groups,
+                                            bool defer_decode_core_publication) const;
     void           initializeKvCacheMetadata(GptModelInputs& model_input) const;
     absl::Status   processDecodeStreams(GptModelInputs& model_input, const StreamGroups& stream_groups) const;
     absl::Status   processContextStreams(GptModelInputs&     model_input,

@@ -267,11 +267,9 @@ class MiniMaxM3ReasoningDetector(BaseReasoningFormatDetector):
     Assumes reasoning format:
       (<mm:think>)*(.*)</mm:think>
 
-    M3 always closes with `</mm:think>`, even when it skips thinking: its system
-    prompt instructs it to "begin your response directly after the </mm:think>
-    prefix". Reasoning is therefore forced, as for DeepSeek-R1 — otherwise a
-    non-thinking reply, which opens with a bare `</mm:think>`, leaks that tag
-    into the content.
+    The closing marker may already be part of the generation prompt when
+    thinking is disabled. Honor the caller's initial state; explicit markers
+    in generated text are still detected and stripped.
 
     M3 also repeats the closing marker, so the base class's single-shot split is
     not enough: once reasoning has ended every further marker would be treated as
@@ -283,7 +281,7 @@ class MiniMaxM3ReasoningDetector(BaseReasoningFormatDetector):
         super().__init__(
             MM_THINK_START_TOKEN,
             MM_THINK_END_TOKEN,
-            force_reasoning=True,
+            force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
         )
         self._marker_carry = ""
@@ -328,6 +326,11 @@ class MiniMaxM3ReasoningDetector(BaseReasoningFormatDetector):
         (`...<`, `...</`) would have them silently dropped.
         """
         carry, self._marker_carry = self._marker_carry, ""
+        # A marker prefix occupying an entire chunk is retained by the base
+        # detector instead. Once reasoning has ended it is ordinary content too.
+        if not self._in_reasoning:
+            carry += self._buffer
+            self._buffer = ""
         return carry
 
 
@@ -358,7 +361,7 @@ class ReasoningParser:
         self,
         model_type: Optional[str] = None,
         stream_reasoning: bool = True,
-        force_reasoning: bool = False,
+        force_reasoning: Optional[bool] = None,
     ):
         if not model_type:
             raise ValueError("Model type must be specified")
@@ -367,6 +370,10 @@ class ReasoningParser:
         if not detector_class:
             raise ValueError(f"Unsupported model type: {model_type}")
 
+        # Preserve the historical M3 default while allowing an explicit
+        # disabled/adaptive request to supply its actual prompt state.
+        if force_reasoning is None:
+            force_reasoning = model_type.lower() == "minimax_m3"
         if model_type.lower() == "qwen3-thinking":
             force_reasoning = True
 

@@ -38,6 +38,11 @@ public:
                                                                      TensorHolder&       host_holder) const;
 
 protected:
+    // Only MTP DSpARK preparation uses this intermediate CPU-core contract;
+    // the public virtual gatherModelInput continues publishing CUDA core tensors.
+    absl::StatusOr<GptModelInputs> gatherModelInputWithDeferredDecodeCore(const StreamGroups& stream_groups,
+                                                                        TensorHolder& host_holder) const;
+
     SamplerInputs allocateSamplerInputs(const StreamGroups& stream_groups,
                                         size_t              total_batch_size_in,
                                         size_t              total_batch_size_out,

@@ -370,3 +370,15 @@ py_test(
     deps = ["//rtp_llm:testlib"],
     timeout = "short",
 )
+
+py_test(
+    name = "minimax_m31_decode_query_fp8_test",
+    srcs = ["minimax_m31_decode_query_fp8_test.py"],
+    deps = [
+        "//rtp_llm/models_py/triton_kernels:sparse_msa",
+        "//rtp_llm/models_py/standalone:py_standalone_testlib",
+    ],
+    env = {"GPU_COUNT": "1"},
+    tags = ["SM100_X86"],
+    exec_properties = {"gpu": "SM100_X86", "gpu_count": "1"},
+)

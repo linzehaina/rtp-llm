@@ -112,7 +112,6 @@ __global__ __launch_bounds__(256,2) void grouped_cutlass_compact(Params p) {
                 }
                 float den=((sums[0]+sums[2])+(sums[4]+sums[6]))+((sums[1]+sums[3])+(sums[5]+sums[7]));
                 den=__shfl_sync(0xffffffff,den,lane%16+16);
-                if(MSA_TRACE&&p.debug&&blockIdx.x==0&&blockIdx.y==0&&local==0&&j==0) printf("softmax block=%d valid=%d max=%f den=%f prob=%f\n",block,int(valid),maximum,den,v[0]);
                 if(j>0) cutlass::arch::ClusterBarrier::wait(&s.stats_free,(j-1)%2);
                 #pragma unroll
                 for(int c=0;c<64;c+=4) *reinterpret_cast<uint32_t*>(s.p+Layout64{}(cute::make_coord(row,half*64+c)))=pack_probability(v[c],v[c+1],v[c+2],v[c+3]);
@@ -128,19 +127,10 @@ __global__ __launch_bounds__(256,2) void grouped_cutlass_compact(Params p) {
                 cutlass::arch::ClusterBarrier::wait(&s.o_ready,j%2);after_sync();
                 float values[64];load64_m64(t+128+addr,values);cutlass::arch::fence_view_async_tmem_load();
                 float inv=s.inv[row];pair_warp_sync<2>();
-                if(MSA_TRACE&&p.debug&&blockIdx.x==0&&blockIdx.y==0&&local==0&&j==0) printf("merge pv=%f inv=%f\n",values[0],inv);
                 if(local==0) cutlass::arch::ClusterBarrier::arrive(&s.stats_free);
                 uint32_t packed[32];
                 #pragma unroll
                 for(int c=0;c<32;++c) packed[c]=normalize_bf16_pair(values[c*2],values[c*2+1],inv);
-                if(MSA_TRACE&&p.debug&&blockIdx.x==0&&blockIdx.y==0) {
-                    auto* d=reinterpret_cast<float*>(p.debug);
-                    #pragma unroll
-                    for(int c=0;c<32;++c) {
-                        d[(j*32+row)*128+half*64+c*2]=__uint_as_float(packed[c]<<16);
-                        d[(j*32+row)*128+half*64+c*2+1]=__uint_as_float(packed[c]&0xffff0000);
-                    }
-                }
                 if(j<8&&j%4<2) {
                     compact_store_impl(compact_partial_address(t,j,warp),packed,std::make_index_sequence<32>{});
                     cutlass::arch::fence_view_async_tmem_store();
@@ -190,14 +180,6 @@ __global__ __launch_bounds__(256,2) void grouped_cutlass_compact(Params p) {
                     #pragma unroll
                     for(int c=0;c<16;c+=4) *reinterpret_cast<uint4*>(packed+c)=*reinterpret_cast<uint4*>(&s.partial[j-8][local][(part*16+c)^((local&7)*4)]);
                 }
-                if(MSA_TRACE&&p.debug&&blockIdx.x==0&&blockIdx.y==0) {
-                    auto* d=reinterpret_cast<float*>(p.debug)+65536;
-                    #pragma unroll
-                    for(int c=0;c<16;++c) {
-                        d[(j*32+row)*128+half*64+part*32+c*2]=__uint_as_float(packed[c]<<16);
-                        d[(j*32+row)*128+half*64+part*32+c*2+1]=__uint_as_float(packed[c]&0xffff0000);
-                    }
-                }
                 #pragma unroll
                 for(int c=0;c<16;++c) accumulate_bf16_pair(accum[c*2],accum[c*2+1],packed[c],weights[j]);
             }
@@ -227,7 +209,6 @@ __global__ __launch_bounds__(256,2) void grouped_cutlass_compact(Params p) {
                     Copy::copy(*reinterpret_cast<const uint4*>(p.v8+offset),*reinterpret_cast<uint4*>(s.v+VLayout{}(cute::make_coord(d,token))),present);
                 }
                 cute::cp_async_fence();cute::cp_async_wait<0>();cutlass::arch::fence_view_async_shared();pair_warp_sync<3>();
-                if(MSA_TRACE&&p.debug&&blockIdx.x==0&&blockIdx.y==0&&local==0&&j==0) printf("loader page=%d valid=%d k=%x v=%x\n",page,int(valid),*reinterpret_cast<uint32_t*>(s.k),*reinterpret_cast<uint32_t*>(s.v));
                 if(local==0) cutlass::arch::ClusterBarrier::arrive(&s.kv_ready);
                 if(j<8&&j%4>=2) {
                     cutlass::arch::ClusterBarrier::wait(&s.spill_ready,(j%4-2)%2);

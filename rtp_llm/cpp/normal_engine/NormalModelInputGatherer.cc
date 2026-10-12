@@ -324,13 +324,17 @@ torch::Tensor publishInt32ToCuda(const torch::Tensor& tensor, TensorHolder& host
     return tensor.to(cuda_i32, /*non_blocking=*/true);
 }
 
-void publishModelInputCoreTensorsToCuda(GptModelInputs& model_input, TensorHolder& host_holder) {
+void publishModelInputCoreTensorsToCuda(GptModelInputs& model_input,
+                                       TensorHolder& host_holder,
+                                       bool defer_decode_core_publication) {
     // TODO(async): stream state is still gathered through CPU pointers above.
     // Publish only device tensors at the model boundary.
     RTP_LLM_PROFILE_SCOPE("normal_engine.model_input_gatherer.publish_core_tensors_to_cuda");
-    model_input.combo_tokens     = publishInt32ToCuda(model_input.combo_tokens, host_holder);
-    model_input.input_lengths    = publishInt32ToCuda(model_input.input_lengths, host_holder);
-    model_input.sequence_lengths = publishInt32ToCuda(model_input.sequence_lengths, host_holder);
+    if (!defer_decode_core_publication) {
+        model_input.combo_tokens     = publishInt32ToCuda(model_input.combo_tokens, host_holder);
+        model_input.input_lengths    = publishInt32ToCuda(model_input.input_lengths, host_holder);
+        model_input.sequence_lengths = publishInt32ToCuda(model_input.sequence_lengths, host_holder);
+    }
     model_input.prefix_lengths   = publishInt32ToCuda(model_input.prefix_lengths, host_holder);
     // Migrate the 3-D KV kernel block id tensor with one H2D, replacing the
     // former per-group tensorHoldHostAndToCuda copies in PyWrappedModel.
@@ -341,7 +345,8 @@ void publishModelInputCoreTensorsToCuda(GptModelInputs& model_input, TensorHolde
 
 NormalModelInputGatherer::NormalModelInputGatherer(const NormalModelInputGathererConfig& config): config_(config) {}
 
-GptModelInputs NormalModelInputGatherer::allocateModelInputBuffers(const StreamGroups& stream_groups) const {
+GptModelInputs NormalModelInputGatherer::allocateModelInputBuffers(const StreamGroups& stream_groups,
+                                                                 bool defer_decode_core_publication) const {
     const size_t current_tokens_size      = stream_groups.modelExecuteTokenSize();
     const size_t total_batch_size         = stream_groups.totalModelBatchSize();
     const size_t total_decode_batch_size  = stream_groups.totalDecodeBatchSize();
@@ -359,10 +364,14 @@ GptModelInputs NormalModelInputGatherer::allocateModelInputBuffers(const StreamG
     static const auto pinned_bool = torch::TensorOptions(torch::kBool).pinned_memory(true);
     const auto        cuda_i32    = runtimeCudaI32Options();
 
+    // Keep fresh CPU storage and all gather writes/validation. DSpARK replaces
+    // these vectors from device state, so its intermediate buffers need no pinning.
+    const auto core_i32 = defer_decode_core_publication ?
+                             torch::TensorOptions(torch::kInt32).device(torch::kCPU) : pinned_i32;
     GptModelInputs model_input;
-    model_input.combo_tokens                 = torch::empty({(int64_t)current_tokens_size}, pinned_i32);
-    model_input.input_lengths                = torch::empty({(int64_t)total_batch_size}, pinned_i32);
-    model_input.sequence_lengths             = torch::empty({(int64_t)total_decode_batch_size}, pinned_i32);
+    model_input.combo_tokens                 = torch::empty({(int64_t)current_tokens_size}, core_i32);
+    model_input.input_lengths                = torch::empty({(int64_t)total_batch_size}, core_i32);
+    model_input.sequence_lengths             = torch::empty({(int64_t)total_decode_batch_size}, core_i32);
     model_input.prefix_lengths               = torch::empty({(int64_t)total_context_batch_size}, cuda_i32);
     model_input.request_id                   = torch::empty({(int64_t)total_context_batch_size}, pinned_i64);
     model_input.request_pd_separation        = torch::empty({(int64_t)total_context_batch_size}, pinned_bool);
@@ -658,16 +667,21 @@ absl::StatusOr<torch::Tensor> NormalModelInputGatherer::gatherKvCacheKernelBlock
 }
 
 absl::StatusOr<GptModelInputs> NormalModelInputGatherer::gather(const StreamGroups& stream_groups,
-                                                                TensorHolder&       host_holder) const {
+                                                                TensorHolder&       host_holder,
+                                                                bool defer_decode_core_publication) const {
     RTP_LLM_LOG_DEBUG(__PRETTY_FUNCTION__);
     RTP_LLM_LOG_DEBUG("context_streams size = %d, decode_streams size = %d",
                       stream_groups.contextStreams().size(),
                       stream_groups.decodeStreams().size());
-    auto model_input = allocateModelInputBuffers(stream_groups);
+    RTP_LLM_CHECK_WITH_INFO(!defer_decode_core_publication
+                              || (stream_groups.totalContextBatchSize() == 0
+                                  && stream_groups.totalDecodeBatchSize() > 0 && !stream_groups.isFakeStream()),
+                            "deferred decode core publication requires nonempty real decode-only streams");
+    auto model_input = allocateModelInputBuffers(stream_groups, defer_decode_core_publication);
     initializeKvCacheMetadata(model_input);
     RETURN_IF_STATUS_ERROR(processDecodeStreams(model_input, stream_groups));
     RETURN_IF_STATUS_ERROR(processContextStreams(model_input, stream_groups, host_holder));
-    publishModelInputCoreTensorsToCuda(model_input, host_holder);
+    publishModelInputCoreTensorsToCuda(model_input, host_holder, defer_decode_core_publication);
     model_input.lm_output_indexes = buildLmOutputIndexesOnCuda(model_input, stream_groups);
     return model_input;
 }

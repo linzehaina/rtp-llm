@@ -109,7 +109,6 @@ __global__ __launch_bounds__(128,1) void decode_warp_mma(Params p) {
 
     // Prologue: fetch page 0 (K and V).
     if(valids[0]) { issue_k(0,0); issue_v(0,0); }
-    if(p.debug&&ln==0&&warp==0) reinterpret_cast<long long*>(p.debug)[0]=clock64();
 
     int mybuf=0;
     #pragma unroll 1
@@ -322,7 +321,6 @@ __global__ __launch_bounds__(128,1) void decode_warp_mma(Params p) {
     }
     cute::cp_async_wait<0>();
     __syncwarp();
-    if(p.debug&&ln==0&&warp==0) reinterpret_cast<long long*>(p.debug)[1]=clock64();
 
     // Cross-warp merge: pack the four 8KB partial-output tiles tightly at
     // the base of the retired raw buffers.
@@ -370,7 +368,6 @@ __global__ __launch_bounds__(128,1) void decode_warp_mma(Params p) {
         if(half==0) p.lse[int64_t(row)*64+head*16+g_row]=
             zt>0.f?(mt+log_native(zt))*0.6931471805599453f:-CUDART_INF_F;
     }
-    if(p.debug&&ln==0&&warp==0) reinterpret_cast<long long*>(p.debug)[2]=clock64();
 }
 
 } // namespace rtp_llm

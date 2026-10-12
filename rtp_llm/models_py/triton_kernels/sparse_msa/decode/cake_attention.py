@@ -22,7 +22,7 @@ from rtp_llm.models_py.triton_kernels.common.nvfp4_kv_cache import NVFP4CacheLay
 
 
 @triton.jit
-def _prepare_metadata(Q, TOPK, TABLE, LENS, MASK, Q_OUT, TOPK_OUT, TABLE_OUT,
+def _prepare_metadata_row(Q, TOPK, TABLE, LENS, MASK, Q_OUT, TOPK_OUT, TABLE_OUT,
                       LENS_OUT, QS0, QS1, TS0, TS1, KS0, KS1, KS2, LS, MS,
                       ROWS: tl.constexpr, COLS: tl.constexpr,
                       PHYSICAL: tl.constexpr, HAS_MASK: tl.constexpr,
@@ -60,6 +60,29 @@ def _prepare_metadata(Q, TOPK, TABLE, LENS, MASK, Q_OUT, TOPK_OUT, TABLE_OUT,
                       descending=False)
     tl.store(TOPK_OUT + (head * ROWS + row) * 16 + slot,
              tl.where(ordered == 2147483647, -1, ordered))
+
+
+@triton.jit
+def _prepare_metadata(Q, TOPK, TABLE, LENS, MASK, Q_OUT, TOPK_OUT, TABLE_OUT,
+                      LENS_OUT, QS0, QS1, TS0, TS1, KS0, KS1, KS2, LS, MS,
+                      ROWS: tl.constexpr, COLS: tl.constexpr,
+                      PHYSICAL: tl.constexpr, HAS_MASK: tl.constexpr,
+                      COPY_Q: tl.constexpr, BLOCK: tl.constexpr,
+                      SEEN=None, CLEAR_ELECTION: tl.constexpr = False):
+    if CLEAR_ELECTION:
+        # Disjoint coalesced stores avoid atomic contention when many verify
+        # rows share the same physical pages. The grid covers both metadata
+        # rows and the entire election plane; prefix election starts only after
+        # this kernel completes. Do not combine reset and election in one CTA
+        # grid: a reset could otherwise erase another CTA's prefix winner.
+        offset = (tl.program_id(0).to(tl.int64) * 4 + tl.program_id(1)) * 256
+        offset = offset + tl.arange(0, 256)
+        tl.store(SEEN + offset, 0, mask=offset < PHYSICAL * 4)
+    if tl.program_id(0) < ROWS:
+        _prepare_metadata_row(
+            Q, TOPK, TABLE, LENS, MASK, Q_OUT, TOPK_OUT, TABLE_OUT,
+            LENS_OUT, QS0, QS1, TS0, TS1, KS0, KS1, KS2, LS, MS,
+            ROWS, COLS, PHYSICAL, HAS_MASK, COPY_Q, BLOCK)
 
 
 @triton.jit
@@ -226,7 +249,7 @@ class CakeAttentionWorkspace:
 def cake_paged_sparse_decode(q, layout: NVFP4CacheLayout, block_table,
                              topk_indices, seq_lens, *, workspace,
                              mma_scale_layout=True, valid_token_mask=None,
-                             sm_scale=None):
+                             sm_scale=None, defer_output_mask=False):
     """Consume sorted logical TopK and original BF16 Q; return stable BF16 output.
 
     Invalid logical/physical IDs and padded rows are removed before Cake runs.
@@ -235,6 +258,8 @@ def cake_paged_sparse_decode(q, layout: NVFP4CacheLayout, block_table,
     a masked probability times a NaN V operand otherwise propagates NaN.
     The writer owns valid-token scale initialization.
     ``workspace`` and its scales must outlive every captured graph using them.
+    ``defer_output_mask`` is for the packed-output adapter whose quantizer
+    masks invalid rows itself; raw BF16 output and LSE are then internal only.
     """
     _validate(q, layout, block_table, topk_indices, seq_lens, valid_token_mask)
     ws = workspace
@@ -273,7 +298,7 @@ def cake_paged_sparse_decode(q, layout: NVFP4CacheLayout, block_table,
         if capturing:
             ws.runners[key] = runner
     rows, cols = q.shape[0], block_table.shape[1]
-    _prepare_metadata[(rows, 4)](
+    _prepare_metadata[(max(rows, triton.cdiv(layout.num_blocks, 256)), 4)](
         q, topk_indices, block_table, seq_lens, valid_token_mask,
         ws.q, ws.topk, ws.table, ws.lens, q.stride(0), q.stride(1),
         block_table.stride(0), block_table.stride(1), topk_indices.stride(0),
@@ -281,17 +306,18 @@ def cake_paged_sparse_decode(q, layout: NVFP4CacheLayout, block_table,
         valid_token_mask.stride(0) if valid_token_mask is not None else 0,
         ROWS=rows, COLS=cols, PHYSICAL=layout.num_blocks,
         HAS_MASK=valid_token_mask is not None, COPY_Q=not direct_q,
-        BLOCK=triton.next_power_of_2(cols), num_warps=4)
-    ws.scales.seen.zero_()
+        BLOCK=triton.next_power_of_2(cols), SEEN=ws.scales.seen,
+        CLEAR_ELECTION=True, num_warps=4)
     _selected_valid_prefix[(rows, 4)](
         ws.topk, ws.table, ws.lens, ws.scales.seen,
         ROWS=rows, COLS=cols, num_warps=4)
     _refresh_selected_scales[(rows * 16, 4)](
         ws.topk, ws.table, ws.scales.seen, ks, vs, ws.scales.k, ws.scales.v,
         ks.stride(0), vs.stride(0), ROWS=rows, COLS=cols,
-        MMA=mma_scale_layout, num_warps=4)
+        MMA=mma_scale_layout, num_warps=2 if rows >= 20 else 4)
     runner()
-    _mask_output[(rows,)](ws.output, ws.lse, valid_token_mask, ws.lens,
-                         valid_token_mask.stride(0) if valid_token_mask is not None else 0,
-                         HAS_MASK=valid_token_mask is not None, num_warps=4)
+    if not defer_output_mask:
+        _mask_output[(rows,)](ws.output, ws.lse, valid_token_mask, ws.lens,
+                             valid_token_mask.stride(0) if valid_token_mask is not None else 0,
+                             HAS_MASK=valid_token_mask is not None, num_warps=4)
     return ws.output

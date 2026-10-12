@@ -391,6 +391,18 @@ void ThinkModeLogitsProcessor::updateStatus(const torch::Tensor& new_tokens, int
     publishSpecSnapshotLocked();
 }
 
+bool ThinkModeLogitsProcessor::tryGetStaticThinkMaskDescriptor(StaticThinkMaskDescriptor& descriptor) const {
+    const auto snapshot = std::atomic_load_explicit(&spec_snapshot_, std::memory_order_acquire);
+    if (!snapshot || !snapshot->eligible || !snapshot->info.pending_forced_think_end_token_ids.empty()
+        || (snapshot->info.process_state != ThinkProcessState::NO_THINK
+            && snapshot->info.process_state != ThinkProcessState::AFTER_THINK)) return false;
+    descriptor.first_begin_id = firstTokenOrInvalid(snapshot->info.begin_think_token_ids);
+    descriptor.first_end_id = firstTokenOrInvalid(snapshot->info.end_think_token_ids);
+    descriptor.snapshot_version = snapshot->version;
+    descriptor.snapshot_owner = snapshot;
+    return true;
+}
+
 bool ThinkModeLogitsProcessor::isSpecVerifyEligible() const {
     auto snapshot = std::atomic_load_explicit(&spec_snapshot_, std::memory_order_acquire);
     return snapshot && snapshot->eligible;

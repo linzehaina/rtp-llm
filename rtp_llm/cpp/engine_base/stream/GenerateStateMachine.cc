@@ -140,7 +140,7 @@ void GenerateStateMachine::handleRunning() {
         if (normal_override > 0) {
             seq_len_override = normal_override;
         } else {
-            const auto& mtp_state    = stream->getMtpAsyncDeviceState();
+            const auto& mtp_state    = stream->getMtpAsyncDeviceStateMetadata();
             const int   mtp_override = mtp_state.next_real_seq_len;
             if (mtp_override > 0) {
                 seq_len_override = mtp_override;
@@ -156,7 +156,7 @@ void GenerateStateMachine::handleRunning() {
                                 stream->seqLength(),
                                 stream->getNormalAsyncDeviceState().last_real_seq_len,
                                 stream->getNormalAsyncDeviceState().next_real_seq_len,
-                                stream->getMtpAsyncDeviceState().next_real_seq_len,
+                                stream->getMtpAsyncDeviceStateMetadata().next_real_seq_len,
                                 seq_len_override);
         }
     }

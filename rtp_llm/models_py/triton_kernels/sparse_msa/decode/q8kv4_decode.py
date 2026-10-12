@@ -21,7 +21,7 @@ stable addresses under CUDA Graph.
 
 The attention stage itself has two native routes: the Triton partial+combine
 reader (plus its BF16-Q Cake specialization) and the frozen ctypes champion in
-``native_hybrid_decode.py`` (default; bitwise-identical output, one launch).
+``native_hybrid_decode.py`` (experimental opt-in; default OFF).
 """
 
 import logging
@@ -189,6 +189,29 @@ def _scale1_e4m3(values: torch.Tensor, name: str, out: torch.Tensor) -> torch.Te
 # mutable scale staging and addressing buffers.
 _CAKE_SCALES: dict[tuple, object] = {}
 _CAKE_WORKSPACES: dict[tuple, object] = {}
+_DECODE_INDEX_QUERY_FP8: dict[tuple, torch.Tensor] = {}
+
+
+def decode_index_query_fp8_buffer(index_q: torch.Tensor) -> torch.Tensor | None:
+    """Stream-owned scratch shared by serial layers, independent of KV length."""
+    if (
+        not index_q.is_cuda
+        or index_q.dtype != torch.bfloat16
+        or index_q.ndim not in (2, 3)
+    ):
+        return None
+    rows = index_q.shape[0]
+    if (
+        not 20 <= rows <= 256
+        or tuple(index_q.shape[1:]) not in ((512,), (4, 128))
+    ):
+        return None
+    key = (index_q.device, torch.cuda.current_stream(index_q.device).cuda_stream, rows)
+    output = _DECODE_INDEX_QUERY_FP8.get(key)
+    if output is None:
+        output = torch.empty((rows, 4, 128), dtype=torch.float8_e4m3fn, device=index_q.device)
+        _DECODE_INDEX_QUERY_FP8[key] = output
+    return output
 
 
 def _native_hybrid_decode_selected(
@@ -201,7 +224,7 @@ def _native_hybrid_decode_selected(
     query_cu_seqlens,
     output_format,
 ):
-    """Frozen native champion as the attention stage (default on).
+    """Frozen native champion as the attention stage (explicit opt-in only).
 
     Replaces the Triton partial+combine reader (and the Cake reader above its
     20-row boundary) with one ctypes launch that consumes the same cache
@@ -313,6 +336,7 @@ def q8kv4_paged_sparse_decode(
     query_cu_seqlens: torch.Tensor | None = None,
     max_query_width: int = 1,
     fuse_bf16_query_rounding: bool = False,
+    index_query_fp8_output: torch.Tensor | None = None,
     bf16_main_query: bool = False,
     valid_token_mask: torch.Tensor | None = None,
     max_seq_len: int | None = None,
@@ -337,6 +361,7 @@ def q8kv4_paged_sparse_decode(
         query_cu_seqlens=query_cu_seqlens,
         max_query_width=max_query_width,
         fuse_bf16_query_rounding=fuse_bf16_query_rounding,
+        index_query_fp8_output=index_query_fp8_output,
         bf16_main_query=bf16_main_query,
         valid_token_mask=valid_token_mask,
         max_seq_len=max_seq_len,
@@ -370,6 +395,7 @@ def _q8kv4_paged_sparse_decode(
     query_cu_seqlens: torch.Tensor | None = None,
     max_query_width: int = 1,
     fuse_bf16_query_rounding: bool = False,
+    index_query_fp8_output: torch.Tensor | None = None,
     bf16_main_query: bool = False,
     valid_token_mask: torch.Tensor | None = None,
     max_seq_len: int | None = None,
@@ -392,7 +418,7 @@ def _q8kv4_paged_sparse_decode(
     that limit. It removes only speculative reserve columns above 8192 pages.
 
     The attention stage (partial + combine) is routed to the frozen native
-    champion (``native_hybrid_decode.py``) whenever the supported M3.1
+    champion (``native_hybrid_decode.py``) only when explicitly enabled and the M3.1
     geometry, BF16 output format and SM103 device allow it; the query cast,
     index score and production TopK prefix are unchanged on that route.
     ``MSA_USE_NATIVE_HYBRID_DECODE=0`` restores the Triton/Cake dispatch.
@@ -430,13 +456,13 @@ def _q8kv4_paged_sparse_decode(
     if _output_format == "mxfp8" and (
         not q.is_cuda
         or torch.cuda.get_device_capability(q.device) != (10, 3)
-        or not 0 < q.shape[0] <= 100
+        or not 0 < q.shape[0] <= 160
         or tuple(q.shape[1:]) != (64, 128)
         or layout.num_heads != 4
         or topk != 16
     ):
         raise ValueError(
-            "MXFP8 output requires tested SM103 Hq64/Hkv4/D128/TopK16 M1..100"
+            "MXFP8 output requires tested SM103 Hq64/Hkv4/D128/TopK16 M1..160"
         )
     workspace = _Q8KV4DecodeWorkspace.acquire(
         q, idx_q, max_blocks, topk, num_topk_chunks, _output_format
@@ -456,7 +482,24 @@ def _q8kv4_paged_sparse_decode(
         and not use_native
         and _cake_supported(q, layout, topk, mma_scale_layout, max_blocks)
     )
-    if fuse_bf16_query_rounding:
+    if index_query_fp8_output is not None and (
+        not fuse_bf16_query_rounding
+        or index_query_fp8_output.dtype != torch.float8_e4m3fn
+        or index_query_fp8_output.shape != idx_q.shape
+        or index_query_fp8_output.device != idx_q.device
+        or not index_query_fp8_output.is_contiguous()
+        or (
+            idx_q.numel()
+            and index_query_fp8_output.untyped_storage().data_ptr() in {
+                q.untyped_storage().data_ptr(), idx_q.untyped_storage().data_ptr()
+            }
+        )
+    ):
+        raise ValueError("precast index-Q requires BF16 rounding and independent matching E4M3 storage")
+    if use_cake and index_query_fp8_output is not None:
+        # Cake consumes BF16 main Q; norm/RoPE already rounded index Q to E4M3.
+        q8, idx_q8 = workspace.q8, index_query_fp8_output
+    elif fuse_bf16_query_rounding:
         from .nvfp4_q8_query_cast import fused_query_cast
 
         fused_query_cast(
@@ -508,7 +551,12 @@ def _q8kv4_paged_sparse_decode(
     # RTP_LLM_MSA_TRITON_TOPK=0 to fall back to the native op (e.g. for
     # eager deployments that cannot capture the Python launch in a graph --
     # see pair_adoption/README.md for the +23.5us eager host-launch caveat).
-    if _TRITON_REG16_TOPK:
+    if (
+        _TRITON_REG16_TOPK
+        and topk == 16
+        and block_size == 128
+        and 0 < max_blocks <= 4096
+    ):
         from .minimax_decode_topk_reg16 import triton_reg16_topk
 
         triton_reg16_topk(
@@ -564,6 +612,7 @@ def _q8kv4_paged_sparse_decode(
             sm_scale=layout.head_dim**-0.5 if sm_scale is None else sm_scale,
             mma_scale_layout=mma_scale_layout,
             valid_token_mask=valid_token_mask,
+            defer_output_mask=_output_format == "mxfp8",
         )
         if _output_format == "mxfp8":
             from .nvfp4_q8_combine_mxfp8 import _quantize_bf16_attention_mxfp8
@@ -573,6 +622,12 @@ def _q8kv4_paged_sparse_decode(
                 workspace.output_fp8.view(torch.uint8),
                 workspace.output_scales_packed,
                 ALIGNED_M=workspace.output_scales_packed.stride(1),
+                LENS=seq_lens,
+                MASK=valid_token_mask,
+                LS=seq_lens.stride(0),
+                MS=valid_token_mask.stride(0) if valid_token_mask is not None else 0,
+                HAS_LENS=True,
+                HAS_MASK=valid_token_mask is not None,
                 num_warps=4,
             )
             return Q8KV4Mxfp8DecodeResult(

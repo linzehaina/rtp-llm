@@ -302,6 +302,88 @@ TEST_F(HybridKVCacheAllocatorCPShardTest, ShardedAllocCpSize4) {
     EXPECT_EQ(batch_res->blocksNum(0, gid_full), 2);  // ceil(8/4)=2
 }
 
+
+// FULL uses CP-local lengths; draft SWA retains the global sequence length.
+static CacheConfig makeCPFullSwaConfig() {
+    auto config = makeCPHybridConfig();
+    auto full_spec = std::dynamic_pointer_cast<MHAKVCacheSpec>(config.cache_specs[1]);
+    config.cache_specs = {full_spec, full_spec};
+    config.group_types = {CacheGroupType::FULL, CacheGroupType::SWA};
+    config.linear_group_num = 0;
+    config.full_group_num = 1;
+    config.swa_group_num = 1;
+    return config;
+}
+
+TEST_F(HybridKVCacheAllocatorCPShardTest, FullSwaNoGrowthUsesLocalAndGlobalLengthsForEveryRank) {
+    for (int rank = 0; rank < 4; ++rank) {
+        SCOPED_TRACE(::testing::Message() << "cp_rank=" << rank);
+        auto config = makeCPFullSwaConfig();
+        auto allocator = std::make_shared<HybridTypeKVCacheAllocator>(config, AllocationType::DEVICE);
+        allocator->setSharedBlockCache(std::make_shared<SharedBlockCache>());
+        ASSERT_TRUE(allocator->init());
+        auto mapper = std::make_shared<CPSlotMapper>(rank, 4, 4);
+        allocator->setCPSlotMapper(mapper);
+        auto resource = makeBatchRes(1, 2, 4, config.layer_to_group_id, {});
+        auto tokens = makeTokens(1, 17, 4);
+        tokens->setReserveStep(2);
+        MallocInfo info{resource, tokens};
+        info.enable_device_cache = false;
+        info.reuse_cache = false;
+        info.enable_remove_skipped_blocks = false;
+        ASSERT_TRUE(allocator->malloc(info).success);
+        EXPECT_EQ(resource->blocksNum(0, 0), mapper->localBlockCount(17) + 1);
+        EXPECT_EQ(resource->blocksNum(0, 1), 5);
+        const auto full_before = resource->blocks(0, 0);
+        const auto swa_before = resource->blocks(0, 1);
+        const auto free_before = allocator->freeBlocksNum();
+        const auto refs_before = allocator->requestRefBlocksNum();
+        info.incr_seq_len_override = 18;
+        for (int repeat = 0; repeat < 3; ++repeat) {
+            ASSERT_TRUE(allocator->malloc(info).success);
+            EXPECT_EQ(resource->blocks(0, 0), full_before);
+            EXPECT_EQ(resource->blocks(0, 1), swa_before);
+            EXPECT_EQ(allocator->freeBlocksNum(), free_before);
+            EXPECT_EQ(allocator->requestRefBlocksNum(), refs_before);
+        }
+        // Global SWA crosses a boundary on every rank; FULL grows only on rank1.
+        info.incr_seq_len_override = 21;
+        ASSERT_TRUE(allocator->malloc(info).success);
+        EXPECT_EQ(resource->blocksNum(0, 0), mapper->localBlockCount(21) + 1);
+        EXPECT_EQ(resource->blocksNum(0, 1), 6);
+        EXPECT_LT(allocator->freeBlocksNum(), free_before);
+    }
+}
+
+TEST_F(HybridKVCacheAllocatorCPShardTest, FullSwaNoGrowthPreservesZeroLocalFullGroups) {
+    for (int rank = 0; rank < 4; ++rank) {
+        SCOPED_TRACE(::testing::Message() << "cp_rank=" << rank);
+        auto config = makeCPFullSwaConfig();
+        auto allocator = std::make_shared<HybridTypeKVCacheAllocator>(config, AllocationType::DEVICE);
+        allocator->setSharedBlockCache(std::make_shared<SharedBlockCache>());
+        ASSERT_TRUE(allocator->init());
+        auto mapper = std::make_shared<CPSlotMapper>(rank, 4, 4);
+        allocator->setCPSlotMapper(mapper);
+        auto resource = makeBatchRes(1, 2, 4, config.layer_to_group_id, {});
+        auto tokens = makeTokens(1, 1, 4);
+        MallocInfo info{resource, tokens};
+        info.enable_device_cache = false;
+        info.reuse_cache = false;
+        info.enable_remove_skipped_blocks = false;
+        ASSERT_TRUE(allocator->malloc(info).success);
+        EXPECT_EQ(resource->blocksNum(0, 0), mapper->localBlockCount(1));
+        EXPECT_EQ(resource->blocksNum(0, 1), 1);
+        const auto full_before = resource->blocks(0, 0);
+        const auto swa_before = resource->blocks(0, 1);
+        const auto free_before = allocator->freeBlocksNum();
+        info.incr_seq_len_override = 2;
+        ASSERT_TRUE(allocator->malloc(info).success);
+        EXPECT_EQ(resource->blocks(0, 0), full_before);
+        EXPECT_EQ(resource->blocks(0, 1), swa_before);
+        EXPECT_EQ(allocator->freeBlocksNum(), free_before);
+    }
+}
+
 }  // namespace test
 }  // namespace rtp_llm
 

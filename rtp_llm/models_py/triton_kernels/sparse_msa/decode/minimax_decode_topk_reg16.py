@@ -81,14 +81,16 @@ def _msa_topk_reg16_kernel(
         )
         j = j.to(tl.int32)
         valid = v != NEG_INF            # nb < TOPK defensive (never here)
-        j = tl.where(valid, j, -1)
+        # Sort invalid slots after real IDs; -1 would sort first and cause
+        # the valid-prefix mask below to discard blocks on short sequences.
+        j = tl.where(valid, j, 2147483647)
         ids = tl.where(tl.arange(0, TOPK) == t, j, ids)
         s = tl.where(off == j, NEG_INF, s)
 
     # canonical id-ascending slot order (deterministic downstream consume)
     ids = tl.sort(ids, descending=False)
     mslot = tl.arange(0, TOPK) < tl.minimum(TOPK, nb)
-    ids = tl.where(mslot, ids, -1)
+    ids = tl.where(mslot & (ids != 2147483647), ids, -1)
 
     o_ptrs = (out_ptr + pid_h * stride_o_h + pid_b * stride_o_b
               + tl.arange(0, TOPK) * stride_o_t)

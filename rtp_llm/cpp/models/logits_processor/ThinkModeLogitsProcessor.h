@@ -118,6 +118,7 @@ public:
     void updateMultiSeqStatus(const std::vector<int>& src_batch_indices) override;
     void updateStatus(const torch::Tensor& new_tokens, int32_t num_new_tokens) override;
     bool isSpecVerifyEligible() const override;
+    bool tryGetStaticThinkMaskDescriptor(StaticThinkMaskDescriptor& descriptor) const override;
     int  tryAcceptAndFillBitmask(const SpecLogitsProcessorRequest& request) override;
     bool isStateful() const override;
     bool requiresTokenHistory() const override {

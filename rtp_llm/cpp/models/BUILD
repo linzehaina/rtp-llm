@@ -81,7 +81,10 @@ cc_library(
         "//rtp_llm/cpp/utils:error_code",
         "@havenask//aios/autil:json",
     ] + select({
-        "//:using_cuda": ["//rtp_llm/models_py/bindings/cuda/ops:standalone_ops"],
+        "//:using_cuda": [
+            "//rtp_llm/models_py/bindings/cuda/ops:standalone_ops",
+            "//rtp_llm/models_py/bindings/cuda/kernels:compact_spec_vocab_mask",
+        ],
         "//conditions:default": [],
     }),
     visibility = ["//visibility:public"],

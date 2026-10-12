@@ -9,6 +9,7 @@ from rtp_llm.model_loader.model_weight_info import ModelWeights
 from rtp_llm.models_py.distributed.collective_torch import Group, all_reduce
 from rtp_llm.models_py.model_desc.block_map import select_block_map_for_layer
 from rtp_llm.models_py.model_desc.module_base import GptModelBase
+from rtp_llm.models_py.modules.attention_output import DeferredMaskedAttentionOutput
 from rtp_llm.models_py.modules import (
     CausalAttention,
     DenseMLP,
@@ -787,6 +788,10 @@ class GenericMoeDecoderLayer(nn.Module):
         if self._join_cp_prefix_prefetch is not None:
             self._join_cp_prefix_prefetch()
 
+        valid_row_mask = None
+        if isinstance(hidden_states, DeferredMaskedAttentionOutput):
+            hidden_states, valid_row_mask = hidden_states
+
         # Dense/shared experts retain their original interface and row count.
         moe_kwargs = (
             {"prefill_chunk_plan": prefill_chunk_plan}
@@ -805,6 +810,7 @@ class GenericMoeDecoderLayer(nn.Module):
                 scale_ue8m0=_params.scale_ue8m0,
                 round_to_pow2=_params.round_to_pow2,
                 tma_packed_scales=_params.tma_packed_scales,
+                valid_row_mask=valid_row_mask,
             )
             hidden_states = self.mlp(
                 hidden_states, x_fp8=fp8_hs, x_scale=scale, **moe_kwargs
@@ -821,9 +827,14 @@ class GenericMoeDecoderLayer(nn.Module):
                 scale_ue8m0=_params.scale_ue8m0,
                 round_to_pow2=_params.round_to_pow2,
                 tma_packed_scales=_params.tma_packed_scales,
+                valid_row_mask=valid_row_mask,
             )
             hidden_states = self.mlp(bf16_hs, x_fp8=fp8_hs, x_scale=scale, **moe_kwargs)
         else:
+            if valid_row_mask is not None:
+                hidden_states = torch.where(
+                    valid_row_mask[:, None], hidden_states, torch.zeros_like(hidden_states)
+                )
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual
             )

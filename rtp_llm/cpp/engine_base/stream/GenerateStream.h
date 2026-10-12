@@ -22,6 +22,7 @@
 #include <mutex>
 #include <optional>
 #include <unordered_map>
+#include <vector>
 
 namespace rtp_llm {
 
@@ -553,6 +554,23 @@ public:
     // Per-stream CUDA state used to prepare the next MTP decode step while host
     // bookkeeping may still be in flight. It carries accept_len/tokens,
     // next_seq_len, propose_tokens; epoch guards stale clears in tests.
+    // Immutable publication for one DSpark round. Each publication owns fresh
+    // tensors; it is never overwritten by a later round or graph replay. Stream
+    // row references and the bookkeeping closure keep it alive independently.
+    struct MtpBatchDeviceState {
+        torch::Tensor accept_len_gpu;
+        torch::Tensor accept_tokens_gpu;
+        torch::Tensor next_seq_len_gpu;
+        torch::Tensor propose_tokens_gpu;
+        torch::Tensor last_hidden_states_gpu;
+        torch::Tensor draft_all_probs_gpu;
+        torch::Tensor dspark_anchor_gpu;
+        torch::Tensor dspark_committed_end_gpu;
+        std::vector<int64_t> stream_ids;
+        std::vector<uint64_t> stream_epochs;
+        std::shared_ptr<torch::Event> ready_event;
+    };
+
     struct MtpAsyncDeviceState {
         uint64_t      epoch = 0;
         torch::Tensor accept_len_gpu;
@@ -578,6 +596,8 @@ public:
         // chain as the next round's true length.
         // -1 = unset (first iter / cleared).
         int next_real_seq_len = -1;
+        std::shared_ptr<const MtpBatchDeviceState> batch_owner;
+        int64_t batch_row = -1;
     };
 
     uint64_t setMtpAsyncDeviceState(MtpAsyncDeviceState state) {
@@ -585,8 +605,30 @@ public:
         mtp_async_state_ = std::move(state);
         return mtp_async_state_.epoch;
     }
-    const MtpAsyncDeviceState& getMtpAsyncDeviceState() const {
+    // Batch consumers inspect only metadata, without constructing Tensor views.
+    const MtpAsyncDeviceState& getMtpAsyncDeviceStateMetadata() const {
         return mtp_async_state_;
+    }
+    // Preserve the legacy accessor's visible tensor fields. Returning a value
+    // materializes optional owner rows without mutable lazy caches; metadata-only
+    // scheduler/batch callers use the accessor above instead.
+    MtpAsyncDeviceState getMtpAsyncDeviceState() const {
+        return materializeMtpAsyncDeviceState();
+    }
+    MtpAsyncDeviceState materializeMtpAsyncDeviceState() const {
+        auto state = mtp_async_state_;
+        if (state.batch_owner) {
+            state.accept_len_gpu = getAcceptLenGpu();
+            state.accept_tokens_gpu = getAcceptTokensGpu();
+            state.next_seq_len_gpu = getNextSeqLenGpu();
+            state.propose_tokens_gpu = getProposeTokensGpu();
+            state.last_hidden_states_gpu = getLastHiddenStatesGpu();
+            state.draft_all_probs_gpu = getDraftAllProbsGpu();
+            state.dspark_anchor_gpu = mtpDeviceStateRow(state.dspark_anchor_gpu, &MtpBatchDeviceState::dspark_anchor_gpu);
+            state.dspark_committed_end_gpu =
+                mtpDeviceStateRow(state.dspark_committed_end_gpu, &MtpBatchDeviceState::dspark_committed_end_gpu);
+        }
+        return state;
     }
     bool clearMtpAsyncDeviceState(uint64_t epoch) {
         // Legacy/testing escape hatch. Active MTP decode paths should keep
@@ -610,23 +652,39 @@ public:
         state.propose_tokens_gpu = std::move(propose_tokens_gpu);
         setMtpAsyncDeviceState(std::move(state));
     }
-    const torch::Tensor& getAcceptLenGpu() const {
-        return mtp_async_state_.accept_len_gpu;
+    torch::Tensor getAcceptLenGpu() const {
+        return mtpDeviceStateRow(mtp_async_state_.accept_len_gpu, &MtpBatchDeviceState::accept_len_gpu);
     }
-    const torch::Tensor& getAcceptTokensGpu() const {
-        return mtp_async_state_.accept_tokens_gpu;
+    torch::Tensor getAcceptTokensGpu() const {
+        return mtpDeviceStateRow(mtp_async_state_.accept_tokens_gpu, &MtpBatchDeviceState::accept_tokens_gpu);
     }
-    const torch::Tensor& getNextSeqLenGpu() const {
-        return mtp_async_state_.next_seq_len_gpu;
+    torch::Tensor getNextSeqLenGpu() const {
+        return mtpDeviceStateRow(mtp_async_state_.next_seq_len_gpu, &MtpBatchDeviceState::next_seq_len_gpu);
     }
-    const torch::Tensor& getProposeTokensGpu() const {
-        return mtp_async_state_.propose_tokens_gpu;
+    torch::Tensor getProposeTokensGpu() const {
+        return mtpDeviceStateRow(mtp_async_state_.propose_tokens_gpu, &MtpBatchDeviceState::propose_tokens_gpu);
     }
-    const torch::Tensor& getLastHiddenStatesGpu() const {
-        return mtp_async_state_.last_hidden_states_gpu;
+    torch::Tensor getLastHiddenStatesGpu() const {
+        return mtpDeviceStateRow(mtp_async_state_.last_hidden_states_gpu, &MtpBatchDeviceState::last_hidden_states_gpu);
     }
-    const torch::Tensor& getDraftAllProbsGpu() const {
-        return mtp_async_state_.draft_all_probs_gpu;
+    torch::Tensor getDraftAllProbsGpu() const {
+        return mtpDeviceStateRow(mtp_async_state_.draft_all_probs_gpu, &MtpBatchDeviceState::draft_all_probs_gpu);
+    }
+    torch::Tensor mtpDeviceStateRow(const torch::Tensor& legacy,
+                                    torch::Tensor MtpBatchDeviceState::* field) const {
+        if (legacy.defined() || !mtp_async_state_.batch_owner) {
+            return legacy;
+        }
+        const auto& batch = *mtp_async_state_.batch_owner;
+        const auto& tensor = batch.*field;
+        if (!tensor.defined()) {
+            return {};
+        }
+        TORCH_CHECK(mtp_async_state_.batch_row >= 0 && mtp_async_state_.batch_row < tensor.size(0),
+                    "MTP batch state row is out of range");
+        // Materialize only for legacy/RPC or changed-cohort consumers. No
+        // mutation/cache: simultaneous readers do not race on lazy views.
+        return tensor.narrow(0, mtp_async_state_.batch_row, 1);
     }
     void clearSpecDecodeDeviceState() {
         // Unconditional legacy/testing escape hatch. Active MTP decode paths

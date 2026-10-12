@@ -65,6 +65,17 @@ cc_test(
 )
 
 cc_test(
+    name = "sampling_seed_offset_test",
+    srcs = ["SamplingSeedOffsetTest.cc"],
+    copts = copts(),
+    deps = test_deps + [
+        "//rtp_llm/models_py/bindings/core:exec_ops_hdr",
+        "//rtp_llm/models_py/bindings/cuda/kernels/sampling:sampling",
+    ] + cuda13_torch_link_deps,
+    exec_properties = {'gpu':'H20'},
+)
+
+cc_test(
     name = "beam_search_op_test",
     srcs = [
         "CudaBeamSearchOpTest.cc",
@@ -123,4 +134,29 @@ alias(
     name = "cuda_graph_copy_kernel_test",
     actual = "//rtp_llm/cpp/cuda_graph/tests:cuda_graph_copy_kernel_test",
     visibility = ["//visibility:public"],
+)
+
+cc_test(
+    name = "graph_table_overwrite_test",
+    srcs = ["GraphTableOverwriteTest.cc"],
+    copts = copts(),
+    deps = test_deps + [
+        "//rtp_llm/cpp/cuda_graph:cuda_graph_hdrs_lib",
+        "//rtp_llm/models_py/bindings/cuda/kernels:cuda_graph_prepare",
+        "//rtp_llm/models_py/bindings/common/kernels:fuse_copy_kernel",
+    ] + cuda13_torch_link_deps,
+    exec_properties = {"gpu": "H20"},
+)
+
+cc_test(
+    name = "commit_metadata_producer_test",
+    srcs = ["CommitMetadataProducerTest.cc"],
+    copts = copts(),
+    deps = test_deps + [
+        "//rtp_llm/models_py/bindings/cuda/kernels:commit_metadata_producer",
+        "//rtp_llm/models_py/bindings/cuda/kernels:attention_input_metadata",
+        "//rtp_llm/models_py/bindings/common/kernels:fuse_copy_kernel",
+        "//rtp_llm/cpp/cuda_graph:cuda_graph_hdrs_lib",
+    ] + cuda13_torch_link_deps,
+    exec_properties = {'gpu':'H20'},
 )

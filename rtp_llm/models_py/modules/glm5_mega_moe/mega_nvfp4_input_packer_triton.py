@@ -6,7 +6,7 @@ import os
 
 import torch
 
-_SMALL_VECTOR_TILES = {20: 8, 25: 8, 40: 16, 60: 16, 80: 16, 100: 16}
+_SMALL_VECTOR_TILES = {20: 8, 25: 8, 40: 16, 60: 16, 80: 16, 100: 16, 160: 16}
 
 
 def vector_packer_warmup_rows(
@@ -316,8 +316,8 @@ def fused_pack_mega_nvfp4_inputs(
     # Keep other small shapes and explicit overrides on their existing path.
     # Both variants write the same buffers; there is no additional workspace.
     # Compact DP8 verification uses 20/60/100 rows at B4/12/20 with
-    # a four-draft-token budget. Byte-exact Graph gates favor vector tiles
-    # here too; keep other shapes and explicit overrides unchanged.
+    # a four-draft-token budget; B32 uses 160 rows. Byte-exact Graph gates
+    # favor vector tiles here too; keep explicit overrides unchanged.
     small_vector_tile = _SMALL_VECTOR_TILES.get(tokens)
     vector_pack = (
         block_m_env is None

@@ -52,10 +52,16 @@ void AsyncRunner::sync(const torch::Stream& wait_stream) {
 }
 
 void AsyncRunner::streamWait(const torch::Stream& wait_stream) {
-    event_.block(wait_stream);
+    // block() before this task records event_ observes an older generation (or
+    // an unrecorded event). The host publication barrier and error propagation
+    // are required even when the caller only needs GPU stream ordering. sync()
+    // waits for enqueue completion and respects draining_; it does not wait for
+    // GPU completion.
+    sync(wait_stream);
 }
 
 std::exception_ptr AsyncRunner::joinAndDrain() {
+    RTP_LLM_PROFILE_SCOPE("async_runner.join_and_drain");
     if (std::this_thread::get_id() == thread_.get_id()) {
         throw std::logic_error("AsyncRunner cannot drain its own worker");
     }

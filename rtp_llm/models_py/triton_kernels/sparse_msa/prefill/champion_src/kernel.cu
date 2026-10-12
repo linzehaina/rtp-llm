@@ -14,9 +14,6 @@
 #include <cutlass/float8.h>
 #include <cutlass/arch/reg_reconfig.h>
 
-#ifndef MSA_TRACE
-#define MSA_TRACE 0
-#endif
 #ifndef MSA_DUAL
 #define MSA_DUAL 0
 #endif
@@ -96,7 +93,7 @@ struct Params {
     int64_t qn, qh, kp, vp, th, tq, tb, ksp, vsp;
     int pages, max_pages, max_q, batches;
     float alpha;
-    uint64_t* debug;
+    uint64_t* debug;  // Reserved ABI slot; no diagnostic writes.
     uint8_t *k8,*v8;
     const int32_t* rowlens;
     __nv_bfloat16* partial;
@@ -732,13 +729,12 @@ __device__ __forceinline__ void loader_sync() {
 
 template<bool SharedP=false>
 __device__ __forceinline__ void page_softmax(uint32_t score,uint32_t row_addr,int block,int limit,
-                                          int length,bool valid,float alpha,float& inv,float& lp,uint64_t* debug,uint64_t* half_ready,uint8_t* shared_p=nullptr,uint64_t* score_free=nullptr,uint64_t* half2_ready=nullptr) {
+                                          int length,bool valid,float alpha,float& inv,float& lp,uint64_t* half_ready,uint8_t* shared_p=nullptr,uint64_t* score_free=nullptr,uint64_t* half2_ready=nullptr) {
     float v[128],tile_max[4];
     #pragma unroll
     for(int c=0;c<128;c+=32) load32max(score+row_addr+c,v+c,tile_max[c/32]);
     cutlass::arch::fence_view_async_tmem_load();
     if(score_free&&threadIdx.x%128==0) cutlass::arch::ClusterBarrier::arrive(score_free);
-    if(debug&&threadIdx.x%128==0) debug[4]=clock64();
     const int last=valid?min(length-1,limit)-block*128:-1;
     float maximum;
     if(__all_sync(0xffffffff,last>=127)) {
@@ -758,7 +754,6 @@ __device__ __forceinline__ void page_softmax(uint32_t score,uint32_t row_addr,in
         maximum=max_native(max_native(max_native(maxima[0],maxima[1]),max_native(maxima[2],maxima[3])),
                            max_native(max_native(maxima[4],maxima[5]),max_native(maxima[6],maxima[7])));
     }
-    if(debug&&threadIdx.x%128==0) debug[5]=clock64();
     float shift=(maximum==-CUDART_INF_F?0.f:maximum)*(-alpha);
     if(half2_ready) {
         // 32-col early arrival: pack cols 0-31, signal, then cols 32-63.
@@ -820,7 +815,6 @@ __device__ __forceinline__ void page_softmax(uint32_t score,uint32_t row_addr,in
         v[c]=(c>=32&&c<96&&c%16>=12)?exp_emulated(v[c]):exp_native(v[c]);
         v[c+1]=(c>=32&&c<96&&c%16>=12)?exp_emulated(v[c+1]):exp_native(v[c+1]);
     }
-    if(debug&&threadIdx.x%128==0) debug[6]=clock64();
     float sums[8]={};
     #pragma unroll
     for(int j=0;j<16;++j) {
@@ -830,13 +824,11 @@ __device__ __forceinline__ void page_softmax(uint32_t score,uint32_t row_addr,in
     float den=((sums[0]+sums[2])+(sums[4]+sums[6]))+((sums[1]+sums[3])+(sums[5]+sums[7]));
     inv=rcp_native(den>0.f?den:1.f);
     lp=maximum==-CUDART_INF_F?-CUDART_INF_F:fmaf(maximum,alpha,log_native(den));
-    if(debug&&threadIdx.x%128==0) debug[7]=clock64();
     uint32_t packed[16];
     #pragma unroll
     for(int c=0;c<16;++c) {
         packed[c]=pack_probability(v[64+c*4],v[64+c*4+1],v[64+c*4+2],v[64+c*4+3]);
     }
-    if(debug&&threadIdx.x%128==0) debug[8]=clock64();
     if constexpr(SharedP) {
         #pragma unroll
         for(int c=0;c<16;c+=4) *reinterpret_cast<uint4*>(shared_p+Layout{}(cute::make_coord(threadIdx.x%128,64+c*4)))=*reinterpret_cast<uint4*>(packed+c);
@@ -845,7 +837,6 @@ __device__ __forceinline__ void page_softmax(uint32_t score,uint32_t row_addr,in
         store16(score+80+row_addr,packed);
         cutlass::arch::fence_view_async_tmem_store();
     }
-    if(debug&&threadIdx.x%128==0) debug[9]=clock64();
 }
 
 __global__ __launch_bounds__(512,1) void grouped_cutlass_pipeline(Params p) {
@@ -884,29 +875,24 @@ __global__ __launch_bounds__(512,1) void grouped_cutlass_pipeline(Params p) {
     cutlass::arch::fence_view_async_shared();
     __syncthreads();
     uint32_t t=s.tmem,row_addr=(warp*32)<<16;
-    uint64_t* debug=MSA_TRACE&&p.debug?p.debug+(int(blockIdx.y)*gridDim.x+blockIdx.x)*576+(MSA_DUAL?max(0,wg-1):wg)*192:nullptr;
     if(wg<(MSA_DUAL?2:1)) {
         cutlass::arch::warpgroup_reg_alloc<MSA_DUAL&&!MSA_DECODED?176:192>();
         int query=qbase+local/16,limit=query-start+length-(stop-start);
         for(int j=MSA_DUAL?wg:0;j<16;j+=MSA_DUAL?2:1) {
             int slot=j%2;
-            if(debug&&local==0) debug[j*12]=clock64();
             cutlass::arch::ClusterBarrier::wait(&s.s_ready[slot],(j/2)%2);
             after_sync();
-            if(debug&&local==0) debug[j*12+1]=clock64();
             int block=p.topk[head*p.th+int64_t(qbase)*p.tq+j];
             bool valid=block>=0&&block<p.max_pages&&block*128<length;
             int page=valid?p.table[batch*p.tb+block]:-1;
             valid=valid&&page>=0&&page<p.pages&&query<stop;
             float inv,lp;
-            page_softmax(t+slot*128,row_addr,block,limit,length,valid,p.alpha,inv,lp,debug?debug+j*12:nullptr,&s.p_half[slot]);
+            page_softmax(t+slot*128,row_addr,block,limit,length,valid,p.alpha,inv,lp,&s.p_half[slot]);
             if(j>=2) cutlass::arch::ClusterBarrier::wait(&s.stats_free[slot],((j/2)-1)%2);
             s.inv[slot][local]=inv;s.lp[slot][local]=lp;
-            if(debug&&local==0) debug[j*12+2]=clock64();
             before_sync();
             if(wg==0) wg_sync<1>(); else wg_sync<2>();
             if(local==0) cutlass::arch::ClusterBarrier::arrive(&s.p_ready[slot]);
-            if(debug&&local==0) debug[j*12+3]=clock64();
         }
     } else if(wg==(MSA_DUAL?2:1)) {
         cutlass::arch::warpgroup_reg_dealloc<MSA_DUAL?96:112>();
@@ -917,10 +903,8 @@ __global__ __launch_bounds__(512,1) void grouped_cutlass_pipeline(Params p) {
         float m=-CUDART_INF_F,z=0.f;
         for(int j=0;j<16;++j) {
             int slot=j%2;
-            if(debug&&local==0) debug[j*12]=clock64();
             cutlass::arch::ClusterBarrier::wait(&s.o_ready,j%2);
             after_sync();
-            if(debug&&local==0) debug[j*12+1]=clock64();
             float inv=s.inv[slot][local],lp=s.lp[slot][local];
             wg_sync<3>();
             if(local==0) cutlass::arch::ClusterBarrier::arrive(&s.stats_free[slot]);
@@ -937,10 +921,8 @@ __global__ __launch_bounds__(512,1) void grouped_cutlass_pipeline(Params p) {
             }
             cutlass::arch::fence_view_async_tmem_store();
             m=nm;z=z*a+b;
-            if(debug&&local==0) debug[j*12+2]=clock64();
             before_sync();wg_sync<3>();
             if(local==0) cutlass::arch::ClusterBarrier::arrive(&s.o_free);
-            if(debug&&local==0) debug[j*12+3]=clock64();
         }
         float inv=rcp_native(z>0.f?z:1.f);
         auto* output=reinterpret_cast<__nv_bfloat16*>(s.k);
@@ -965,9 +947,7 @@ __global__ __launch_bounds__(512,1) void grouped_cutlass_pipeline(Params p) {
         if(MSA_DUAL?local<96:wg==2) {
         for(int j=0;j<16;++j) {
             int slot=j%2;
-            if(debug&&local==0) debug[j*12]=clock64();
             if(j>=2) cutlass::arch::ClusterBarrier::wait(&s.kv_free[slot],((j/2)-1)%2);
-            if(debug&&local==0) debug[j*12+1]=clock64();
             int block=p.topk[head*p.th+int64_t(qbase)*p.tq+j];
             bool valid=block>=0&&block<p.max_pages&&block*128<length;
             int page=valid?p.table[batch*p.tb+block]:-1;
@@ -1014,7 +994,6 @@ __global__ __launch_bounds__(512,1) void grouped_cutlass_pipeline(Params p) {
                 *reinterpret_cast<uint4*>(s.v[slot]+VLayout{}(cute::make_coord(d,token)))=value;
             }
             }
-            if(debug&&local==0) debug[j*12+2]=clock64();
             cutlass::arch::fence_view_async_shared();loader_sync();
 #else
             if(MSA_DECODED||p.k8) {
@@ -1061,11 +1040,9 @@ __global__ __launch_bounds__(512,1) void grouped_cutlass_pipeline(Params p) {
                 *reinterpret_cast<uint4*>(s.v[slot]+VLayout{}(cute::make_coord(d,token)))=value;
             }
             }
-            if(debug&&local==0) debug[j*12+2]=clock64();
             cutlass::arch::fence_view_async_shared();wg_sync<4>();
 #endif
             if(local==0) cutlass::arch::ClusterBarrier::arrive(&s.kv_ready[slot]);
-            if(debug&&local==0) debug[j*12+3]=clock64();
         }
         } else if(MSA_DUAL||warp==0) {
             uint64_t dq=descriptor(s.q);
@@ -1141,8 +1118,6 @@ __global__ __launch_bounds__(512,1) void grouped_cutlass_pipeline(Params p) {
 #include "decode_m64.cuh"
 #include "decode_warp.cuh"
 #include "decode_pair.cuh"
-#include "m64_probe.cuh"
-#include "mma_probe.cuh"
 
 static int g_selfmark=0;
 static int g_coop=0;
@@ -1426,46 +1401,6 @@ extern "C" int msa_decode_m64_launch(const rtp_llm::Params* p, cudaStream_t stre
     auto err=cudaFuncSetAttribute(rtp_llm::grouped_cutlass_decode_m64,cudaFuncAttributeMaxDynamicSharedMemorySize,sizeof(rtp_llm::DecodeM64Shared));
     if(err!=cudaSuccess) return 100+int(err);
     rtp_llm::grouped_cutlass_decode_m64<<<dim3(p->max_q,4,4),256,sizeof(rtp_llm::DecodeM64Shared),stream>>>(*p);
-    return int(cudaGetLastError());
-}
-
-extern "C" int msa_m64_layout_probe(const uint8_t* q, const uint8_t* k, float* out, cudaStream_t stream) {
-    rtp_llm::m64_layout_probe<<<1,256,0,stream>>>(q,k,out);
-    return int(cudaGetLastError());
-}
-
-extern "C" int msa_warp_store_probe(float* out, cudaStream_t stream) {
-    rtp_llm::warp_store_probe<<<1,256,0,stream>>>(out);
-    return int(cudaGetLastError());
-}
-
-extern "C" int msa_warp_store_probe2(float* out, cudaStream_t stream) {
-    rtp_llm::warp_store_probe2<<<1,256,0,stream>>>(out);
-    return int(cudaGetLastError());
-}
-
-extern "C" int msa_n64_split_qk_probe(const uint8_t* q, const uint8_t* k, float* out, cudaStream_t stream) {
-    rtp_llm::n64_split_qk_probe<<<1,128,0,stream>>>(q,k,out);
-    return int(cudaGetLastError());
-}
-
-extern "C" int msa_m64_loadmap_probe(const uint8_t* q, const uint8_t* k, float* out, cudaStream_t stream) {
-    rtp_llm::m64_loadmap_probe<<<1,256,0,stream>>>(q,k,out);
-    return int(cudaGetLastError());
-}
-
-extern "C" int msa_pv_split_probe(const uint8_t* q, const uint8_t* v, float* out, cudaStream_t stream) {
-    rtp_llm::pv_split_probe<<<1,128,0,stream>>>(q,v,out);
-    return int(cudaGetLastError());
-}
-
-extern "C" int msa_mma_layout_probe(const uint8_t* a, const uint8_t* b, const float* c, float* d, cudaStream_t stream) {
-    rtp_llm::mma_layout_probe<<<1,32,0,stream>>>(a,b,c,d);
-    return int(cudaGetLastError());
-}
-
-extern "C" int msa_mma_kchain_probe(const uint8_t* a, const uint8_t* b, float* d, cudaStream_t stream) {
-    rtp_llm::mma_kchain_probe<<<1,32,0,stream>>>(a,b,d);
     return int(cudaGetLastError());
 }
 

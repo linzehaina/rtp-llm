@@ -24,11 +24,20 @@ struct SpecLogitsProcessorRequest {
     int64_t  base_output_len = 0;
 };
 
+// Immutable launch-time scalar view. The owner retains the exact acquired snapshot.
+struct StaticThinkMaskDescriptor {
+    int32_t first_begin_id = -1;
+    int32_t first_end_id = -1;
+    uint64_t snapshot_version = 0;
+    std::shared_ptr<const void> snapshot_owner;
+};
+
 class SpecLogitsProcessor {
 public:
     virtual ~SpecLogitsProcessor() = default;
 
     virtual bool isSpecVerifyEligible() const = 0;
+    virtual bool tryGetStaticThinkMaskDescriptor(StaticThinkMaskDescriptor&) const { return false; }
 
     // Pure wrt committed processor state. Implementations may use a local
     // copy/rollback, but the externally committed state must be unchanged.

@@ -41,20 +41,29 @@ SamplerOutput SpeculativeSampler::sampleDSparkDraft(const torch::Tensor& base_lo
                                                     const torch::Tensor& markov_w1,
                                                     const torch::Tensor& markov_w2,
                                                     size_t               draft_vocab_size,
-                                                    size_t               sampled_prefix_steps) const {
+                                                    size_t               sampled_prefix_steps,
+                                                    size_t               base_logit_steps) const {
     RTP_LLM_PROFILE_SCOPE("speculative_sampler.sample_dspark_draft");
     const size_t prefix_steps = sampled_prefix_steps == 0 ? propose_step_ : sampled_prefix_steps;
+    const size_t head_steps = base_logit_steps == 0 ? propose_step_ : base_logit_steps;
+    RTP_LLM_CHECK_WITH_INFO(prefix_steps <= head_steps && head_steps <= propose_step_,
+                            "DSpARK LM-head width must contain the sampled prefix and not exceed gamma");
+#if !USING_CUDA
+    RTP_LLM_CHECK_WITH_INFO(head_steps == propose_step_, "DSpARK non-CUDA LM head must retain all gamma rows");
+#endif
     RTP_LLM_CHECK_WITH_INFO(prefix_steps > 0 && prefix_steps <= propose_step_,
                             "DSpARK sampled prefix must be in [1,gamma]");
     RTP_LLM_CHECK_WITH_INFO(temperature.defined() && temperature.is_cuda() && temperature.is_contiguous()
                                 && temperature.scalar_type() == torch::kFloat32 && temperature.dim() == 1,
                             "DSpARK draft temperatures must be contiguous CUDA FP32 [B]");
     const auto batch_size = temperature.numel();
+    RTP_LLM_CHECK_WITH_INFO(batch_size > 0 || head_steps == propose_step_,
+                            "DSpARK empty batch requires the legacy full-width LM head");
     RTP_LLM_CHECK_WITH_INFO(base_logits.defined() && base_logits.is_cuda() && base_logits.is_contiguous()
                                 && base_logits.scalar_type() == torch::kFloat32 && base_logits.dim() == 2
-                                && base_logits.size(0) == batch_size * static_cast<int64_t>(propose_step_)
+                                && base_logits.size(0) == batch_size * static_cast<int64_t>(head_steps)
                                 && base_logits.size(1) >= static_cast<int64_t>(draft_vocab_size),
-                            "DSpARK C++ lm_head must emit contiguous CUDA FP32 [B*gamma,vocab_padded] logits with "
+                            "DSpARK C++ lm_head must emit contiguous CUDA FP32 [B*head_steps,vocab_padded] logits with "
                             "vocab_padded >= draft vocab size");
     RTP_LLM_CHECK_WITH_INFO(anchors.defined() && anchors.is_cuda() && anchors.numel() == batch_size,
                             "DSpARK anchors must be a CUDA tensor with one token per request");
@@ -65,7 +74,8 @@ SamplerOutput SpeculativeSampler::sampleDSparkDraft(const torch::Tensor& base_lo
                                 && markov_w2.size(1) == markov_w1.size(1),
                             "DSpARK markov_w2 must be CUDA [draft_vocab, rank]");
 
-    // The backbone and LM head still produce all gamma rows. Only CUDA's
+    // The backbone retains all gamma query rows; the LM head may emit only
+    // the sampled prefix. Only CUDA's
     // FlashInfer path has a known per-call RNG reservation contract. Keep the
     // full legacy loop for HIP and empty batches, then select the prefix.
     size_t sampling_steps = propose_step_;
@@ -82,7 +92,7 @@ SamplerOutput SpeculativeSampler::sampleDSparkDraft(const torch::Tensor& base_lo
     token_columns.reserve(sampling_steps);
     auto proposal_logits =
         base_logits.narrow(1, 0, draft_vocab_size)
-            .view({batch_size, static_cast<int64_t>(propose_step_), static_cast<int64_t>(draft_vocab_size)});
+            .view({batch_size, static_cast<int64_t>(head_steps), static_cast<int64_t>(draft_vocab_size)});
 
     // Private per invocation: no cross-stream scratch or capture-bucket cache.
     // Cached Blackwell softmax needs no workspace; fallback reuses this buffer.
@@ -286,15 +296,17 @@ void SpeculativeSampler::batchSample(SpeculativeSamplerOutput&           sample_
             std::any_of(streams.begin(), streams.end(), [](const auto& stream) { return stream->forceSpAccept(); });
         if (has_force) {
             RTP_LLM_PROFILE_SCOPE("speculative_sampler.batchSample.post_rejection_sampling.forceSpAccept");
-            auto force_mask =
-                torch::zeros({(long)batch_size}, torch::TensorOptions().dtype(torch::kBool).device(target_device));
-            int idx = 0;
+            // Fill the request flags on the host and upload once. GPU scalar
+            // indexing here used to issue one fill kernel per forced request.
+            // Torch's pinned caching allocator records the async copy lifetime.
+            auto force_mask_cpu = torch::empty(
+                {(long)batch_size}, torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU).pinned_memory(target_device.is_cuda()));
+            auto* flags = force_mask_cpu.data_ptr<bool>();
+            int64_t idx = 0;
             for (const auto& stream : streams) {
-                if (stream->forceSpAccept()) {
-                    force_mask[idx] = true;
-                }
-                idx++;
+                flags[idx++] = stream->forceSpAccept();
             }
+            auto force_mask = force_mask_cpu.to(target_device, /*non_blocking=*/target_device.is_cuda());
             // target_token_ids_d_t layout: [batch_size * (propose_step+1), token_stride]
             // Extract the bonus token at position propose_step for each batch item.
             int64_t token_stride = target_token_ids_d_t.size(1);

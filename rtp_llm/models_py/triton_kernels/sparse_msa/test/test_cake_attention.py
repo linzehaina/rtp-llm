@@ -50,7 +50,7 @@ class CakeSourceContractTest(unittest.TestCase):
         for forbidden in ("torch.unique", ".item()", ".cpu()", "nan_to_num",
                           "masked_fill_", "convert_rtp_scales"):
             self.assertNotIn(forbidden, text)
-        self.assertIn("ws.scales.seen.zero_()", text)
+        self.assertNotIn("ws.scales.seen.zero_()", text)
         self.assertIn("tl.atomic_max", text)
         self.assertNotIn("tl.atomic_cas", text)
         self.assertIn("owner == selection.to(tl.int64) + 1", text)
@@ -102,6 +102,59 @@ class CakeMetadataGpuTest(unittest.TestCase):
         import torch
         from rtp_llm.models_py.triton_kernels.sparse_msa.decode import cake_attention
         self.torch, self.adapter = torch, cake_attention
+
+    def test_selected_election_reset_replay_with_shared_pages(self):
+        torch, adapter = self.torch, self.adapter
+        rows, cols, pages = 3, 2, 5
+        q = torch.zeros((rows, 64, 128), device="cuda", dtype=torch.bfloat16)
+        table = torch.tensor([[0, 1]] * rows, device="cuda", dtype=torch.int32)
+        topk = torch.full((4, rows, 16), -1, device="cuda", dtype=torch.int32)
+        topk[:, :, :2] = torch.tensor([1, 0], device="cuda", dtype=torch.int32)
+        lens = torch.tensor([3, 200, 0], device="cuda", dtype=torch.int32)
+        mask = torch.tensor([True, True, False], device="cuda")
+        ko, to, lo = torch.empty_like(topk), torch.empty_like(table), torch.empty_like(lens)
+        sentinel = (127 << 32) | 999
+        seen = torch.full((pages, 4), sentinel, device="cuda", dtype=torch.int64)
+        source = torch.arange(pages * 4096, device="cuda").remainder(256).to(torch.uint8)
+        source = source.reshape(pages, 4096)
+        sparse = adapter.CakeScaleWorkspace.create(q.device, pages)
+        dense = adapter.CakeScaleWorkspace.create(q.device, pages)
+
+        def run():
+            adapter._prepare_metadata[(rows, 4)](
+                q, topk, table, lens, mask, q, ko, to, lo,
+                q.stride(0), q.stride(1), table.stride(0), table.stride(1),
+                topk.stride(0), topk.stride(1), topk.stride(2), lens.stride(0), mask.stride(0),
+                ROWS=rows, COLS=cols, PHYSICAL=pages, HAS_MASK=True,
+                COPY_Q=False, BLOCK=cols, SEEN=seen, CLEAR_ELECTION=True, num_warps=4)
+            dense.seen.zero_()
+            for election in (seen, dense.seen):
+                adapter._selected_valid_prefix[(rows, 4)](
+                    ko, to, lo, election, ROWS=rows, COLS=cols, num_warps=4)
+            for scratch, election in ((sparse, seen), (dense, dense.seen)):
+                adapter._refresh_selected_scales[(rows * 16, 4)](
+                    ko, to, election, source, source, scratch.k, scratch.v,
+                    source.stride(0), source.stride(0), ROWS=rows, COLS=cols,
+                    MMA=True, num_warps=4)
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            run()
+        torch.cuda.current_stream().wait_stream(stream)
+        for visible in (True, False, True):
+            mask[1] = visible
+            sparse.k.fill_(0xa5)
+            sparse.v.fill_(0xa5)
+            dense.k.fill_(0xa5)
+            dense.v.fill_(0xa5)
+            graph.replay()
+            self.assertTrue(torch.equal(sparse.k, dense.k))
+            self.assertTrue(torch.equal(sparse.v, dense.v))
+            expected = (128 << 32) | 17 if visible else (3 << 32) | 1
+            self.assertTrue(torch.all(seen[0] == expected))
+            self.assertTrue(torch.all(seen[2:] == 0))
 
     def test_duplicate_cta_immutable_owner_graph_layers(self):
         torch, adapter = self.torch, self.adapter

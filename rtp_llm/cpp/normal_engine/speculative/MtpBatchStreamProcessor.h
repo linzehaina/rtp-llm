@@ -97,6 +97,9 @@ public:
         torch::Tensor position_bases;
     };
 
+    static std::shared_ptr<const GenerateStream::MtpBatchDeviceState>
+    dsparkBatchDeviceState(const std::list<GenerateStreamPtr>& streams);
+
     DSparkRoundState buildDSparkRoundState(const StreamGroups&   stream_groups,
                                            const GptModelInputs& model_input,
                                            TensorHolder&         host_holder) const;

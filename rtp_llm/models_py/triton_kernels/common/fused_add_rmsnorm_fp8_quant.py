@@ -72,6 +72,7 @@ def _ue8m0_pow2_round(s_init):
 @triton.jit
 def _fused_add_rmsnorm_fp8_quant_singlepass_kernel(
     hidden_ptr,
+    row_mask_ptr,
     residual_ptr,
     weight_ptr,
     fp8_out_ptr,
@@ -90,6 +91,7 @@ def _fused_add_rmsnorm_fp8_quant_singlepass_kernel(
     SCALE_UE8M0: tl.constexpr,
     ROUND_POW2: tl.constexpr = False,
     TMA_PACKED_SCALES: tl.constexpr = False,
+    HAS_ROW_MASK: tl.constexpr = False,
 ):
     """Single-pass: load whole row → r_new in registers → reuse for normalize+quant.
 
@@ -99,7 +101,10 @@ def _fused_add_rmsnorm_fp8_quant_singlepass_kernel(
     offs = tl.arange(0, BLOCK_N)
     mask = offs < H
 
-    h = tl.load(hidden_ptr + token_id * stride_h_t + offs, mask=mask, other=0.0).to(
+    row_valid = True
+    if HAS_ROW_MASK:
+        row_valid = tl.load(row_mask_ptr + token_id)
+    h = tl.load(hidden_ptr + token_id * stride_h_t + offs, mask=mask & row_valid, other=0.0).to(
         tl.float32
     )
     r = tl.load(residual_ptr + token_id * stride_r_t + offs, mask=mask, other=0.0).to(
@@ -207,6 +212,7 @@ def _fused_add_rmsnorm_fp8_quant_singlepass_kernel(
 @triton.jit
 def _fused_add_rmsnorm_fp8_quant_dual_output_singlepass_kernel(
     hidden_ptr,
+    row_mask_ptr,
     residual_ptr,
     weight_ptr,
     bf16_out_ptr,
@@ -227,6 +233,7 @@ def _fused_add_rmsnorm_fp8_quant_dual_output_singlepass_kernel(
     SCALE_UE8M0: tl.constexpr,
     ROUND_POW2: tl.constexpr = False,
     TMA_PACKED_SCALES: tl.constexpr = False,
+    HAS_ROW_MASK: tl.constexpr = False,
 ):
     """Single-pass dual-output: also stores bf16 normed alongside fp8.
 
@@ -236,7 +243,10 @@ def _fused_add_rmsnorm_fp8_quant_dual_output_singlepass_kernel(
     offs = tl.arange(0, BLOCK_N)
     mask = offs < H
 
-    h = tl.load(hidden_ptr + token_id * stride_h_t + offs, mask=mask, other=0.0).to(
+    row_valid = True
+    if HAS_ROW_MASK:
+        row_valid = tl.load(row_mask_ptr + token_id)
+    h = tl.load(hidden_ptr + token_id * stride_h_t + offs, mask=mask & row_valid, other=0.0).to(
         tl.float32
     )
     r = tl.load(residual_ptr + token_id * stride_r_t + offs, mask=mask, other=0.0).to(
@@ -428,6 +438,7 @@ def fused_add_rmsnorm_fp8_quant_with_bf16_output(
     scale_ue8m0: bool = False,
     round_to_pow2: bool = False,
     tma_packed_scales: bool = False,
+    valid_row_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Same as ``fused_add_rmsnorm_fp8_quant`` but also returns bf16 normed.
 
@@ -442,12 +453,17 @@ def fused_add_rmsnorm_fp8_quant_with_bf16_output(
     assert residual.shape == hidden_states.shape
     assert weight.dim() == 1 and weight.shape[0] == hidden_states.shape[1]
     T, H = hidden_states.shape
+    if valid_row_mask is not None:
+        if valid_row_mask.dtype != torch.bool or valid_row_mask.shape != (T,) or valid_row_mask.device != hidden_states.device or not valid_row_mask.is_contiguous():
+            raise ValueError("valid_row_mask must be contiguous bool[T] on the hidden-state device")
     assert H % group_size == 0
     if scale_ue8m0:
         assert (H // group_size) % 4 == 0, "UE8M0 requires num_groups divisible by 4"
 
     block_n = triton.next_power_of_2(H)
     if block_n > MAX_INREG_H:
+        if valid_row_mask is not None:
+            hidden_states = torch.where(valid_row_mask[:, None], hidden_states, torch.zeros_like(hidden_states))
         return _baseline_add_rmsnorm_fp8_quant_with_bf16_output(
             hidden_states,
             residual,
@@ -499,6 +515,7 @@ def fused_add_rmsnorm_fp8_quant_with_bf16_output(
 
     _fused_add_rmsnorm_fp8_quant_dual_output_singlepass_kernel[grid](
         hidden_states,
+        valid_row_mask if valid_row_mask is not None else hidden_states,
         residual,
         weight,
         bf16_out,
@@ -519,6 +536,7 @@ def fused_add_rmsnorm_fp8_quant_with_bf16_output(
         SCALE_UE8M0=scale_ue8m0,
         ROUND_POW2=round_to_pow2 and not scale_ue8m0,
         TMA_PACKED_SCALES=direct_tma,
+        HAS_ROW_MASK=valid_row_mask is not None,
         num_warps=_select_num_warps(H),
     )
     return bf16_out, fp8_out, scale_out
@@ -533,6 +551,7 @@ def fused_add_rmsnorm_fp8_quant(
     scale_ue8m0: bool = False,
     round_to_pow2: bool = False,
     tma_packed_scales: bool = False,
+    valid_row_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused add-residual + RMSNorm + per-token-group FP8 quant.
 
@@ -550,12 +569,17 @@ def fused_add_rmsnorm_fp8_quant(
     assert residual.shape == hidden_states.shape
     assert weight.dim() == 1 and weight.shape[0] == hidden_states.shape[1]
     T, H = hidden_states.shape
+    if valid_row_mask is not None:
+        if valid_row_mask.dtype != torch.bool or valid_row_mask.shape != (T,) or valid_row_mask.device != hidden_states.device or not valid_row_mask.is_contiguous():
+            raise ValueError("valid_row_mask must be contiguous bool[T] on the hidden-state device")
     assert H % group_size == 0
     if scale_ue8m0:
         assert (H // group_size) % 4 == 0, "UE8M0 requires num_groups divisible by 4"
 
     block_n = triton.next_power_of_2(H)
     if block_n > MAX_INREG_H:
+        if valid_row_mask is not None:
+            hidden_states = torch.where(valid_row_mask[:, None], hidden_states, torch.zeros_like(hidden_states))
         return _baseline_add_rmsnorm_fp8_quant(
             hidden_states,
             residual,
@@ -606,6 +630,7 @@ def fused_add_rmsnorm_fp8_quant(
 
     _fused_add_rmsnorm_fp8_quant_singlepass_kernel[grid](
         hidden_states,
+        valid_row_mask if valid_row_mask is not None else hidden_states,
         residual,
         weight,
         fp8_out,
@@ -624,6 +649,7 @@ def fused_add_rmsnorm_fp8_quant(
         SCALE_UE8M0=scale_ue8m0,
         ROUND_POW2=round_to_pow2 and not scale_ue8m0,
         TMA_PACKED_SCALES=direct_tma,
+        HAS_ROW_MASK=valid_row_mask is not None,
         num_warps=_select_num_warps(H),
     )
     return fp8_out, scale_out

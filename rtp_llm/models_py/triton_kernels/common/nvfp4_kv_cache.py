@@ -831,6 +831,144 @@ def _quantize_main_index_rows_d128_kernel(
         )
 
 
+# Separate Decode-only candidate. Existing Prefill/CP writers remain unchanged.
+@triton.jit(do_not_specialize=["N", "NUM_BLOCKS", "COLS", "TABLE_S0"])
+def _quantize_decode_main_index_rows_d128_kernel(
+    k_ptr, v_ptr, idx_ptr, lens_ptr, table_ptr,
+    k_packed_ptr, k_scales_ptr, v_packed_ptr, v_scales_ptr,
+    idx_packed_ptr, idx_scales_ptr,
+    N, COLS,
+    LENS_S: tl.constexpr, TABLE_S0, TABLE_S1: tl.constexpr,
+    K_S0: tl.constexpr, K_S1: tl.constexpr, K_S2: tl.constexpr,
+    V_S0: tl.constexpr, V_S1: tl.constexpr, V_S2: tl.constexpr,
+    IDX_S0: tl.constexpr, IDX_S2: tl.constexpr,
+    MAIN_PACKED_S0: tl.constexpr, MAIN_SCALE_S0: tl.constexpr,
+    IDX_PACKED_S0: tl.constexpr, IDX_SCALE_S0: tl.constexpr,
+    NUM_BLOCKS, NUM_HEADS: tl.constexpr, PAGE_SIZE: tl.constexpr,
+    MMA_SCALE_LAYOUT: tl.constexpr,
+):
+    """Original d128 quantization/stores with token-row slot lookup in each CTA.
+
+    No source-row/CP remapping or dual working/persistent destination exists
+    in this explicit Decode entry. Invalid addressing suppresses input loads
+    and all six destination planes exactly as the slots-based writer does.
+    """
+    row = tl.program_id(0).to(tl.int64)
+    plane = tl.program_id(1)
+    is_k = plane < NUM_HEADS
+    is_v = (plane >= NUM_HEADS) & (plane < 2 * NUM_HEADS)
+    is_idx = plane == 2 * NUM_HEADS
+    head = tl.where(is_k, plane, tl.where(is_v, plane - NUM_HEADS, 0))
+
+    valid_row = row < N
+    source_row = row
+    if COLS == 0:
+        slot = tl.full((), -1, tl.int64)
+    else:
+        # Preserve the standalone mapper's int64 arithmetic before subtraction
+        # and page multiplication, including INT32_MIN / INT32_MAX inputs.
+        pos = tl.load(lens_ptr + row * LENS_S, mask=valid_row, other=0).to(tl.int64) - 1
+        col = tl.maximum(pos, 0) // PAGE_SIZE
+        address_valid = valid_row & (pos >= 0) & (col < COLS)
+        page = tl.load(
+            table_ptr + row * TABLE_S0 + col * TABLE_S1,
+            mask=address_valid,
+            other=0,
+        ).to(tl.int64)
+        slot = tl.where(address_valid & (page > 0), page * PAGE_SIZE + pos % PAGE_SIZE, -1)
+    valid_slot = valid_row & (slot >= 0) & (slot < NUM_BLOCKS * PAGE_SIZE)
+    input_valid = valid_slot
+    block = slot // PAGE_SIZE
+    page_offset = slot - block * PAGE_SIZE
+    pair = tl.arange(0, 8)[None, :]
+    groups = tl.arange(0, 8)
+    group = groups[:, None]
+    element = group * 16 + 2 * pair
+    main_even_offset = source_row * K_S0 + head * K_S1 + element * K_S2
+    main_odd_offset = main_even_offset + K_S2
+    v_even_offset = source_row * V_S0 + head * V_S1 + element * V_S2
+    v_odd_offset = v_even_offset + V_S2
+    idx_even_offset = source_row * IDX_S0 + element * IDX_S2
+    idx_odd_offset = idx_even_offset + IDX_S2
+
+    k_even = tl.load(k_ptr + main_even_offset, mask=input_valid & is_k, other=0.0)
+    k_odd = tl.load(k_ptr + main_odd_offset, mask=input_valid & is_k, other=0.0)
+    v_even = tl.load(v_ptr + v_even_offset, mask=input_valid & is_v, other=0.0)
+    v_odd = tl.load(v_ptr + v_odd_offset, mask=input_valid & is_v, other=0.0)
+    idx_even = tl.load(idx_ptr + idx_even_offset, mask=input_valid & is_idx, other=0.0)
+    idx_odd = tl.load(idx_ptr + idx_odd_offset, mask=input_valid & is_idx, other=0.0)
+    even_values = tl.where(is_k, k_even, tl.where(is_v, v_even, idx_even)).to(
+        tl.float32
+    )
+    odd_values = tl.where(is_k, k_odd, tl.where(is_v, v_odd, idx_odd)).to(tl.float32)
+    amax = tl.max(tl.maximum(tl.abs(even_values), tl.abs(odd_values)), axis=1)
+    raw_scale = tl.minimum(
+        tl.maximum(amax / _TL_E2M1_MAX, _TL_SCALE_MIN), _TL_SCALE_MAX
+    )
+    stored_scale = raw_scale.to(tl.float8e4nv)
+    scale = stored_scale.to(tl.float32)[:, None]
+    packed_codes = _e2m1_encode(even_values, scale) | (
+        _e2m1_encode(odd_values, scale) << 4
+    )
+
+    main_packed_offset = (
+        block * MAIN_PACKED_S0
+        + (head * PAGE_SIZE + page_offset) * 64
+        + group * 8
+        + pair
+    )
+    if MMA_SCALE_LAYOUT:
+        main_scale_offset = (
+            block * MAIN_SCALE_S0
+            + head * PAGE_SIZE * 8
+            + _scale_128x4_offset(page_offset, groups)
+        )
+    else:
+        main_scale_offset = (
+            block * MAIN_SCALE_S0 + (head * PAGE_SIZE + page_offset) * 8 + groups
+        )
+    v_scale_offset = main_scale_offset
+    idx_packed_offset = block * IDX_PACKED_S0 + page_offset * 64 + group * 8 + pair
+    if MMA_SCALE_LAYOUT:
+        idx_scale_offset = block * IDX_SCALE_S0 + _scale_128x4_offset(
+            page_offset, groups
+        )
+    else:
+        idx_scale_offset = block * IDX_SCALE_S0 + page_offset * 8 + groups
+
+    tl.store(
+        k_packed_ptr + main_packed_offset,
+        packed_codes,
+        mask=valid_slot & is_k,
+    )
+    tl.store(
+        k_scales_ptr + main_scale_offset,
+        stored_scale,
+        mask=valid_slot & is_k,
+    )
+    tl.store(
+        v_packed_ptr + main_packed_offset,
+        packed_codes,
+        mask=valid_slot & is_v,
+    )
+    tl.store(
+        v_scales_ptr + v_scale_offset,
+        stored_scale,
+        mask=valid_slot & is_v,
+    )
+    tl.store(
+        idx_packed_ptr + idx_packed_offset,
+        packed_codes,
+        mask=valid_slot & is_idx,
+    )
+    tl.store(
+        idx_scales_ptr + idx_scale_offset,
+        stored_scale,
+        mask=valid_slot & is_idx,
+    )
+
+
+
 # Counts/capacities only bound accesses; reuse the binary across Prefill shapes.
 @triton.jit(do_not_specialize=["N", "NUM_BLOCKS", "PERSIST_NUM_BLOCKS"])
 def _quantize_main_index_rows_d128_multirow_kernel(
@@ -1732,6 +1870,127 @@ def quantize_query_rows_mma(
         HEAD_DIM=dim,
         GROUPS=groups,
         num_warps=1,
+    )
+
+
+def quantize_decode_main_index_rows(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    index_k: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    layout: NVFP4CacheLayout,
+    *,
+    mma_scale_layout: bool = False,
+) -> None:
+    """Candidate Decode writer taking token-row lengths and physical page IDs.
+
+    Addressing equals ``build_decode_physical_slots`` followed by
+    ``quantize_main_index_rows``: pos=lens-1, page IDs must be strictly positive,
+    and the writer bounds the resulting int64 slot by the physical pool.
+    Only CUDA int32 addressing with d128 Main/Indexer and page128 is fused.
+    Generic dimensions and int64 metadata retain the original two-launch path.
+    The paged Decode caller selects this entry only when logical and physical
+    page sizes match. Token rows must address distinct destination slots, as
+    for the existing writer.
+    """
+    if seq_lens.ndim != 1 or block_table.ndim != 2:
+        raise ValueError("expected lens[N] and table[N,C]")
+    if k.ndim == 0 or block_table.shape[0] != seq_lens.numel() or k.shape[0] != seq_lens.numel():
+        raise ValueError("token dimensions must match")
+    if seq_lens.dtype not in (torch.int32, torch.int64) or block_table.dtype not in (
+        torch.int32, torch.int64,
+    ):
+        raise ValueError("lens/table must be int32 or int64")
+    if not seq_lens.is_cuda or seq_lens.device != block_table.device:
+        raise ValueError("lens/table must use the same CUDA device")
+    if not isinstance(layout.page_size, int) or layout.page_size <= 0:
+        raise ValueError("page_size must be a positive integer")
+    fused = (
+        seq_lens.dtype == torch.int32 and block_table.dtype == torch.int32
+        and k.ndim == 3 and k.shape[-1] == 128
+        and index_k.ndim in (2, 3) and index_k.shape[-1] == 128
+        and layout.page_size == 128
+        # Keep unknown integer capacity arithmetic on the existing path.
+        and 0 <= layout.num_blocks <= (2**31 - 1) // layout.page_size
+        and block_table.shape[1] <= 2**31 - 1
+    )
+    if not fused:
+        slots = build_decode_physical_slots(seq_lens, block_table, layout.page_size)
+        quantize_main_index_rows(k, v, index_k, slots, layout, mma_scale_layout=mma_scale_layout)
+        return
+    if tuple(k.shape) != tuple(v.shape) or k.dim() != 3:
+        raise ValueError(
+            f"NVFP4 fused K/V need matching [token,head,dim] tensors, got "
+            f"{tuple(k.shape)} and {tuple(v.shape)}"
+        )
+    rows, heads, head_dim = map(int, k.shape)
+    if (
+        k.dtype != torch.bfloat16
+        or v.dtype != torch.bfloat16
+        or index_k.dtype != torch.bfloat16
+    ):
+        raise ValueError("NVFP4 fused writer inputs must use BF16")
+    if heads != layout.num_heads or head_dim != layout.head_dim:
+        raise ValueError(
+            "NVFP4 fused K/V shape does not match cache layout: "
+            f"tensor heads/dim={heads}/{head_dim}, "
+            f"layout={layout.num_heads}/{layout.head_dim}"
+        )
+    if index_k.dim() == 2:
+        index_k = index_k[:, None, :]
+    if index_k.dim() != 3 or int(index_k.shape[0]) != rows:
+        raise ValueError(
+            "NVFP4 fused Indexer-K must be [token,dim] or [token,1,dim], "
+            f"got {tuple(index_k.shape)}"
+        )
+    if int(index_k.shape[1]) != 1:
+        raise ValueError(
+            "NVFP4 cache layout stores one shared Indexer-K row per token, "
+            f"got {index_k.shape[1]} heads"
+        )
+    index_dim = int(index_k.shape[2])
+    _validate_grouped_dim(index_dim, "NVFP4 fused indexer")
+    if mma_scale_layout and (
+        layout.page_size != 128
+        or (head_dim // NVFP4_GROUP_SIZE) % 4 != 0
+        or (index_dim // NVFP4_GROUP_SIZE) % 4 != 0
+    ):
+        raise ValueError(
+            "NVFP4 MMA scale layout requires page_size=128 and scale-group "
+            "counts divisible by 4"
+        )
+    if rows == 0:
+        return
+    # The kernels consume explicit input strides. This intentionally accepts
+    # K/V/index-K column views of one fused projection buffer so Decode does
+    # not copy the same suffix into three temporary contiguous tensors.
+    if any(int(tensor.stride(-1)) != 1 for tensor in (k, v, index_k)):
+        raise ValueError("NVFP4 fused writer inputs require unit inner stride")
+
+    cache_tensors = (layout.packed_main, layout.side_bytes)
+    if not k.is_cuda or any(
+        tensor.device != k.device
+        for tensor in (v, index_k, seq_lens, block_table, *cache_tensors)
+    ):
+        raise ValueError("NVFP4 fused writer tensors must share one CUDA device")
+
+    k_packed, k_scales = layout.main_plane(0)
+    v_packed, v_scales = layout.main_plane(1)
+    idx_packed, idx_scales = layout.indexer(128)
+    _quantize_decode_main_index_rows_d128_kernel[(rows, 2 * heads + 1)](
+        k, v, index_k, seq_lens, block_table,
+        k_packed, k_scales, v_packed, v_scales, idx_packed, idx_scales,
+        rows, block_table.shape[1],
+        LENS_S=int(seq_lens.stride(0)), TABLE_S0=int(block_table.stride(0)),
+        TABLE_S1=int(block_table.stride(1)),
+        K_S0=int(k.stride(0)), K_S1=int(k.stride(1)), K_S2=int(k.stride(2)),
+        V_S0=int(v.stride(0)), V_S1=int(v.stride(1)), V_S2=int(v.stride(2)),
+        IDX_S0=int(index_k.stride(0)), IDX_S2=int(index_k.stride(2)),
+        MAIN_PACKED_S0=int(k_packed.stride(0)), MAIN_SCALE_S0=int(k_scales.stride(0)),
+        IDX_PACKED_S0=int(idx_packed.stride(0)), IDX_SCALE_S0=int(idx_scales.stride(0)),
+        NUM_BLOCKS=layout.num_blocks, NUM_HEADS=heads, PAGE_SIZE=layout.page_size,
+        MMA_SCALE_LAYOUT=mma_scale_layout, num_warps=1,
     )
 
 

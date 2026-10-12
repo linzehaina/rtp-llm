@@ -299,6 +299,20 @@ class MiniMaxM3DetectorTest(TestCase):
 
 
 class MiniMaxM3ReasoningParserTest(TestCase):
+    def test_disabled_thinking_without_generated_marker_is_content(self):
+        parser = ReasoningParser(model_type="minimax_m3", force_reasoning=False)
+        self.assertEqual(parser.parse_non_stream("The answer is 4."), ("", "The answer is 4."))
+
+    def test_enabled_prompt_without_generated_opening_marker_is_reasoning(self):
+        parser = ReasoningParser(model_type="minimax_m3", force_reasoning=True)
+        self.assertEqual(parser.parse_non_stream("Still working."), ("Still working.", ""))
+
+    def test_disabled_thinking_stream_without_marker_is_content(self):
+        parser = ReasoningParser(model_type="minimax_m3", force_reasoning=False)
+        chunks = [parser.parse_stream_chunk(s) for s in ("The ", "answer is ", "4.")]
+        self.assertEqual("".join(x[0] for x in chunks), "")
+        self.assertEqual("".join(x[1] for x in chunks), "The answer is 4.")
+
     def test_non_stream_split(self):
         parser = ReasoningParser(model_type="minimax_m3")
 
@@ -424,8 +438,30 @@ class MiniMaxM3RendererTest(TestCase):
         self.assertNotIn(NS_TOKEN, self.renderer.extra_stop_words)
         self.assertNotIn("<mm:think>", self.renderer.extra_stop_words)
 
+    def test_non_stream_token_chunks_keep_reasoning_close_state(self):
+        request = ChatCompletionRequest(
+            messages=[], chat_template_kwargs={"thinking_mode": "enabled"}
+        )
+        parser = self.renderer._create_reasoning_parser(request)
+        chunks = ["We", "</mm:think>", r"\(", r"\boxed{4}", r"\)"]
+        parsed = [self.renderer._extract_reasoning_content(parser, c, False) for c in chunks]
+        self.assertEqual("".join(r for r, _ in parsed), "We")
+        self.assertEqual("".join(c for _, c in parsed), r"\(\boxed{4}\)")
+
     def test_reasoning_always_enabled(self):
         self.assertTrue(self.renderer.in_think_mode(ChatCompletionRequest(messages=[])))
+
+    def test_parser_initial_state_matches_request_prompt(self):
+        for mode in ("disabled", "adaptive", "enabled"):
+            with self.subTest(mode=mode):
+                request = ChatCompletionRequest(
+                    messages=[], chat_template_kwargs={"thinking_mode": mode}
+                )
+                result = self.renderer._create_reasoning_parser(request).parse_non_stream(
+                    "The answer is 4."
+                )
+                expected = ("The answer is 4.", "") if mode == "enabled" else ("", "The answer is 4.")
+                self.assertEqual(result, expected)
 
     def test_tojson_filter_accepts_ensure_ascii(self):
         env = Environment(loader=BaseLoader())
@@ -620,6 +656,101 @@ class MiniMaxM3RealTokenizerTest(TestCase):
         cls.vl_renderer = build_vl_renderer(cls.tokenizer, str(MINIMAX_M3_PATH))
         cls.tools = [PLAN_TOOL_DEFINITION]
         cls.messages = [{"role": "user", "content": "plan my finals"}]
+
+    def test_native_token_chunks_preserve_final_answer_in_both_http_modes(self):
+        import asyncio
+        import torch
+        from rtp_llm.utils.base_model_datatypes import AuxInfo, GenerateOutput
+        from rtp_llm.openai.renderers.custom_renderer import ThinkStatus, OutputDelta
+        from rtp_llm.config.generate_config import ThinkingMode
+
+        # Captured from a successful PD request with the M3 closing token forced
+        # by a one-token thinking budget: We</mm:think>\(\boxed{4}\)[e~[.
+        token_ids = [2421, 200060, 116012, 128640, 123, 52, 55936, 200020]
+        for renderer in (self.renderer, self.vl_renderer):
+            for streaming in (False, True):
+                for chunk_size in (1, 2, 4, 8):
+                    with self.subTest(renderer=type(renderer).__name__, streaming=streaming, chunk_size=chunk_size):
+                        async def replay():
+                            request = ChatCompletionRequest(
+                                messages=[], stream=streaming,
+                                chat_template_kwargs={"thinking_mode": "enabled"},
+                            )
+                            status = (await renderer._create_status_list(1, request))[0]
+                            wire_status = ThinkStatus(enable_think_mode=True, in_think_mode=True,
+                                                      is_streaming=streaming, thinking_mode=ThinkingMode.ENABLED)
+                            content, reasoning = [], []
+                            for count in range(chunk_size, len(token_ids) + 1, chunk_size):
+                                output = GenerateOutput(
+                                    output_ids=torch.tensor([token_ids[count - chunk_size:count]], dtype=torch.int32),
+                                    finished=count == len(token_ids),
+                                    aux_info=AuxInfo(output_len=count),
+                                )
+                                delta = await renderer._update_single_status(
+                                    status, output, 64, renderer.extra_stop_words, [], streaming
+                                )
+                                text = renderer._split_reasoning_text_and_content(delta, wire_status)
+                                if isinstance(text, str):
+                                    content.append(text)
+                                else:
+                                    content.append(text.content or "")
+                                    reasoning.append(text.reasoning_content or "")
+                            # CustomChatRenderer flushes remaining normal text after
+                            # the final native output, including non-streaming replies.
+                            content.append(renderer._split_reasoning_text_and_content(
+                                OutputDelta(status.delta_output_string, None, 0, count, 0), wire_status
+                            ).content or "")
+                            return "".join(content), "".join(reasoning)
+                        content, reasoning = asyncio.run(replay())
+                        self.assertEqual(content, r"\(\boxed{4}\)")
+                        self.assertEqual(reasoning, "We")
+
+    def test_incomplete_marker_tail_is_flushed_at_finish(self):
+        import asyncio
+        import torch
+        from rtp_llm.utils.base_model_datatypes import AuxInfo, GenerateOutput
+        from rtp_llm.openai.renderers.custom_renderer import ThinkStatus, OutputDelta
+        from rtp_llm.config.generate_config import ThinkingMode
+
+        for renderer in (self.renderer, self.vl_renderer):
+            for streaming in (False, True):
+                for tail in ("<", "</", "</mm:"):
+                    for one_packet in (False, True):
+                        with self.subTest(renderer=type(renderer).__name__, streaming=streaming,
+                                          tail=tail, one_packet=one_packet):
+                            async def replay():
+                                request = ChatCompletionRequest(
+                                    messages=[], stream=streaming,
+                                    chat_template_kwargs={"thinking_mode": "enabled"},
+                                )
+                                status = (await renderer._create_status_list(1, request))[0]
+                                wire_status = ThinkStatus(enable_think_mode=True, in_think_mode=True,
+                                                          is_streaming=streaming, thinking_mode=ThinkingMode.ENABLED)
+                                ids = renderer.tokenizer.encode("We</mm:think>answer" + tail,
+                                                                add_special_tokens=False)
+                                packets = [ids + [200020]] if one_packet else [[i] for i in ids] + [[200020]]
+                                content, reasoning, count = [], [], 0
+                                for packet in packets:
+                                    count += len(packet)
+                                    output = GenerateOutput(
+                                        output_ids=torch.tensor([packet], dtype=torch.int32),
+                                        finished=count == len(ids) + 1,
+                                        aux_info=AuxInfo(output_len=count),
+                                    )
+                                    delta = await renderer._update_single_status(
+                                        status, output, 64, renderer.extra_stop_words, [], streaming
+                                    )
+                                    text = renderer._split_reasoning_text_and_content(delta, wire_status)
+                                    if isinstance(text, str):
+                                        content.append(text)
+                                    else:
+                                        content.append(text.content or "")
+                                        reasoning.append(text.reasoning_content or "")
+                                content.append(renderer._split_reasoning_text_and_content(
+                                OutputDelta(status.delta_output_string, None, 0, count, 0), wire_status
+                            ).content or "")
+                                return "".join(content), "".join(reasoning)
+                            self.assertEqual(asyncio.run(replay()), ("answer" + tail, "We"))
 
     def test_tools_reach_the_prompt(self):
         request = ChatCompletionRequest(messages=self.messages, tools=self.tools)

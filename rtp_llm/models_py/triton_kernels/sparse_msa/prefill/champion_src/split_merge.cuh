@@ -48,7 +48,7 @@ __global__ __launch_bounds__(512,1) void grouped_cutlass_split_merge(Params p) {
             int physical=valid?p.table[batch*p.tb+block]:-1;
             valid=valid&&physical>=0&&physical<p.pages&&query<stop;
             float inv,lp;
-            page_softmax(t+slot*128,addr,block,limit,length,valid,p.alpha,inv,lp,nullptr,&s.p_half[slot]);
+            page_softmax(t+slot*128,addr,block,limit,length,valid,p.alpha,inv,lp,&s.p_half[slot]);
             if(page>=2) cutlass::arch::ClusterBarrier::wait(&s.stats_free[slot],((page/2)-1)%2);
             s.inv[slot][local]=inv;s.lp[slot][local]=lp;
             before_sync();wg_sync<1>();if(local==0) cutlass::arch::ClusterBarrier::arrive(&s.p_ready[slot]);

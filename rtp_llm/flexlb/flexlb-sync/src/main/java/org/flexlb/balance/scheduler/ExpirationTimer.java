@@ -23,7 +23,7 @@ final class ExpirationTimer implements AutoCloseable {
 
     private enum DeadlineState {
 
-        PREPARED, FIRED_BEFORE_INSTALL, ARMED, CONSUMED, CANCELED
+        PREPARED, FIRED_BEFORE_PUBLISH, ARMED, CALLBACK_CLAIMED, CANCELED
     }
 
     /** Exact deadlines detached together for request finalization or timer shutdown. */
@@ -40,7 +40,29 @@ final class ExpirationTimer implements AutoCloseable {
         }
     }
 
+    /**
+     * One-shot registration protocol. Cells describe the next state and any external action.
+     * An unchanged state ignores the event; claiming a callback does not mean it has finished.
+     *
+     * <pre>
+     * State                  PUBLISH                 FIRE                    CANCEL
+     * PREPARED               ARMED                   FIRED_BEFORE_PUBLISH     CANCELED + cancel
+     * FIRED_BEFORE_PUBLISH    CALLBACK_CLAIMED + run  unchanged               CANCELED + cancel
+     * ARMED                  error                   CALLBACK_CLAIMED + run  CANCELED + cancel
+     * CALLBACK_CLAIMED       unchanged               unchanged               unchanged
+     * CANCELED               unchanged               unchanged               unchanged
+     * </pre>
+     * State decisions hold this registration's monitor; external actions run after releasing it.
+     */
     abstract static class DeadlineRegistration {
+
+        private enum DeadlineEvent {
+            PUBLISH, FIRE, CANCEL
+        }
+
+        private enum DeadlineAction {
+            NONE, RUN_CALLBACK, CANCEL_TASK
+        }
 
         private DeadlineState state = DeadlineState.PREPARED;
 
@@ -48,62 +70,72 @@ final class ExpirationTimer implements AutoCloseable {
 
         private DeadlineRegistration() { }
 
-        final synchronized void installScheduled(
-                ScheduledFuture<?> exactScheduled) {
-            checkState(scheduled == null, "deadline already owns a scheduled task");
-            scheduled = exactScheduled;
-            if (state == DeadlineState.CANCELED) {
+        final void installScheduled(ScheduledFuture<?> exactScheduled) {
+            boolean cancelImmediately;
+            synchronized (this) {
+                checkState(scheduled == null, "deadline already owns a scheduled task");
+                scheduled = exactScheduled;
+                cancelImmediately = state == DeadlineState.CANCELED;
+            }
+            if (cancelImmediately) {
                 exactScheduled.cancel(false);
             }
         }
 
         /**
          * Publish only after the exact context has stored this capability.
+         * Returns true when the caller must run a callback that fired before publication.
          */
         final synchronized boolean publishAfterInstall() {
-            return switch (state) {
-                case PREPARED -> {
-                    state = DeadlineState.ARMED;
-                    yield false;
-                }
-                case FIRED_BEFORE_INSTALL -> {
-                    state = DeadlineState.CONSUMED;
-                    yield true;
-                }
-                case CANCELED, CONSUMED -> false;
-                case ARMED -> throw new IllegalStateException(
-                        "deadline capability was published twice");
-            };
+            return transitionLocked(DeadlineEvent.PUBLISH) == DeadlineAction.RUN_CALLBACK;
         }
 
+        /** Returns true only to the caller that claims the callback's execution. */
         final synchronized boolean consume() {
-            return switch (state) {
-                case PREPARED -> {
-                    state = DeadlineState.FIRED_BEFORE_INSTALL;
-                    yield false;
-                }
-                case ARMED -> {
-                    state = DeadlineState.CONSUMED;
-                    yield true;
-                }
-                case FIRED_BEFORE_INSTALL, CONSUMED, CANCELED -> false;
-            };
+            return transitionLocked(DeadlineEvent.FIRE) == DeadlineAction.RUN_CALLBACK;
         }
 
+        /** Returns whether this caller canceled the registration, not the future's cancel result. */
         final boolean cancel() {
             ScheduledFuture<?> exactScheduled;
             synchronized (this) {
-                if (state == DeadlineState.CONSUMED
-                        || state == DeadlineState.CANCELED) {
+                if (transitionLocked(DeadlineEvent.CANCEL) != DeadlineAction.CANCEL_TASK) {
                     return false;
                 }
-                state = DeadlineState.CANCELED;
                 exactScheduled = scheduled;
             }
             if (exactScheduled != null) {
                 exactScheduled.cancel(false);
             }
             return true;
+        }
+
+        /** Caller holds this monitor. NONE may still advance the state without an external action. */
+        private DeadlineAction transitionLocked(DeadlineEvent event) {
+            assert Thread.holdsLock(this);
+            return switch (state) {
+                case PREPARED -> switch (event) {
+                    case PUBLISH -> moveTo(DeadlineState.ARMED, DeadlineAction.NONE);
+                    case FIRE -> moveTo(DeadlineState.FIRED_BEFORE_PUBLISH, DeadlineAction.NONE);
+                    case CANCEL -> moveTo(DeadlineState.CANCELED, DeadlineAction.CANCEL_TASK);
+                };
+                case FIRED_BEFORE_PUBLISH -> switch (event) {
+                    case PUBLISH -> moveTo(DeadlineState.CALLBACK_CLAIMED, DeadlineAction.RUN_CALLBACK);
+                    case FIRE -> DeadlineAction.NONE;
+                    case CANCEL -> moveTo(DeadlineState.CANCELED, DeadlineAction.CANCEL_TASK);
+                };
+                case ARMED -> switch (event) {
+                    case PUBLISH -> throw new IllegalStateException("deadline capability was published twice");
+                    case FIRE -> moveTo(DeadlineState.CALLBACK_CLAIMED, DeadlineAction.RUN_CALLBACK);
+                    case CANCEL -> moveTo(DeadlineState.CANCELED, DeadlineAction.CANCEL_TASK);
+                };
+                case CALLBACK_CLAIMED, CANCELED -> DeadlineAction.NONE;
+            };
+        }
+
+        private DeadlineAction moveTo(DeadlineState nextState, DeadlineAction action) {
+            state = nextState;
+            return action;
         }
     }
 

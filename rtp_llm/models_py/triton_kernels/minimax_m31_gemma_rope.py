@@ -103,24 +103,38 @@ def _gemma_norm_rope(
             bf16 = out.to(tl.bfloat16)
             packed_stride = (2 * HK + 1) * 128
             if head < HQ:
-                tl.store(PREFILL_Q + row * (HQ * 128) + head * 128 + d,
-                         bf16, mask=valid)
+                tl.store(
+                    PREFILL_Q + row * (HQ * 128) + head * 128 + d, bf16, mask=valid
+                )
             elif head < HQ + HK:
                 kv_head = head - HQ
-                tl.store(PREFILL_KV + row * packed_stride + kv_head * 128 + d,
-                         bf16, mask=valid)
+                tl.store(
+                    PREFILL_KV + row * packed_stride + kv_head * 128 + d,
+                    bf16,
+                    mask=valid,
+                )
                 # V is not normalized/rotated. Its K CTA copies the original
                 # BF16 values into the adjacent communication plane.
-                v = tl.load(QKV + row * QS + (HQ + HK + kv_head) * 128 + d,
-                            mask=valid, other=0)
-                tl.store(PREFILL_KV + row * packed_stride + (HK + kv_head) * 128 + d,
-                         v, mask=valid)
+                v = tl.load(
+                    QKV + row * QS + (HQ + HK + kv_head) * 128 + d, mask=valid, other=0
+                )
+                tl.store(
+                    PREFILL_KV + row * packed_stride + (HK + kv_head) * 128 + d,
+                    v,
+                    mask=valid,
+                )
             elif head < HQ + HK + HI:
-                tl.store(PREFILL_IQ + row * (HI * 128) + (head - HQ - HK) * 128 + d,
-                         bf16.to(tl.float8e4nv), mask=valid)
+                tl.store(
+                    PREFILL_IQ + row * (HI * 128) + (head - HQ - HK) * 128 + d,
+                    bf16.to(tl.float8e4nv),
+                    mask=valid,
+                )
             else:
-                tl.store(PREFILL_KV + row * packed_stride + 2 * HK * 128 + d,
-                         bf16, mask=valid)
+                tl.store(
+                    PREFILL_KV + row * packed_stride + 2 * HK * 128 + d,
+                    bf16,
+                    mask=valid,
+                )
         else:
             tl.store(ptr, out, mask=valid)
         if WRITE_Q8:
@@ -129,7 +143,9 @@ def _gemma_norm_rope(
             if head < HQ:
                 if WRITE_MAIN_Q8:
                     rounded = out.to(tl.bfloat16).to(tl.float8e4nv)
-                    tl.store(Q8 + row * (HQ * 128) + head * 128 + d, rounded, mask=valid)
+                    tl.store(
+                        Q8 + row * (HQ * 128) + head * 128 + d, rounded, mask=valid
+                    )
             elif head >= HQ + HK and head < HQ + HK + HI:
                 rounded = out.to(tl.bfloat16).to(tl.float8e4nv)
                 tl.store(
@@ -185,10 +201,13 @@ def minimax_m31_gemma_norm_rope_(
     with legacy outputs and preserves BF16 rounding before index-Q FP8 cast.
     """
     if prefill_outputs is not None and (
-        contiguous_outputs is not None or query_fp8_outputs is not None
+        contiguous_outputs is not None
+        or query_fp8_outputs is not None
         or index_query_fp8_output is not None
     ):
-        raise ValueError("prefill producer outputs cannot be combined with legacy outputs")
+        raise ValueError(
+            "prefill producer outputs cannot be combined with legacy outputs"
+        )
     heads = (num_q_heads, num_kv_heads, num_index_heads)
     if any(not isinstance(h, int) or h <= 0 for h in heads) or eps <= 0:
         raise ValueError("positive integer head counts and positive eps required")
@@ -245,11 +264,15 @@ def minimax_m31_gemma_norm_rope_(
             ((rows, (2 * num_kv_heads + 1) * 128), torch.bfloat16),
         )
         if len(prefill_outputs) != 3 or any(
-            x.shape != shape or x.dtype != dtype or x.device != qkv.device
+            x.shape != shape
+            or x.dtype != dtype
+            or x.device != qkv.device
             or not x.is_contiguous()
             for x, (shape, dtype) in zip(prefill_outputs, specifications)
         ):
-            raise ValueError("prefill outputs require contiguous BF16 Q, E4M3 index Q and BF16 packed KV")
+            raise ValueError(
+                "prefill outputs require contiguous BF16 Q, E4M3 index Q and BF16 packed KV"
+            )
         inputs = {x.untyped_storage().data_ptr() for x in tensors}
         outputs = [x.untyped_storage().data_ptr() for x in prefill_outputs]
         if rows and (len(set(outputs)) != 3 or inputs.intersection(outputs)):
@@ -296,16 +319,21 @@ def minimax_m31_gemma_norm_rope_(
                 "contiguous outputs must have independent non-input storage"
             )
     if rows:
-        # In-place Prefill producers benefit from grouping at medium row
-        # counts too. Keep small decode/verify and contiguous-output producers
-        # on their existing threshold; grouping needs no extra tensors.
-        group = (
-            8 if rows >= 32768 or (rows >= 2048 and contiguous_outputs is None) else 1
-        )
+        # Group medium-row producers without independent contiguous outputs.
+        # Contiguous-output Verify calls keep their existing geometry.
+        if (
+            prefill_outputs is None
+            and contiguous_outputs is None
+            and 128 <= rows <= 256
+        ):
+            group = 4
+        elif rows >= 32768 or (rows >= 2048 and contiguous_outputs is None):
+            group = 8
+        else:
+            group = 1
         # One warp avoids cross-warp gather/layout conversions for grouped
-        # 128-channel heads. Keep small decode/verify and contiguous stores on
-        # their existing launch configuration.
-        num_warps = 1 if group == 8 and contiguous_outputs is None else 4
+        # 128-channel heads, including medium-size Verify.
+        num_warps = 1 if group > 1 and contiguous_outputs is None else 4
         _gemma_norm_rope[(triton.cdiv(rows, group), sum(heads) + 1)](
             qkv,
             index_q,
@@ -328,8 +356,13 @@ def minimax_m31_gemma_norm_rope_(
             OIK=contiguous_outputs[3] if contiguous_outputs is not None else None,
             WRITE_CONTIGUOUS=contiguous_outputs is not None,
             Q8=query_fp8_outputs[0] if query_fp8_outputs is not None else None,
-            IQ8=query_fp8_outputs[1] if query_fp8_outputs is not None else index_query_fp8_output,
-            WRITE_Q8=query_fp8_outputs is not None or index_query_fp8_output is not None,
+            IQ8=(
+                query_fp8_outputs[1]
+                if query_fp8_outputs is not None
+                else index_query_fp8_output
+            ),
+            WRITE_Q8=query_fp8_outputs is not None
+            or index_query_fp8_output is not None,
             WRITE_MAIN_Q8=query_fp8_outputs is not None,
             PREFILL_Q=prefill_outputs[0] if prefill_outputs is not None else None,
             PREFILL_IQ=prefill_outputs[1] if prefill_outputs is not None else None,

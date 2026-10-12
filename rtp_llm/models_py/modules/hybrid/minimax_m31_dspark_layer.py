@@ -7,6 +7,8 @@ target feature capture boundaries, query alignment, or CP cache ownership.
 
 import flashinfer
 import torch
+import triton
+import triton.language as tl
 from torch import nn
 
 from rtp_llm.models_py.distributed.collective_torch import Group, all_reduce
@@ -22,6 +24,44 @@ from rtp_llm.models_py.triton_kernels.dspark_swa import (
 )
 from rtp_llm.models_py.triton_kernels.dspark_swa_fa4 import paged_gqa_swa_fa4
 from rtp_llm.utils.model_weight import W
+
+
+@triton.jit
+def _add_mask_proposal_rows(
+    HIDDEN, MLP, LENS, OUT, WIDTH: tl.constexpr, DIM: tl.constexpr, BLOCK: tl.constexpr
+):
+    row = tl.program_id(0)
+    col = tl.arange(0, BLOCK)
+    valid = row % WIDTH < tl.load(LENS + row // WIDTH)
+    lhs = tl.load(HIDDEN + row.to(tl.int64) * DIM + col, mask=col < DIM, other=0).to(
+        tl.float32
+    )
+    rhs = tl.load(MLP + row.to(tl.int64) * DIM + col, mask=col < DIM, other=0).to(
+        tl.float32
+    )
+    tl.store(
+        OUT + row.to(tl.int64) * DIM + col,
+        tl.where(valid, lhs + rhs, 0).to(OUT.dtype.element_ty),
+        mask=col < DIM,
+    )
+
+
+def _add_and_mask_proposals(
+    hidden: torch.Tensor, mlp: torch.Tensor, query_lens: torch.Tensor, width: int
+) -> torch.Tensor:
+    rows, dim = hidden.shape
+    output = torch.empty_like(hidden)
+    _add_mask_proposal_rows[(rows,)](
+        hidden,
+        mlp,
+        query_lens,
+        output,
+        WIDTH=width,
+        DIM=dim,
+        BLOCK=triton.next_power_of_2(dim),
+        num_warps=8,
+    )
+    return output.view(query_lens.shape[0], width, dim)
 
 
 class MiniMaxM31DSparkLayer(nn.Module):
@@ -185,6 +225,6 @@ class MiniMaxM31DSparkLayer(nn.Module):
         if self.tp_size > 1:
             output = all_reduce(output, group=Group.TP)
         hidden = residual + output
-        hidden = hidden + self.mlp(self.post_norm(hidden))
-        valid = torch.arange(width, device=hidden.device)[None, :] < query_lens[:, None]
-        return torch.where(valid[:, :, None], hidden.view(batch, width, hidden_dim), 0)
+        return _add_and_mask_proposals(
+            hidden, self.mlp(self.post_norm(hidden)), query_lens, width
+        )

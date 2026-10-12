@@ -1,4 +1,5 @@
 """Decode index-Q producer preserves the existing BF16-to-E4M3 boundary."""
+
 import unittest
 
 import torch
@@ -19,30 +20,46 @@ class DecodeIndexQueryFp8Test(unittest.TestCase):
     def fixture(self, rows):
         torch.manual_seed(20261012)
         source = torch.randn(rows, 9856, device="cuda", dtype=torch.bfloat16)
-        weights = tuple(torch.randn(128, device="cuda", dtype=torch.bfloat16) for _ in range(4))
+        weights = tuple(
+            torch.randn(128, device="cuda", dtype=torch.bfloat16) for _ in range(4)
+        )
         positions = torch.arange(rows, device="cuda", dtype=torch.int32) % 1024
         cache = torch.randn(1024, 64, device="cuda", dtype=torch.float32)
         return source, weights, positions, cache
 
     def call(self, storage, weights, positions, cache, outputs=None, index_fp8=None):
         minimax_m31_gemma_norm_rope_(
-            storage[:, :9216], storage[:, 9216:9728], storage[:, 9728:],
-            weights, positions, cache,
-            num_q_heads=64, num_kv_heads=4, num_index_heads=4,
-            contiguous_outputs=outputs, index_query_fp8_output=index_fp8,
+            storage[:, :9216],
+            storage[:, 9216:9728],
+            storage[:, 9728:],
+            weights,
+            positions,
+            cache,
+            num_q_heads=64,
+            num_kv_heads=4,
+            num_index_heads=4,
+            contiguous_outputs=outputs,
+            index_query_fp8_output=index_fp8,
         )
 
     def check(self, rows, contiguous, graph=False):
         source, weights, positions, cache = self.fixture(rows)
         old, new = source.clone(), source.clone()
         if contiguous:
-            outputs = [tuple(torch.empty((rows, heads, 128), dtype=torch.bfloat16, device="cuda")
-                             for heads in (64, 4, 4, 1)) for _ in range(2)]
+            outputs = [
+                tuple(
+                    torch.empty((rows, heads, 128), dtype=torch.bfloat16, device="cuda")
+                    for heads in (64, 4, 4, 1)
+                )
+                for _ in range(2)
+            ]
         else:
             outputs = [None, None]
         expected = torch.empty((rows, 4, 128), dtype=torch.float8_e4m3fn, device="cuda")
         actual = torch.empty_like(expected)
-        unused_main = torch.empty((rows, 64, 128), dtype=torch.float8_e4m3fn, device="cuda")
+        unused_main = torch.empty(
+            (rows, 64, 128), dtype=torch.float8_e4m3fn, device="cuda"
+        )
 
         def reference():
             self.call(old, weights, positions, cache, outputs[0])
@@ -59,7 +76,9 @@ class DecodeIndexQueryFp8Test(unittest.TestCase):
         reference()
         fused()
         self.assertTrue(torch.equal(old.view(torch.int16), new.view(torch.int16)))
-        self.assertTrue(torch.equal(expected.view(torch.uint8), actual.view(torch.uint8)))
+        self.assertTrue(
+            torch.equal(expected.view(torch.uint8), actual.view(torch.uint8))
+        )
         if contiguous:
             for a, b in zip(*outputs):
                 self.assertTrue(torch.equal(a.view(torch.int16), b.view(torch.int16)))
@@ -79,24 +98,36 @@ class DecodeIndexQueryFp8Test(unittest.TestCase):
                 new.copy_(source)
                 for capture in graphs:
                     capture.replay()
-                self.assertTrue(torch.equal(old.view(torch.int16), new.view(torch.int16)))
-                self.assertTrue(torch.equal(expected.view(torch.uint8), actual.view(torch.uint8)))
+                self.assertTrue(
+                    torch.equal(old.view(torch.int16), new.view(torch.int16))
+                )
+                self.assertTrue(
+                    torch.equal(expected.view(torch.uint8), actual.view(torch.uint8))
+                )
 
     def test_index_only_and_contiguous_outputs_match_legacy_rounding(self):
-        for rows in (1, 5, 20, 25, 40, 100, 160, 256):
+        for rows in (1, 5, 20, 25, 40, 100, 128, 160, 200, 256):
             for contiguous in (False, True):
                 with self.subTest(rows=rows, contiguous=contiguous):
                     self.check(rows, contiguous)
 
     def test_graph_replay_preserves_changed_positions(self):
         self.check(160, True, graph=True)
+        self.check(200, False, graph=True)
         self.check(256, True, graph=True)
 
     def test_index_output_cannot_alias_contiguous_output(self):
         source, weights, positions, cache = self.fixture(20)
-        outputs = tuple(torch.empty((20, heads, 128), dtype=torch.bfloat16, device="cuda")
-                        for heads in (64, 4, 4, 1))
-        alias = outputs[2].view(torch.float8_e4m3fn).reshape(-1)[:20 * 4 * 128].reshape(20, 4, 128)
+        outputs = tuple(
+            torch.empty((20, heads, 128), dtype=torch.bfloat16, device="cuda")
+            for heads in (64, 4, 4, 1)
+        )
+        alias = (
+            outputs[2]
+            .view(torch.float8_e4m3fn)
+            .reshape(-1)[: 20 * 4 * 128]
+            .reshape(20, 4, 128)
+        )
         with self.assertRaisesRegex(ValueError, "independent storage"):
             self.call(source, weights, positions, cache, outputs, alias)
 

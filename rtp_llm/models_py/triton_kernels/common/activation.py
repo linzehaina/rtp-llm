@@ -821,9 +821,9 @@ def _silu_and_mul_post_quant_dense_packed_kernel(
     """Fused: SiLU-and-mul + per-token-group FP8 quant.
 
     When SCALE_UE8M0 is True, processes 4 groups at a time and writes a packed
-    int32 (one byte per group exponent). When False, processes 1 group at a
-    time and writes float32 scale. When ROUND_POW2 is True (and SCALE_UE8M0 is
-    False), the float32 scale is rounded to the nearest power of two (MXFP8).
+    int32 (one byte per group exponent). When False, it processes one or more
+    independent groups per CTA. ROUND_POW2 rounds the scale to a power of two
+    for MXFP8; the caller selects row-major or directly packed scale output.
     """
     block_id = tl.program_id(axis=0)
     token_id = tl.program_id(axis=1)
@@ -879,8 +879,8 @@ def _silu_and_mul_post_quant_dense_packed_kernel(
             packed_scale = packed_scale | (exp_bits << (g * 8))
         tl.store(scale_base, packed_scale)
     elif GROUPS_PER_CTA > 1:
-        # Independently reduce each 32-value group, while amortizing the
-        # one-warp CTA overhead across four groups for larger verify shapes.
+        # Independently reduce each 32-value group while amortizing the
+        # one-warp CTA overhead across multiple groups.
         group_idx = block_id * GROUPS_PER_CTA + tl.arange(0, GROUPS_PER_CTA)
         offs_in_d = group_idx[:, None] * BLOCK_N + tl.arange(0, BLOCK_N)[None, :]
         mask = offs_in_d < size_n
@@ -1096,18 +1096,21 @@ def silu_and_mul_per_token_group_fp8_quant_dense_packed_fwd(
 
     BLOCK_N = quant_group_size
     NUM_STAGE = 2
-    groups_per_cta = (
-        4
-        if (
-            direct_tma
-            and input.dtype == torch.bfloat16
-            and 64 <= T <= 128
-            and size_n in (3072, 12288)
-            and gemm1_alpha == 1.702
-            and gemm1_clamp_limit == 7.0
-        )
-        else 1
+    grouped_tma = (
+        direct_tma
+        and input.dtype == torch.bfloat16
+        and size_n in (3072, 12288)
+        and gemm1_alpha == 1.702
+        and gemm1_clamp_limit == 7.0
     )
+    # Dense M3.1 decode at BS32/40 has 160..280 rows. One CTA per 32-value
+    # group creates tens of thousands of one-warp CTAs at these shapes.
+    if grouped_tma and 129 <= T <= 320:
+        groups_per_cta = 16
+    elif grouped_tma and 64 <= T <= 128:
+        groups_per_cta = 4
+    else:
+        groups_per_cta = 1
     num_blocks = triton.cdiv(num_blocks, groups_per_cta)
     grid = (num_blocks, T)
 

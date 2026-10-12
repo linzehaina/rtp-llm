@@ -1800,7 +1800,7 @@ TEST_F(PPExecutorTpTest, ShutdownPlanStopsEveryTpRankBeforeOrDuringFinishWithout
                     EXPECT_EQ(executor.current_slot_, 2u);
                     EXPECT_EQ(wire->receive_index, stage == 0 ? 0u : 4u);
                     ASSERT_EQ(wire->sent_tensors.size(), stage == 2 ? 0u : 4u);
-                    /** Every stage stops after TP sync; only the root's original payload carries shutdown. */
+                    /** TP sync propagates shutdown locally; forwarding preserves each rank's original header value. */
                     if (stage != 2) {
                         EXPECT_FALSE(pp_serialization::deserializePlan(wire->sent_tensors[1]).model_input.shutdown);
                         const auto terminal = pp_serialization::deserializePlan(wire->sent_tensors[3]);
@@ -2309,7 +2309,7 @@ TEST_F(PPExecutorTest, FirstDecodeMetricsCountSequencesAndFilterErrorsByRequest)
 }
 
 /** Middle: consume upstream activations, execute locally and publish model outputs. */
-TEST_F(PPExecutorTest, MiddleForwardsOriginalPayloadWhileRestoringMultimodalInputs) {
+TEST_F(PPExecutorTest, MiddleForwardsOriginalPayloadWhileCopyingMultimodalInputsToCuda) {
     auto params = makeStageParams(1);
     PPExecutor executor(params, nullptr, false);
     auto* wire = attachTransport(executor);

@@ -1,8 +1,3 @@
-/**
- * Binary serialization for PP transport payloads: execution plans, execution
- * results, and intermediate tensor metadata. kVersion guards mixed builds.
- */
-
 #include "rtp_llm/cpp/normal_engine/pipeline/PPSerialization.h"
 
 #include <cstring>
@@ -14,12 +9,8 @@ namespace rtp_llm::pp_serialization {
 
 namespace {
 
-/**
- * Versioned byte stream; readers bounds-check every field. The tensor
- * presence flag encodes definedness so defined-but-empty tensors survive;
- * host tensors are rebuilt pinned to match gatherModelInput plan tensors.
- */
-constexpr uint32_t kVersion = 19;
+/** Bump when any payload layout changes; all PP peers must use the same version. */
+constexpr uint32_t kVersion = 20;
 
 struct ByteWriter {
     std::vector<uint8_t> buf;
@@ -34,6 +25,27 @@ struct ByteWriter {
         raw(&v, sizeof(T));
     }
 
+    template<typename WireType, typename T>
+    void scalar(const T& value) {
+        val<WireType>(static_cast<WireType>(value));
+    }
+
+    template<typename T, typename Fields>
+    void sequence(const std::vector<T>& values, Fields fields) {
+        val<uint64_t>(values.size());
+        for (const auto& value : values) {
+            fields(*this, value);
+        }
+    }
+
+    template<typename T, typename Fields>
+    void optional(const std::optional<T>& value, Fields fields) {
+        flag(value.has_value());
+        if (value.has_value()) {
+            fields(*this, *value);
+        }
+    }
+
     void flag(bool v) {
         val<uint8_t>(v ? 1 : 0);
     }
@@ -44,10 +56,7 @@ struct ByteWriter {
     }
 
     void strings(const std::vector<std::string>& values) {
-        val<uint64_t>(values.size());
-        for (const auto& value : values) {
-            str(value);
-        }
+        sequence(values, [](auto& io, auto& value) { io.str(value); });
     }
 
     void errors(const std::vector<ErrorInfo>& errors) {
@@ -61,6 +70,7 @@ struct ByteWriter {
     }
 
     void tensor(const torch::Tensor& t) {
+        /** Encode definedness separately so empty tensors retain their dtype and shape. */
         flag(t.defined());
         if (!t.defined()) {
             return;
@@ -71,19 +81,9 @@ struct ByteWriter {
             val<int64_t>(cpu.size(d));
         }
         val<int32_t>(static_cast<int32_t>(t.scalar_type()));
-        flag(t.is_cuda());
         val<uint64_t>(static_cast<uint64_t>(cpu.nbytes()));
-        raw(cpu.data_ptr(), cpu.nbytes());
-    }
-
-    void optTensorList(const std::optional<std::vector<torch::Tensor>>& list) {
-        flag(list.has_value());
-        if (!list.has_value()) {
-            return;
-        }
-        val<uint64_t>(list->size());
-        for (const auto& t : *list) {
-            tensor(t);
+        if (cpu.nbytes() > 0) {
+            raw(cpu.data_ptr(), cpu.nbytes());
         }
     }
 
@@ -99,12 +99,10 @@ struct ByteWriter {
 struct ByteReader {
     const uint8_t* p   = nullptr;
     const uint8_t* end = nullptr;
-    const bool     restore_device;
 
-    ByteReader(const torch::Tensor& buffer, bool restore_device = true):
+    explicit ByteReader(const torch::Tensor& buffer):
         p(static_cast<const uint8_t*>(buffer.data_ptr())),
-        end(p + static_cast<size_t>(buffer.numel()) * buffer.element_size()),
-        restore_device(restore_device) {
+        end(p + static_cast<size_t>(buffer.numel()) * buffer.element_size()) {
         RTP_LLM_CHECK_WITH_INFO(buffer.dtype() == torch::kUInt8 && buffer.dim() == 1,
                                 "PP serialization payload must be a 1-D uint8 tensor");
     }
@@ -122,8 +120,35 @@ struct ByteReader {
         return v;
     }
 
+    template<typename WireType, typename T>
+    void scalar(T& value) {
+        value = static_cast<T>(val<WireType>());
+    }
+
+    template<typename T, typename Fields>
+    void sequence(std::vector<T>& values, Fields fields) {
+        values.resize(val<uint64_t>());
+        for (auto& value : values) {
+            fields(*this, value);
+        }
+    }
+
+    template<typename T, typename Fields>
+    void optional(std::optional<T>& value, Fields fields) {
+        if (flag()) {
+            value.emplace();
+            fields(*this, *value);
+        } else {
+            value.reset();
+        }
+    }
+
     bool flag() {
         return val<uint8_t>() != 0;
+    }
+
+    void flag(bool& value) {
+        value = flag();
     }
 
     std::string str() {
@@ -134,30 +159,28 @@ struct ByteReader {
         return s;
     }
 
-    std::vector<std::string> strings() {
-        std::vector<std::string> values;
-        const auto               size = val<uint64_t>();
-        values.reserve(size);
-        for (uint64_t i = 0; i < size; ++i) {
-            values.push_back(str());
-        }
-        return values;
+    void str(std::string& value) {
+        value = str();
     }
 
-    std::vector<ErrorInfo> errors() {
-        std::vector<ErrorInfo> errors(val<uint64_t>());
+    void strings(std::vector<std::string>& values) {
+        sequence(values, [](auto& io, auto& value) { io.str(value); });
+    }
+
+    void errors(std::vector<ErrorInfo>& errors) {
+        errors.resize(val<uint64_t>());
         for (auto& error : errors) {
             const auto code = static_cast<ErrorCode>(val<int32_t>());
             if (code != ErrorCode::NONE_ERROR) {
                 error = ErrorInfo(code, str());
             }
         }
-        return errors;
     }
 
-    torch::Tensor tensor() {
+    void tensor(torch::Tensor& out) {
         if (!flag()) {
-            return {};
+            out = torch::Tensor();
+            return;
         }
         const auto ndim = val<uint8_t>();
         RTP_LLM_CHECK_WITH_INFO(ndim <= 8, "PP serialization tensor ndim=%u out of range", ndim);
@@ -166,39 +189,15 @@ struct ByteReader {
             sizes[d] = val<int64_t>();
             RTP_LLM_CHECK_WITH_INFO(sizes[d] >= 0, "PP serialization tensor has negative dim");
         }
-        const auto dtype   = static_cast<torch::ScalarType>(val<int32_t>());
-        const bool is_cuda = flag() && restore_device;
-        const auto nbytes  = val<uint64_t>();
-        /** Host tensors come back pinned: downstream fused H2D copies assert pinned memory. */
-        auto out = torch::empty(
-            sizes,
-            torch::TensorOptions().dtype(dtype).device(is_cuda ? torch::kCUDA : torch::kCPU).pinned_memory(!is_cuda));
+        const auto dtype  = static_cast<torch::ScalarType>(val<int32_t>());
+        const auto nbytes = val<uint64_t>();
+        /** Plan execution uses fused H2D copies that require pinned source memory. */
+        out = torch::empty(sizes, torch::TensorOptions().dtype(dtype).device(torch::kCPU).pinned_memory(true));
         RTP_LLM_CHECK_WITH_INFO(static_cast<uint64_t>(out.nbytes()) == nbytes,
                                 "PP serialization tensor byte count mismatch");
         if (nbytes > 0) {
-            if (is_cuda) {
-                auto cpu = torch::empty(sizes, torch::TensorOptions().dtype(dtype));
-                raw(cpu.data_ptr(), nbytes);
-                out.copy_(cpu, /*non_blocking=*/false);
-            } else {
-                raw(out.data_ptr(), nbytes);
-            }
+            raw(out.data_ptr(), nbytes);
         }
-        return out;
-    }
-
-    void optTensorList(std::optional<std::vector<torch::Tensor>>& out) {
-        if (!flag()) {
-            out = std::nullopt;
-            return;
-        }
-        const auto                 n = val<uint64_t>();
-        std::vector<torch::Tensor> list;
-        list.reserve(n);
-        for (uint64_t i = 0; i < n; ++i) {
-            list.push_back(tensor());
-        }
-        out = std::move(list);
     }
 
     void expectEnd() const {
@@ -206,236 +205,149 @@ struct ByteReader {
     }
 };
 
-void writeModelInput(ByteWriter& w, const GptModelInputs& in) {
-    w.tensor(in.combo_tokens);
-    w.tensor(in.input_lengths);
-    w.tensor(in.sequence_lengths);
-    w.tensor(in.lm_output_indexes);
-    w.tensor(in.custom_output_indexes);
-    w.tensor(in.lm_output_lengths);
-    w.tensor(in.prefix_lengths);
-    w.tensor(in.sequence_lengths_plus_1);
-    w.tensor(in.combo_tokens_type_ids);
-    w.tensor(in.combo_position_ids);
-    w.tensor(in.last_hidden_states);
-    w.tensor(in.attention_mask);
-    w.tensor(in.kv_cache_block_id);
-    w.tensor(in.kv_cache_kernel_block_id);
-    w.strings(in.kv_cache_group_tags);
-    w.tensor(in.kv_cache_group_types);
-    w.tensor(in.kv_cache_update_mapping);
-    w.tensor(in.text_tokens_mask);
-    w.tensor(in.mm_features_locs);
-    w.tensor(in.input_embeddings_locs);
-    w.tensor(in.request_id);
-    w.tensor(in.request_pd_separation);
-    w.tensor(in.cache_keys);
-    w.optTensorList(in.multimodal_features);
-    w.optTensorList(in.mm_extra_input);
-    w.optTensorList(in.input_embeddings);
-    w.val<uint64_t>(in.kv_block_stride_bytes);
-    w.val<uint64_t>(in.kv_scale_stride_bytes);
-    w.val<uint64_t>(in.seq_size_per_block);
-    w.val<uint64_t>(in.kernel_seq_size_per_block);
-    w.flag(in.pd_separation);
-    w.flag(in.decode_entrance);
-    w.flag(in.use_opaque_kv_cache_store);
-    w.flag(in.need_all_logits);
-    w.flag(in.need_all_hidden_states);
-    w.flag(in.need_moe_gating);
-    w.flag(in.warmup);
-    w.flag(in.skip_run);
-    w.flag(in.is_fake_stream);
-    w.flag(in.is_target_verify);
+template<typename IO, typename List>
+void optionalTensorListFields(IO& io, List& list) {
+    io.optional(list, [](auto& io, auto& tensors) {
+        io.sequence(tensors, [](auto& io, auto& tensor) { io.tensor(tensor); });
+    });
 }
 
-void readModelInput(ByteReader& r, GptModelInputs& in) {
-    in.combo_tokens             = r.tensor();
-    in.input_lengths            = r.tensor();
-    in.sequence_lengths         = r.tensor();
-    in.lm_output_indexes        = r.tensor();
-    in.custom_output_indexes    = r.tensor();
-    in.lm_output_lengths        = r.tensor();
-    in.prefix_lengths           = r.tensor();
-    in.sequence_lengths_plus_1  = r.tensor();
-    in.combo_tokens_type_ids    = r.tensor();
-    in.combo_position_ids       = r.tensor();
-    in.last_hidden_states       = r.tensor();
-    in.attention_mask           = r.tensor();
-    in.kv_cache_block_id        = r.tensor();
-    in.kv_cache_kernel_block_id = r.tensor();
-    in.kv_cache_group_tags      = r.strings();
-    in.kv_cache_group_types     = r.tensor();
-    in.kv_cache_update_mapping  = r.tensor();
-    in.text_tokens_mask         = r.tensor();
-    in.mm_features_locs         = r.tensor();
-    in.input_embeddings_locs    = r.tensor();
-    in.request_id               = r.tensor();
-    in.request_pd_separation    = r.tensor();
-    in.cache_keys               = r.tensor();
-    r.optTensorList(in.multimodal_features);
-    r.optTensorList(in.mm_extra_input);
-    r.optTensorList(in.input_embeddings);
-    in.kv_block_stride_bytes     = r.val<uint64_t>();
-    in.kv_scale_stride_bytes     = r.val<uint64_t>();
-    in.seq_size_per_block        = r.val<uint64_t>();
-    in.kernel_seq_size_per_block = r.val<uint64_t>();
-    in.pd_separation             = r.flag();
-    in.decode_entrance           = r.flag();
-    in.use_opaque_kv_cache_store = r.flag();
-    in.need_all_logits           = r.flag();
-    in.need_all_hidden_states    = r.flag();
-    in.need_moe_gating           = r.flag();
-    in.warmup                    = r.flag();
-    in.skip_run                  = r.flag();
-    in.is_fake_stream            = r.flag();
-    in.is_target_verify          = r.flag();
+/** One ordered field list serves const input on write and mutable output on read.
+ * Shutdown stays in the plan header so metadata-only plans carry it too. */
+template<typename IO, typename Input>
+void modelInputFields(IO& io, Input& in) {
+    io.tensor(in.combo_tokens);
+    io.tensor(in.input_lengths);
+    io.tensor(in.sequence_lengths);
+    io.tensor(in.lm_output_indexes);
+    io.tensor(in.custom_output_indexes);
+    io.tensor(in.lm_output_lengths);
+    io.tensor(in.prefix_lengths);
+    io.tensor(in.sequence_lengths_plus_1);
+    io.tensor(in.combo_tokens_type_ids);
+    io.tensor(in.combo_position_ids);
+    io.tensor(in.last_hidden_states);
+    io.tensor(in.attention_mask);
+    io.tensor(in.kv_cache_block_id);
+    io.tensor(in.kv_cache_kernel_block_id);
+    io.strings(in.kv_cache_group_tags);
+    io.tensor(in.kv_cache_group_types);
+    io.tensor(in.kv_cache_update_mapping);
+    io.tensor(in.text_tokens_mask);
+    io.tensor(in.mm_features_locs);
+    io.tensor(in.input_embeddings_locs);
+    io.tensor(in.request_id);
+    io.tensor(in.request_pd_separation);
+    io.tensor(in.cache_keys);
+    optionalTensorListFields(io, in.multimodal_features);
+    optionalTensorListFields(io, in.mm_extra_input);
+    optionalTensorListFields(io, in.input_embeddings);
+    io.template scalar<uint64_t>(in.kv_block_stride_bytes);
+    io.template scalar<uint64_t>(in.kv_scale_stride_bytes);
+    io.template scalar<uint64_t>(in.seq_size_per_block);
+    io.template scalar<uint64_t>(in.kernel_seq_size_per_block);
+    io.flag(in.pd_separation);
+    io.flag(in.decode_entrance);
+    io.flag(in.use_opaque_kv_cache_store);
+    io.flag(in.need_all_logits);
+    io.flag(in.need_all_hidden_states);
+    io.flag(in.need_moe_gating);
+    io.flag(in.warmup);
+    io.flag(in.skip_run);
+    io.flag(in.is_fake_stream);
+    io.flag(in.is_target_verify);
 }
 
-void writeSamplingPlan(ByteWriter& w, const PPSamplingPlan& s) {
-    w.val<uint64_t>(s.random_seeds.size());
-    for (const auto& seed : s.random_seeds) {
-        w.flag(seed.has_value());
-        if (seed.has_value()) {
-            w.val<int64_t>(*seed);
-        }
-    }
-    w.val<uint64_t>(s.logits_processor_configs.size());
-    for (const auto& cfg : s.logits_processor_configs) {
-        w.str(cfg.grammar_type);
-        w.str(cfg.grammar_value);
-        w.val<int32_t>(cfg.combo_token_size);
-        w.val<uint64_t>(cfg.banned_combo_token_ids.size());
-        for (const auto& banned : cfg.banned_combo_token_ids) {
-            w.val<uint64_t>(banned.size());
-            for (const auto id : banned) {
-                w.val<int32_t>(id);
-            }
-        }
-        w.val<uint64_t>(cfg.end_think_token_ids.size());
-        for (const auto id : cfg.end_think_token_ids) {
-            w.val<int32_t>(id);
-        }
-        w.flag(cfg.enable_cross_sequence_ban);
-        w.val<int32_t>(cfg.cross_seq_diverge_start_combo);
-    }
-    w.val<uint64_t>(s.num_return_sequences.size());
-    for (const auto count : s.num_return_sequences) {
-        w.val<int32_t>(count);
-    }
-    w.tensor(s.request_ids);
-    w.tensor(s.token_ids);
-    w.tensor(s.input_lengths);
-    w.tensor(s.sequence_lengths);
-    w.tensor(s.max_tokens);
-    w.tensor(s.top_k);
-    w.tensor(s.top_p);
-    w.tensor(s.temperature);
-    w.tensor(s.repetition_penalty);
-    w.tensor(s.presence_penalty);
-    w.tensor(s.frequency_penalty);
-    w.tensor(s.no_repeat_ngram_size);
-    w.tensor(s.do_sample);
-    w.tensor(s.finished_mask);
-    w.tensor(s.spec_do_sample);
-    w.tensor(s.force_sp_accept);
-    w.tensor(s.draft_all_probs);
-    w.tensor(s.draft_point_mass_rows);
+template<typename IO, typename Config>
+void logitsProcessorConfigFields(IO& io, Config& cfg) {
+    io.str(cfg.grammar_type);
+    io.str(cfg.grammar_value);
+    io.template scalar<int32_t>(cfg.combo_token_size);
+    io.sequence(cfg.banned_combo_token_ids, [](auto& io, auto& banned) {
+        io.sequence(banned, [](auto& io, auto& id) { io.template scalar<int32_t>(id); });
+    });
+    io.sequence(cfg.end_think_token_ids, [](auto& io, auto& id) { io.template scalar<int32_t>(id); });
+    io.flag(cfg.enable_cross_sequence_ban);
+    io.template scalar<int32_t>(cfg.cross_seq_diverge_start_combo);
 }
 
-void readSamplingPlan(ByteReader& r, PPSamplingPlan& s) {
-    const auto seed_num = r.val<uint64_t>();
-    s.random_seeds.resize(seed_num);
-    for (uint64_t i = 0; i < seed_num; ++i) {
-        if (r.flag()) {
-            s.random_seeds[i] = static_cast<int>(r.val<int64_t>());
-        }
-    }
-    const auto cfg_num = r.val<uint64_t>();
-    s.logits_processor_configs.resize(cfg_num);
-    for (uint64_t i = 0; i < cfg_num; ++i) {
-        auto& cfg             = s.logits_processor_configs[i];
-        cfg.grammar_type      = r.str();
-        cfg.grammar_value     = r.str();
-        cfg.combo_token_size  = r.val<int32_t>();
-        const auto banned_num = r.val<uint64_t>();
-        cfg.banned_combo_token_ids.resize(banned_num);
-        for (uint64_t b = 0; b < banned_num; ++b) {
-            const auto id_num = r.val<uint64_t>();
-            cfg.banned_combo_token_ids[b].resize(id_num);
-            for (uint64_t k = 0; k < id_num; ++k) {
-                cfg.banned_combo_token_ids[b][k] = r.val<int32_t>();
-            }
-        }
-        const auto end_num = r.val<uint64_t>();
-        cfg.end_think_token_ids.resize(end_num);
-        for (uint64_t k = 0; k < end_num; ++k) {
-            cfg.end_think_token_ids[k] = r.val<int32_t>();
-        }
-        cfg.enable_cross_sequence_ban     = r.flag();
-        cfg.cross_seq_diverge_start_combo = r.val<int32_t>();
-    }
-    const auto num_return_sequences_size = r.val<uint64_t>();
-    s.num_return_sequences.resize(num_return_sequences_size);
-    for (uint64_t i = 0; i < num_return_sequences_size; ++i) {
-        s.num_return_sequences[i] = r.val<int32_t>();
-    }
-    s.request_ids          = r.tensor();
-    s.token_ids            = r.tensor();
-    s.input_lengths        = r.tensor();
-    s.sequence_lengths     = r.tensor();
-    s.max_tokens           = r.tensor();
-    s.top_k                = r.tensor();
-    s.top_p                = r.tensor();
-    s.temperature          = r.tensor();
-    s.repetition_penalty   = r.tensor();
-    s.presence_penalty     = r.tensor();
-    s.frequency_penalty    = r.tensor();
-    s.no_repeat_ngram_size = r.tensor();
-    s.do_sample            = r.tensor();
-    s.finished_mask        = r.tensor();
-    s.spec_do_sample       = r.tensor();
-    s.force_sp_accept      = r.tensor();
-    s.draft_all_probs       = r.tensor();
-    s.draft_point_mass_rows = r.tensor();
+template<typename IO, typename Sampling>
+void samplingPlanFields(IO& io, Sampling& s) {
+    io.sequence(s.random_seeds, [](auto& io, auto& seed) {
+        io.optional(seed, [](auto& io, auto& value) { io.template scalar<int64_t>(value); });
+    });
+    io.sequence(s.logits_processor_configs, [](auto& io, auto& cfg) { logitsProcessorConfigFields(io, cfg); });
+    io.sequence(s.num_return_sequences, [](auto& io, auto& count) { io.template scalar<int32_t>(count); });
+    io.tensor(s.request_ids);
+    io.tensor(s.token_ids);
+    io.tensor(s.input_lengths);
+    io.tensor(s.sequence_lengths);
+    io.tensor(s.max_tokens);
+    io.tensor(s.top_k);
+    io.tensor(s.top_p);
+    io.tensor(s.temperature);
+    io.tensor(s.repetition_penalty);
+    io.tensor(s.presence_penalty);
+    io.tensor(s.frequency_penalty);
+    io.tensor(s.no_repeat_ngram_size);
+    io.tensor(s.do_sample);
+    io.tensor(s.finished_mask);
+    io.tensor(s.spec_do_sample);
+    io.tensor(s.force_sp_accept);
+    io.tensor(s.draft_all_probs);
+    io.tensor(s.draft_point_mass_rows);
 }
 
-void writeOutputConfig(ByteWriter& w, const PPOutputConfig& output_config) {
-    w.flag(output_config.return_logits);
-    w.flag(output_config.return_softmax_probs);
-    w.flag(output_config.return_cum_log_probs);
-    w.flag(output_config.calculate_loss);
-    w.flag(output_config.return_hidden_states);
-    w.flag(output_config.return_all_hidden_states);
-    w.val<int32_t>(static_cast<int32_t>(output_config.return_all_probs));
-    w.val<uint64_t>(output_config.prompt_logits_requests.size());
-    for (const auto& request : output_config.prompt_logits_requests) {
-        w.flag(request.enabled);
-        w.val<int32_t>(request.top_k);
-        w.val<int32_t>(request.start);
-        w.val<int32_t>(request.end);
-        w.flag(request.return_target_logprob);
-    }
+template<typename IO, typename Request>
+void promptLogitsRequestFields(IO& io, Request& request) {
+    io.flag(request.enabled);
+    io.template scalar<int32_t>(request.top_k);
+    io.template scalar<int32_t>(request.start);
+    io.template scalar<int32_t>(request.end);
+    io.flag(request.return_target_logprob);
 }
 
-void readOutputConfig(ByteReader& r, PPOutputConfig& output_config) {
-    output_config.return_logits            = r.flag();
-    output_config.return_softmax_probs     = r.flag();
-    output_config.return_cum_log_probs     = r.flag();
-    output_config.calculate_loss           = r.flag();
-    output_config.return_hidden_states     = r.flag();
-    output_config.return_all_hidden_states = r.flag();
-    const auto return_all_probs            = r.val<int32_t>();
-    output_config.return_all_probs         = static_cast<ReturnAllProbsMode>(return_all_probs);
-    const auto prompt_logits_request_num   = r.val<uint64_t>();
-    output_config.prompt_logits_requests.resize(prompt_logits_request_num);
-    for (auto& request : output_config.prompt_logits_requests) {
-        request.enabled               = r.flag();
-        request.top_k                 = r.val<int32_t>();
-        request.start                 = r.val<int32_t>();
-        request.end                   = r.val<int32_t>();
-        request.return_target_logprob = r.flag();
-    }
+template<typename IO, typename Config>
+void outputConfigFields(IO& io, Config& output_config) {
+    io.flag(output_config.return_logits);
+    io.flag(output_config.return_softmax_probs);
+    io.flag(output_config.return_cum_log_probs);
+    io.flag(output_config.calculate_loss);
+    io.flag(output_config.return_hidden_states);
+    io.flag(output_config.return_all_hidden_states);
+    io.template scalar<int32_t>(output_config.return_all_probs);
+    io.sequence(output_config.prompt_logits_requests,
+                [](auto& io, auto& request) { promptLogitsRequestFields(io, request); });
+}
+
+template<typename IO, typename Output>
+void promptLogitsOutputFields(IO& io, Output& output) {
+    io.tensor(output.topk_logprobs);
+    io.tensor(output.topk_token_ids);
+    io.tensor(output.target_logprobs);
+    io.template scalar<int32_t>(output.start_pos);
+    io.template scalar<int32_t>(output.end_pos);
+}
+
+template<typename IO, typename Result>
+void executionResultFields(IO& io, Result& result) {
+    io.tensor(result.request_ids);
+    io.tensor(result.new_token_ids);
+    io.tensor(result.new_token_lengths);
+    io.tensor(result.propose_token_ids);
+    io.tensor(result.propose_all_probs);
+    io.tensor(result.propose_hidden_states);
+    io.tensor(result.hidden_states);
+    io.tensor(result.logits);
+    io.tensor(result.softmax_probs);
+    io.tensor(result.cum_log_probs);
+    io.tensor(result.all_probs);
+    io.tensor(result.loss);
+    io.tensor(result.all_hidden_states);
+    io.sequence(result.prompt_logits, [](auto& io, auto& prompt_logits) {
+        io.optional(prompt_logits, [](auto& io, auto& output) { promptLogitsOutputFields(io, output); });
+    });
+    io.errors(result.request_errors);
 }
 
 }  // namespace
@@ -449,9 +361,9 @@ torch::Tensor serializePlan(const PPExecutionPlan& plan, bool metadata_only) {
         /** TP peers need the upstream tag identities before synchronizing numeric cache rows. */
         w.strings(plan.model_input.kv_cache_group_tags);
     } else {
-        writeModelInput(w, plan.model_input);
-        writeSamplingPlan(w, plan.sampling_plan);
-        writeOutputConfig(w, plan.output_config);
+        modelInputFields(w, plan.model_input);
+        samplingPlanFields(w, plan.sampling_plan);
+        outputConfigFields(w, plan.output_config);
         w.flag(plan.is_decode);
         w.tensor(plan.draft_next_position_ids);
         w.val<uint64_t>(plan.finished_request_ids.size());
@@ -463,22 +375,21 @@ torch::Tensor serializePlan(const PPExecutionPlan& plan, bool metadata_only) {
 }
 
 PPExecutionPlan deserializePlan(const torch::Tensor& buffer) {
-    /** Decode on CPU; receivePlan submits the H2D copies required for local execution. */
-    ByteReader r(buffer, false);
+    ByteReader r(buffer);
     RTP_LLM_CHECK_WITH_INFO(r.val<uint32_t>() == kVersion, "PP plan payload version mismatch");
     PPExecutionPlan plan;
     const bool      metadata_only = r.flag();
     plan.model_input.shutdown     = r.flag();
     if (metadata_only) {
-        plan.model_input.kv_cache_group_tags = r.strings();
+        r.strings(plan.model_input.kv_cache_group_tags);
         r.expectEnd();
         return plan;
     }
-    readModelInput(r, plan.model_input);
-    readSamplingPlan(r, plan.sampling_plan);
-    readOutputConfig(r, plan.output_config);
-    plan.is_decode                  = r.flag();
-    plan.draft_next_position_ids    = r.tensor();
+    modelInputFields(r, plan.model_input);
+    samplingPlanFields(r, plan.sampling_plan);
+    outputConfigFields(r, plan.output_config);
+    plan.is_decode = r.flag();
+    r.tensor(plan.draft_next_position_ids);
     const auto finished_request_num = r.val<uint64_t>();
     plan.finished_request_ids.resize(finished_request_num);
     for (uint64_t index = 0; index < finished_request_num; ++index) {
@@ -491,32 +402,7 @@ PPExecutionPlan deserializePlan(const torch::Tensor& buffer) {
 torch::Tensor serializeExecutionResult(const PPExecutionResult& result) {
     ByteWriter w;
     w.val<uint32_t>(kVersion);
-    w.tensor(result.request_ids);
-    w.tensor(result.new_token_ids);
-    w.tensor(result.new_token_lengths);
-    w.tensor(result.propose_token_ids);
-    w.tensor(result.propose_all_probs);
-    w.tensor(result.propose_hidden_states);
-    w.tensor(result.hidden_states);
-    w.tensor(result.logits);
-    w.tensor(result.softmax_probs);
-    w.tensor(result.cum_log_probs);
-    w.tensor(result.all_probs);
-    w.tensor(result.loss);
-    w.tensor(result.all_hidden_states);
-    w.val<uint64_t>(result.prompt_logits.size());
-    for (const auto& prompt_logits : result.prompt_logits) {
-        w.flag(prompt_logits.has_value());
-        if (!prompt_logits.has_value()) {
-            continue;
-        }
-        w.tensor(prompt_logits->topk_logprobs);
-        w.tensor(prompt_logits->topk_token_ids);
-        w.tensor(prompt_logits->target_logprobs);
-        w.val<int32_t>(prompt_logits->start_pos);
-        w.val<int32_t>(prompt_logits->end_pos);
-    }
-    w.errors(result.request_errors);
+    executionResultFields(w, result);
     return w.finish();
 }
 
@@ -525,36 +411,7 @@ PPExecutionResult deserializeExecutionResult(const torch::Tensor& buffer) {
     RTP_LLM_CHECK_WITH_INFO(r.val<uint32_t>() == kVersion, "PP execution-result payload version mismatch");
 
     PPExecutionResult result;
-    result.request_ids       = r.tensor();
-    result.new_token_ids     = r.tensor();
-    result.new_token_lengths = r.tensor();
-    result.propose_token_ids = r.tensor();
-    result.propose_all_probs = r.tensor();
-    result.propose_hidden_states = r.tensor();
-    result.hidden_states     = r.tensor();
-    result.logits            = r.tensor();
-    result.softmax_probs     = r.tensor();
-    result.cum_log_probs     = r.tensor();
-    result.all_probs         = r.tensor();
-    result.loss              = r.tensor();
-    result.all_hidden_states = r.tensor();
-
-    const auto prompt_logits_num = r.val<uint64_t>();
-    result.prompt_logits.resize(prompt_logits_num);
-    for (auto& prompt_logits : result.prompt_logits) {
-        if (!r.flag()) {
-            continue;
-        }
-        PromptLogitsOutput output;
-        output.topk_logprobs   = r.tensor();
-        output.topk_token_ids  = r.tensor();
-        output.target_logprobs = r.tensor();
-        output.start_pos       = r.val<int32_t>();
-        output.end_pos         = r.val<int32_t>();
-        prompt_logits          = std::move(output);
-    }
-
-    result.request_errors = r.errors();
+    executionResultFields(r, result);
     r.expectEnd();
     return result;
 }

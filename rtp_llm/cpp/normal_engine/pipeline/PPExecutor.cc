@@ -157,7 +157,7 @@ PPExecutionPlan PPExecutor::receivePlan(torch::Tensor& plan_payload) {
         RTP_LLM_LOG_INFO("received pipeline shutdown sentinel from previous stage");
     }
 
-    /** Restore MM inputs for local TP execution while preserving the CPU payload for forwarding. */
+    /** Copy MM inputs to CUDA for local TP execution; forward the original CPU payload. */
     auto& model_input = plan.model_input;
     if (model_input.multimodal_features) {
         for (auto& tensor : *model_input.multimodal_features) {
@@ -1180,7 +1180,7 @@ absl::Status PPExecutor::processImpl(const ScheduleOutput& schedule_output, int6
         prepareStreams(streams);
     }
 
-    /** 1. recv the plan from the previous stage */
+    /** 1. Build or receive the plan and retain its CPU payload for forwarding. */
     PPExecutionPlan plan;
     torch::Tensor   plan_payload;
     StreamGroups    scheduled_stream_groups;
@@ -1205,7 +1205,7 @@ absl::Status PPExecutor::processImpl(const ScheduleOutput& schedule_output, int6
 
     auto& model_input = plan.model_input;
 
-    /** 2. do the sync across the all ranks in the same stage. */
+    /** 2. Synchronize model inputs across TP ranks in this stage. */
     {
         RTP_LLM_PROFILE_SCOPE("executor.pp.tp_sync_input");
         const auto start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
@@ -1230,7 +1230,7 @@ absl::Status PPExecutor::processImpl(const ScheduleOutput& schedule_output, int6
         inflight.schedule_time_us = schedule_time_us;
     }
 
-    /** 4. send the plan to next stage  */
+    /** 4. Forward the CPU plan payload to the next stage. */
     if (!isLastStage()) {
         asyncSendPlan(plan_payload, inflight.plan_sends);
     }

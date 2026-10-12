@@ -48,7 +48,7 @@ flowchart TB
 | 决策计算 | 消费所需不可变事实，计算排序、成本、组、victim 方案 | RPC、创建线程、写请求生命周期、执行容量预留 | 成本公式、排序、GroupPlanner、EvictionPlanner 的纯计算部分 |
 | 状态协议 | 校验身份、原子修改本地事实、维护所有权、产生精确交接结果 | 发网络请求、遍历服务组件、运行任意用户回调 | BalanceContext、PrefillState、DecodeState、代际 gate、事务状态 |
 | 技术适配 | 执行调用，转换 wire 结果，管理线程和存储机制 | 从通信超时自行推导业务回滚或重试、重新决定业务结果 | Engine 客户端、Forwarder 的通信部分、Timer、执行器、缓存索引 |
-| 装配与生命周期 | 配置选择、构造组件、按契约启动和排空 | 根据某请求的 ACK/cancel 裁决业务结果 | DeliveryBindingConfiguration、SchedulerRuntime、ApplicationLifecycle |
+| 装配与生命周期 | 配置选择、构造组件、按契约启动和排空 | 根据某请求的 ACK/cancel 裁决业务结果 | PlacementConfiguration、SchedulerRuntime、ApplicationLifecycle |
 
 本地锁和 CAS 不必移出业务内核：它们可以是本地原子协议的一部分。禁止的是网络等待和无约束回调，不能借“纯领域”之名拆开请求资格与 endpoint handoff 的原子区。
 

@@ -1,23 +1,55 @@
 package org.flexlb.balance.scheduler;
 
+import org.flexlb.balance.delivery.BatchIdGenerator;
 import org.flexlb.balance.endpoint.DecodeResources.AdmissionCapacity;
 import org.flexlb.balance.eviction.DecodeCapacityAcquirer;
 import org.flexlb.config.ConfigService;
+import org.flexlb.config.DispatcherConfig;
 import org.flexlb.config.FlexlbConfig;
 import org.flexlb.service.RecentCacheKeyTraceReporter;
 import org.flexlb.service.monitor.DeliveryMetricsReporter;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Lazy;
+import org.springframework.core.env.Environment;
 
-/** Builds the fixed-mode scheduler selected at startup. */
+import java.util.Objects;
+
+/** Assembles the scheduler, Prefill delivery, and Decode admission from startup config. */
 @Configuration(proxyBeanMethods = false)
 public class PlacementConfiguration {
+
+    private static final int DEFAULT_SERVER_PORT = 7001;
+
     @Bean
     public AdmissionCapacity decodeAdmissionCapacity(ConfigService configService) {
         var availability = configService.loadBalanceConfig().getRouter().getRoles().getDecode().getAvailability();
         return new AdmissionCapacity(availability.getMaxEngineRequests() == null ? 0L : availability.getMaxEngineRequests(),
                 availability.getMaxKvUsagePercent());
+    }
+
+    @Bean
+    public DeliveryStrategy prefillDeliveryStrategy(
+            ConfigService configService,
+            DefaultBatchDispatcher batchDispatcher,
+            DeliveryMetricsReporter metricsReporter,
+            Environment environment,
+            AdmissionCapacity admissionCapacity) {
+        DispatcherConfig dispatcherConfig = Objects.requireNonNull(
+                configService.loadBalanceConfig().getDispatcher(), "dispatcherConfig");
+        return switch (dispatcherConfig.getType()) {
+            case BATCH -> {
+                BatchIdGenerator batchIdGenerator = BatchIdGenerator.forCurrentProcess(
+                        resolveServerPort(environment));
+                yield new BatchDeliveryStrategy(
+                        batchDispatcher::tryPrepareSubmission,
+                        batchIdGenerator::nextId,
+                        metricsReporter,
+                        admissionCapacity,
+                        dispatcherConfig.getMaxInflightPerPrefillWorker());
+            }
+            case NON_BATCH -> new RouteDeliveryStrategy(metricsReporter, admissionCapacity);
+        };
     }
 
     @Bean(destroyMethod = "")
@@ -41,5 +73,17 @@ public class PlacementConfiguration {
             return queue;
         }
         return new DirectRequestScheduler(router, runtime, config, capacity, traceReporter);
+    }
+
+    private static int resolveServerPort(Environment environment) {
+        String configuredPort = environment.getProperty("server.port");
+        if (configuredPort == null) {
+            configuredPort = System.getProperty("server.port", String.valueOf(DEFAULT_SERVER_PORT));
+        }
+        try {
+            return Integer.parseInt(configuredPort);
+        } catch (NumberFormatException ignored) {
+            return DEFAULT_SERVER_PORT;
+        }
     }
 }

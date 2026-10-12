@@ -114,7 +114,7 @@ DefaultBatchDispatcher --> EngineGrpcClient : EnqueueBatch
 - `GlobalQueueCoordinator` 管理全局排队与 placement，取得规划资格后才选择路由。
 - `WorkerBatcher` 统一消费 `GroupingPolicy` 的 EMPTY/WAIT/READY，保留队列快照复验、容量预留、条件等待和投递事务。路由预测使用快照中同一个策略，组选择与窗口规则不再分叉。
 - 两个 Placement Control 是各协调器的嵌套接口；`RouteDelivery` 归 DIRECT 协议。`PlacementConfiguration` 完成装配和队列启动，Scheduler 不再依赖 Router。
-- `BatchDeliveryStrategy` 的提交函数由 `DeliveryBindingConfiguration` 绑定到 `DefaultBatchDispatcher`，不是直接持有 dispatcher 字段。
+- `PlacementConfiguration` 直接读取 `dispatcher.type`，装配唯一的 Prefill 投递策略；批次模式通过 `BatchIdGenerator` 生成关联 ID，并把 `DefaultBatchDispatcher` 的提交函数传给 `BatchDeliveryStrategy`。
 
 请求内状态与执行设施的关系：
 
@@ -298,7 +298,8 @@ ZookeeperMasterElectService --> GeneralHttpNettyService : 节点通知
 - [RequestScheduler](../flexlb-sync/src/main/java/org/flexlb/balance/scheduler/RequestScheduler.java)
 - [BalanceContext](../flexlb-sync/src/main/java/org/flexlb/balance/scheduler/BalanceContext.java)
 - [EndpointRegistry](../flexlb-sync/src/main/java/org/flexlb/balance/endpoint/EndpointRegistry.java)
-- [DeliveryBindingConfiguration](../flexlb-sync/src/main/java/org/flexlb/balance/composition/DeliveryBindingConfiguration.java)
+- [PlacementConfiguration](../flexlb-sync/src/main/java/org/flexlb/balance/scheduler/PlacementConfiguration.java)
+- [BatchIdGenerator](../flexlb-sync/src/main/java/org/flexlb/balance/delivery/BatchIdGenerator.java)
 - [PrefillEndpoint](../flexlb-sync/src/main/java/org/flexlb/balance/endpoint/PrefillEndpoint.java)
 - [EngineSyncRunner](../flexlb-sync/src/main/java/org/flexlb/sync/runner/EngineSyncRunner.java)
 - [CacheAwareService](../flexlb-cache/src/main/java/org/flexlb/cache/service/CacheAwareService.java)

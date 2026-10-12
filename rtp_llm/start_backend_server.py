@@ -66,6 +66,14 @@ def local_rank_start(
     _install_hot_hook_runtime(f"backend_rank_{world_rank}")
     backend_manager = None
     logging.info(f"[PROCESS_START]Start local rank process")
+    # Spawned rank processes re-import everything and never run
+    # start_from_config, so install the flashinfer JIT stale-ninja retry here.
+    try:
+        from rtp_llm.utils.jit_cache_env import patch_flashinfer_jit_retry
+
+        patch_flashinfer_jit_retry()
+    except Exception:
+        logging.warning("flashinfer JIT stale-ninja retry setup failed", exc_info=True)
 
     def signal_handler(signum, frame):
         logging.info(

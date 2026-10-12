@@ -272,6 +272,21 @@ def setup_jit_cache(cache_dir=None, packages=None):
         "flashinfer",
         cache_subpath=(".cache", "flashinfer"),
     )
+    fi_base = os.environ.get("FLASHINFER_WORKSPACE_BASE", "").strip()
+    candidates = [Path("/tmp/rtp-llm/.jit_cache")]
+    if fi_base:
+        base = Path(fi_base)
+        nested = base / ".cache" / "flashinfer"
+        candidates.append(nested if nested.is_dir() else base)
+    for candidate in candidates:
+        wiped = cache_env.purge_stale_ninja_cached_ops(candidate)
+        if wiped:
+            logging.warning(
+                "[JIT] purged %s stale flashinfer cached_ops dirs under %s",
+                wiped,
+                candidate,
+            )
+    cache_env.patch_flashinfer_jit_retry()
     cache_env.configure_writable_cache_env(
         "TRITON_CACHE_DIR", Path.home() / ".triton" / "cache", "triton"
     )

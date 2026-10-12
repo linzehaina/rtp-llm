@@ -620,6 +620,12 @@ def h20_oss_suites():
                 gpu_type = ["H20_CU13"],
                 data = native.glob(["data/model/llava/*.jpg"]),
             ),
+            # compare_config.skip_choices: the ViT GPU-batch scheduler composes
+            # batches by arrival timing, so concurrent runs sit on a razor-thin
+            # argmax tie near the tail and the completion oscillates between two
+            # valid continuations ("...is sitting and extending..." vs "...sits
+            # attentively, extending...") across pods. Golden compare stays on
+            # usage + aux_info; content is a reference snapshot only.
             smoke_test(
                 name = "qwen3_vl_gpu_batch",
                 task_info = "data/model/qwen_vl/q_r_3_gpu_batch.json",

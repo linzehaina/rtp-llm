@@ -24,6 +24,8 @@ from rtp_llm.utils import jit_cache_store as store
 from rtp_llm.utils.jit_cache_env import (
     CacheEnvConfig,
     configure_cache_env,
+    patch_flashinfer_jit_retry,
+    purge_stale_ninja_cached_ops,
     read_cache_env,
 )
 
@@ -215,6 +217,15 @@ def setup_jit_cache_env() -> Scope | None:
             # Only torch/aiter use existence batons; tvm_ffi's same-named file is flocked.
             if item.name in ("torch_extensions", "aiter"):
                 store.reap_stale_batons(item.local_dir)
+            if item.name == "flashinfer":
+                wiped = purge_stale_ninja_cached_ops(item.local_dir)
+                if wiped:
+                    logging.warning(
+                        "purged %s stale flashinfer cached_ops dirs under %s",
+                        wiped,
+                        item.local_dir,
+                    )
+                patch_flashinfer_jit_retry()
         return scope
     except Exception:
         logging.warning("JIT_CACHE_FAIL_OPEN: env setup failed", exc_info=True)

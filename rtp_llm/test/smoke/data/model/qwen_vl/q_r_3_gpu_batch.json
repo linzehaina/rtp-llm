@@ -30,10 +30,13 @@
                 "temperature": 0.0,
                 "top_p": 0.01
             },
+            "compare_config": {
+                "skip_choices": true
+            },
             "result": {
                 "id": "chat-",
                 "object": "chat.completion",
-                "created": 1705334081,
+                "created": 1791782516,
                 "model": "",
                 "choices": [
                     {

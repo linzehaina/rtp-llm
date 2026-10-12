@@ -18,14 +18,24 @@ class TestMegaMoeStrategyClassification(unittest.TestCase):
                 self.assertTrue(is_mega_moe_strategy())
 
     def test_fp8_strategies_bypass_load_time_fp4_wrappers(self):
-        for strategy in ("mega_moe_fp8", "mega_moe_fp8_se", "mega_moe_nvfp4"):
+        for strategy in (
+            "mega_moe_fp8",
+            "mega_moe_fp8_se",
+            "mega_moe_nvfp4",
+            "mega_moe_nvfp4_se",
+        ):
             with self.subTest(strategy=strategy), mock.patch.dict(
                 os.environ, {"MOE_STRATEGY": strategy}, clear=False
             ):
                 self.assertFalse(is_mega_moe_strategy())
 
     def test_fp8_strategies_leave_weight_tree_untouched(self):
-        for strategy in ("mega_moe_fp8", "mega_moe_fp8_se", "mega_moe_nvfp4"):
+        for strategy in (
+            "mega_moe_fp8",
+            "mega_moe_fp8_se",
+            "mega_moe_nvfp4",
+            "mega_moe_nvfp4_se",
+        ):
             original_layer = object()
             weight_info = ModelWeightInfo(weights=[], layer_weights=[original_layer])
             with self.subTest(strategy=strategy), mock.patch.dict(

@@ -134,7 +134,8 @@ scatterCompactRows(const torch::Tensor& compact, const torch::Tensor& compact_to
 
 bool isMegaMoeStrategy(const std::string& moe_strategy) {
     return moe_strategy == "mega_moe" || moe_strategy == "mega_moe_se" || moe_strategy == "mega_moe_fused"
-           || moe_strategy == "mega_moe_fp8" || moe_strategy == "mega_moe_fp8_se" || moe_strategy == "mega_moe_nvfp4";
+           || moe_strategy == "mega_moe_fp8" || moe_strategy == "mega_moe_fp8_se" || moe_strategy == "mega_moe_nvfp4"
+           || moe_strategy == "mega_moe_nvfp4_se";
 }
 
 void holdSamplerInputHostBuffers(TensorHolder& holder, const SamplerInputs& inputs) {

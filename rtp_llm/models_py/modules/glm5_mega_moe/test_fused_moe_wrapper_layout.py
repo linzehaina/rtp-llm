@@ -8,6 +8,7 @@ from rtp_llm.models_py.modules.glm5_mega_moe import (
     mega_moe_fp8_se_wrapper,
     mega_moe_fp8_wrapper,
     mega_moe_fused_wrapper,
+    mega_moe_nvfp4_se_wrapper,
     mega_moe_nvfp4_wrapper,
     mega_moe_se_wrapper,
     mega_moe_wrapper,
@@ -196,6 +197,45 @@ class MegaMoeWrapperLayoutTest(unittest.TestCase):
         torch.testing.assert_close(captured["w2_w"], w2)
         torch.testing.assert_close(captured["w2_s"], s2)
         torch.testing.assert_close(captured["w2_inverse_gsf"], inverse_gsf2)
+
+    def test_nvfp4_se_wrapper_consumes_shared_without_restacking_ffn(self):
+        fp8 = torch.float8_e4m3fn
+        shared_w1 = torch.arange(64, dtype=torch.float32).reshape(8, 8).to(fp8)
+        shared_s1 = torch.ones((8, 1))
+        shared_w2 = torch.ones((8, 4)).to(fp8)
+        shared_s2 = torch.ones((8, 1))
+        weights = {
+            W.moe_w1: torch.ones((2, 8, 4), dtype=torch.int8),
+            W.moe_s1: torch.ones((2, 8, 1)).to(fp8),
+            W.moe_w1_s2: torch.ones((2, 2)),
+            W.moe_w2: torch.ones((2, 8, 2), dtype=torch.int8),
+            W.moe_s2: torch.ones((2, 8, 1)).to(fp8),
+            W.moe_w2_s2: torch.ones(2),
+            W.ffn_w13: shared_w1,
+            W.ffn_s13: shared_s1,
+            W.ffn_w2: shared_w2,
+            W.ffn_s2: shared_s2,
+        }
+        with patch.object(
+            mega_moe_nvfp4_se_wrapper, "GLM5MegaMoENVFP4SE", _FakeMegaMoENVFP4
+        ):
+            wrapper = mega_moe_nvfp4_se_wrapper.MegaMoeNvfp4SEWrapper(
+                _config(), _parallelism(), weights
+            )
+        self.assertIsInstance(wrapper, mega_moe_nvfp4_wrapper.MegaMoeNvfp4Wrapper)
+        self.assertTrue(hasattr(_FakeMegaMoENVFP4.instance, "nvfp4_kwargs"))
+        shared = _FakeMegaMoENVFP4.instance.shared_fp8_kwargs
+        self.assertIs(shared["w1_fp8"], shared_w1)
+        self.assertIs(shared["w1_scale"], shared_s1)
+        self.assertIs(shared["w2_fp8"], shared_w2)
+        self.assertIs(shared["w2_scale"], shared_s2)
+        self.assertFalse(weights)
+
+    def test_nvfp4_se_rejects_tp_sharded_shared_weights(self):
+        parallel = _parallelism()
+        parallel.get_ffn_tp_size = lambda: 2
+        with self.assertRaisesRegex(ValueError, "full shared weights"):
+            mega_moe_nvfp4_se_wrapper.MegaMoeNvfp4SEWrapper(_config(), parallel, {})
 
     def test_fp8_se_wrapper_loads_shared_expert_fp8(self):
         config = _config(hidden_size=8, inter=4)

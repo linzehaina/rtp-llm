@@ -17,6 +17,7 @@ def estimate_mega_moe_nvfp4_symm_buffer_bytes(
     hidden: int,
     intermediate_hidden: int,
     activation: str = "swiglu",
+    num_shared_experts: int = 0,
 ) -> int | None:
     try:
         import deep_gemm
@@ -30,6 +31,7 @@ def estimate_mega_moe_nvfp4_symm_buffer_bytes(
                 hidden,
                 intermediate_hidden,
                 activation,
+                num_shared_experts,
             )[0]
         )
     except Exception:
@@ -44,6 +46,7 @@ def get_or_create_mega_buf_nvfp4(
     hidden: int,
     intermediate_hidden: int,
     activation: str = "swiglu",
+    num_shared_experts: int = 0,
 ):
     """Collectively create or reuse the NVFP4 MegaMoE symmetric buffer."""
     import deep_gemm
@@ -56,6 +59,7 @@ def get_or_create_mega_buf_nvfp4(
         hidden,
         intermediate_hidden,
         activation,
+        num_shared_experts,
     )
     buf = _MEGA_NVFP4_BUF_CACHE.get(key)
     if buf is not None:
@@ -74,6 +78,7 @@ def get_or_create_mega_buf_nvfp4(
             hidden,
             intermediate_hidden,
             activation,
+            num_shared_experts,
         )
         if group_size > 0
         else None
@@ -86,6 +91,7 @@ def get_or_create_mega_buf_nvfp4(
         hidden=hidden,
         intermediate_hidden=intermediate_hidden,
         activation=activation,
+        num_shared_experts=num_shared_experts,
     )
     actual_bytes = None
     try:
@@ -95,13 +101,14 @@ def get_or_create_mega_buf_nvfp4(
     logging.info(
         "[MegaMoE NVFP4] allocated symm buffer: group_size=%d "
         "num_experts=%d max_tokens_per_rank=%d topk=%d hidden=%d "
-        "intermediate=%d actual=%s estimated=%s",
+        "intermediate=%d shared=%d actual=%s estimated=%s",
         group_size,
         num_experts,
         num_max_tokens_per_rank,
         num_topk,
         hidden,
         intermediate_hidden,
+        num_shared_experts,
         (
             f"{actual_bytes / (1024**3):.3f} GiB"
             if actual_bytes is not None

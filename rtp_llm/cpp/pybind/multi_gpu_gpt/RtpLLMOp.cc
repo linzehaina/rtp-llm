@@ -80,8 +80,7 @@ prepareMTPEngineInitParams(size_t model_id, py::object propose_model, const Engi
                                                                            std::move(*gpt_weight),
                                                                            py::none(),
                                                                            py_eplb)));
-        return std::move(
-            std::make_unique<ProposeModelEngineInitParams>(sp_type, gen_num_per_cycle, std::move(mtp_params)));
+        return std::make_unique<ProposeModelEngineInitParams>(sp_type, gen_num_per_cycle, std::move(mtp_params));
     }
 
     size_t expected_model_num = gen_num_per_cycle;

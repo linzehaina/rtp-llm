@@ -32,9 +32,103 @@ class NVFP4InputPackerTest(unittest.TestCase):
         if not torch.cuda.is_available():
             raise RuntimeError("NVFP4InputPackerTest requires an SM100 CUDA device")
 
+    def test_shared_mxfp8_input_layout_and_changed_input_graph_replay(self):
+        """Compare SE staging bitwise with the DeepGEMM reference at BM tails."""
+        import deep_gemm
+        from deep_gemm.utils import per_token_cast_to_fp8
+
+        from rtp_llm.models_py.modules.glm5_mega_moe.mega_moe_nvfp4_se import (
+            GLM5MegaMoENVFP4SE,
+        )
+
+        hidden, topk = 6144, 4
+        torch.manual_seed(31)
+        for tokens in (1, 8, 17, 31, 32, 33, 95, 96, 127, 128, 129, 257, 385, 2049):
+            with self.subTest(tokens=tokens):
+                capacity = triton.cdiv(tokens, 384) * 384
+                block_m = deep_gemm.get_block_m_for_mega_moe_nvfp4(
+                    2, 128, capacity, tokens, topk
+                )
+                sf_rows = triton.cdiv(tokens, block_m) * triton.cdiv(block_m, 128) * 128
+                model = object.__new__(GLM5MegaMoENVFP4SE)
+                torch.nn.Module.__init__(model)
+                model.cfg = SimpleNamespace(
+                    n_routed_experts=128, n_activated_experts=topk
+                )
+                # Isolate shared packing; routed NVFP4 numerics are checked below.
+                model._input_packer = SimpleNamespace(pack=Mock())
+                model._shared_input_sf = torch.empty(
+                    (capacity, hidden // 128), dtype=torch.int32, device="cuda"
+                )
+                buf = SimpleNamespace(
+                    group=SimpleNamespace(size=lambda: 2),
+                    num_max_tokens_per_rank=capacity,
+                    shared_l1_acts=torch.empty(
+                        (capacity, hidden), dtype=torch.float8_e4m3fn, device="cuda"
+                    ),
+                    shared_l1_acts_sf=torch.empty_strided(
+                        (sf_rows, hidden // 128),
+                        (1, sf_rows),
+                        dtype=torch.int32,
+                        device="cuda",
+                    ),
+                    topk_idx=torch.empty(
+                        (capacity, topk), dtype=torch.int64, device="cuda"
+                    ),
+                    topk_weights=torch.empty(
+                        (capacity, topk), dtype=torch.float32, device="cuda"
+                    ),
+                )
+                model._mega_buf = buf
+                x = torch.randn((tokens, hidden), dtype=torch.bfloat16, device="cuda")
+                x[0, :128] = 0
+                weights = torch.rand((tokens, topk), device="cuda")
+                indices = torch.randint(128, (tokens, topk), device="cuda")
+
+                def run():
+                    model._pack_inputs(x, weights, indices, tokens)
+
+                def check():
+                    ref_x, ref_sf = per_token_cast_to_fp8(
+                        x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
+                    )
+                    row = torch.arange(tokens, device="cuda")
+                    within = row % block_m
+                    destination = (
+                        row // block_m * triton.cdiv(block_m, 128) * 128
+                        + within // 128 * 128
+                        + within % 32 * 4
+                        + within % 128 // 32
+                    )
+                    expected_sf = torch.zeros_like(buf.shared_l1_acts_sf)
+                    expected_sf[destination] = ref_sf
+                    self.assertTrue(
+                        torch.equal(
+                            buf.shared_l1_acts[:tokens].view(torch.uint8),
+                            ref_x.view(torch.uint8),
+                        )
+                    )
+                    self.assertTrue(torch.equal(buf.shared_l1_acts_sf, expected_sf))
+                    self.assertTrue(torch.equal(buf.topk_idx[:tokens], indices))
+                    self.assertTrue(torch.equal(buf.topk_weights[:tokens], weights))
+
+                run()
+                check()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    run()
+                for step in range(3):
+                    x.normal_() if step < 2 else x.zero_()
+                    weights.uniform_()
+                    indices.random_(128)
+                    graph.replay()
+                    check()
+
     def test_model_warmup_only_adds_small_packer_tiles(self):
-        from .mega_moe import GLM5MegaMoE
-        from .mega_moe_nvfp4 import GLM5MegaMoENVFP4
+        from rtp_llm.models_py.modules.glm5_mega_moe.mega_moe import GLM5MegaMoE
+        from rtp_llm.models_py.modules.glm5_mega_moe.mega_moe_nvfp4 import (
+            GLM5MegaMoENVFP4,
+        )
 
         model = object.__new__(GLM5MegaMoENVFP4)
         torch.nn.Module.__init__(model)

@@ -172,6 +172,7 @@ class GenericMoeLayer(nn.Module):
             "mega_moe_se",
             "mega_moe_fused",
             "mega_moe_fp8_se",
+            "mega_moe_nvfp4_se",
         )
         if self._use_mega_moe_fused_shared:
             if not self.add_shared_expert:
@@ -195,6 +196,7 @@ class GenericMoeLayer(nn.Module):
             "mega_moe_fp8",
             "mega_moe_fp8_se",
             "mega_moe_nvfp4",
+            "mega_moe_nvfp4_se",
             "mega_moe_fused",
         ):
             if moe_config.moe_strategy == "mega_moe_fused":
@@ -215,6 +217,12 @@ class GenericMoeLayer(nn.Module):
                 )
 
                 wrapper_cls = MegaMoeFp8SEWrapper
+            elif moe_config.moe_strategy == "mega_moe_nvfp4_se":
+                from rtp_llm.models_py.modules.glm5_mega_moe.mega_moe_nvfp4_se_wrapper import (
+                    MegaMoeNvfp4SEWrapper,
+                )
+
+                wrapper_cls = MegaMoeNvfp4SEWrapper
             elif moe_config.moe_strategy == "mega_moe_nvfp4":
                 from rtp_llm.models_py.modules.glm5_mega_moe.mega_moe_nvfp4_wrapper import (
                     MegaMoeNvfp4Wrapper,

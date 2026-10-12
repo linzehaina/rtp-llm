@@ -7,8 +7,8 @@ from typing import Any, Dict, Optional
 
 import torch
 
-from .mega_buf import get_or_create_mega_output
 from .jit_warmup import mega_moe_jit_warmup_enabled
+from .mega_buf import get_or_create_mega_output
 from .mega_moe import (
     GLM5MegaMoE,
     GLM5MegaMoeCfg,
@@ -217,6 +217,7 @@ class GLM5MegaMoENVFP4(GLM5MegaMoE):
             hidden=cfg.dim,
             intermediate_hidden=cfg.moe_inter_dim,
             activation=self._activation_name,
+            num_shared_experts=int(getattr(self, "_num_shared_experts", 0)),
         )
         self._mega_y = get_or_create_mega_output(
             _mega_output_capacity(self._mega_buf, cfg.max_tokens_per_rank),
@@ -323,6 +324,17 @@ class GLM5MegaMoENVFP4(GLM5MegaMoE):
                     "_mega_l2_gsf",
                 )
             )
+            protected.extend(
+                tensor
+                for name in (
+                    "_shared_l1_w",
+                    "_shared_l1_sf",
+                    "_shared_l2_w",
+                    "_shared_l2_sf",
+                    "_shared_input_sf",
+                )
+                if (tensor := getattr(self, name, None)) is not None
+            )
             storage = out.untyped_storage().data_ptr()
             if any(
                 tensor.device == out.device
@@ -333,7 +345,8 @@ class GLM5MegaMoENVFP4(GLM5MegaMoE):
                     "NVFP4 MegaMoE direct output aliases protected storage"
                 )
 
-        self._input_packer.pack(x, weights, indices, buf, tokens)
+        self._pack_inputs(x, weights, indices, tokens)
+        fused_shared_kwargs = self._fused_shared_expert_kwargs(tokens)
         self._maybe_pre_kernel_barrier(tokens)
         _sync_cuda_graph_warmup_ranks(
             f"mega_moe_nvfp4.layer{self.cfg.layer_id}.before_deepgemm", x.device
@@ -351,5 +364,9 @@ class GLM5MegaMoENVFP4(GLM5MegaMoE):
                 activation_alpha=alpha,
                 fast_math=True,
                 assume_all_topk_valid=True,
+                **fused_shared_kwargs,
             )
         return y
+
+    def _pack_inputs(self, x, weights, indices, tokens: int) -> None:
+        self._input_packer.pack(x, weights, indices, self._mega_buf, tokens)

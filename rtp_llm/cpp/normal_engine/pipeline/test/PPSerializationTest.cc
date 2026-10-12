@@ -13,14 +13,14 @@ TEST_F(PPSerializationTest, EmptyAndShutdownPlansRemainDistinctOnRootAndPeerLane
         for (bool metadata_only : {false, true}) {
             SCOPED_TRACE(testing::Message() << "shutdown=" << shutdown << ", metadata_only=" << metadata_only);
             PPExecutionPlan plan;
-            plan.shutdown = shutdown;
+            plan.model_input.shutdown = shutdown;
             plan.model_input.skip_run = true;
             plan.model_input.kv_cache_group_tags = {"full", "linear"};
             plan.finished_request_ids = {101, 202};
 
             const auto received =
                 pp_serialization::deserializePlan(pp_serialization::serializePlan(plan, metadata_only));
-            EXPECT_EQ(received.shutdown, shutdown);
+            EXPECT_EQ(received.model_input.shutdown, shutdown);
             EXPECT_EQ(received.model_input.kv_cache_group_tags, plan.model_input.kv_cache_group_tags);
             if (!metadata_only) {
                 EXPECT_TRUE(received.model_input.skip_run);
@@ -29,6 +29,82 @@ TEST_F(PPSerializationTest, EmptyAndShutdownPlansRemainDistinctOnRootAndPeerLane
             }
         }
     }
+}
+
+TEST_F(PPSerializationTest, PlanDecodingKeepsCudaPayloadsOnPinnedCpuWithoutChangingWireBytes) {
+    PPExecutionPlan plan;
+    plan.model_input.combo_tokens = torch::tensor({3, 5}, torch::kInt32).cuda();
+    plan.model_input.last_hidden_states = torch::arange(12, torch::kFloat32).reshape({3, 4}).t().cuda();
+    plan.model_input.kv_cache_block_id = torch::tensor({1, 2, 3, 4}, torch::kInt32).reshape({1, 2, 2}).cuda();
+    plan.model_input.multimodal_features =
+        std::vector<torch::Tensor>{torch::arange(8, torch::kFloat32).reshape({2, 4}).to(torch::kFloat16).cuda()};
+    plan.model_input.mm_extra_input = std::vector<torch::Tensor>{torch::arange(6, torch::kFloat32).cuda()};
+    plan.sampling_plan.request_ids = torch::tensor({101, 202}, torch::kInt64);
+    plan.sampling_plan.token_ids = torch::tensor({{1, 2}, {3, 4}}, torch::kInt32).cuda();
+    plan.sampling_plan.draft_all_probs = torch::arange(16, torch::kFloat32).reshape({2, 2, 4}).cuda();
+    plan.sampling_plan.draft_point_mass_rows = torch::tensor({1}, torch::kInt64).cuda();
+    plan.draft_next_position_ids = torch::tensor({5, 8}, torch::kInt32).cuda();
+
+    const auto payload = pp_serialization::serializePlan(plan, false);
+    const auto original_payload = payload.clone();
+    auto       received = pp_serialization::deserializePlan(payload);
+    const auto expect_host_copy = [](const torch::Tensor& actual, const torch::Tensor& source) {
+        ASSERT_TRUE(actual.defined());
+        EXPECT_TRUE(actual.device().is_cpu());
+        EXPECT_TRUE(actual.is_pinned());
+        EXPECT_EQ(actual.scalar_type(), source.scalar_type());
+        EXPECT_EQ(actual.sizes().vec(), source.sizes().vec());
+        EXPECT_TRUE(torch::equal(actual, source.cpu()));
+    };
+    expect_host_copy(received.model_input.combo_tokens, plan.model_input.combo_tokens);
+    expect_host_copy(received.model_input.last_hidden_states, plan.model_input.last_hidden_states);
+    expect_host_copy(received.model_input.kv_cache_block_id, plan.model_input.kv_cache_block_id);
+    ASSERT_TRUE(received.model_input.multimodal_features.has_value());
+    ASSERT_EQ(received.model_input.multimodal_features->size(), 1u);
+    expect_host_copy(received.model_input.multimodal_features->front(), plan.model_input.multimodal_features->front());
+    ASSERT_TRUE(received.model_input.mm_extra_input.has_value());
+    ASSERT_EQ(received.model_input.mm_extra_input->size(), 1u);
+    expect_host_copy(received.model_input.mm_extra_input->front(), plan.model_input.mm_extra_input->front());
+    expect_host_copy(received.sampling_plan.request_ids, plan.sampling_plan.request_ids);
+    expect_host_copy(received.sampling_plan.token_ids, plan.sampling_plan.token_ids);
+    expect_host_copy(received.sampling_plan.draft_all_probs, plan.sampling_plan.draft_all_probs);
+    expect_host_copy(received.sampling_plan.draft_point_mass_rows, plan.sampling_plan.draft_point_mass_rows);
+    expect_host_copy(received.draft_next_position_ids, plan.draft_next_position_ids);
+
+    /** Local execution can replace or modify decoded tensors while forwarding the original CPU payload. */
+    received.model_input.combo_tokens.fill_(99);
+    received.model_input.multimodal_features->front() = received.model_input.multimodal_features->front().cuda();
+    received.model_input.multimodal_features->front().zero_();
+    EXPECT_TRUE(torch::equal(payload, original_payload));
+    const auto forwarded = pp_serialization::deserializePlan(payload);
+    expect_host_copy(forwarded.model_input.combo_tokens, plan.model_input.combo_tokens);
+    expect_host_copy(forwarded.model_input.multimodal_features->front(), plan.model_input.multimodal_features->front());
+}
+
+TEST_F(PPSerializationTest, ExecutionResultDecodingPreservesTensorDevices) {
+    PPExecutionResult result;
+    result.request_ids = torch::tensor({101}, torch::kInt64);
+    result.new_token_ids = torch::tensor({7}, torch::kInt32).reshape({1, 1});
+    result.hidden_states = torch::arange(8, torch::kFloat32).reshape({2, 4}).cuda();
+    PromptLogitsOutput prompt_logits;
+    prompt_logits.topk_token_ids = torch::tensor({{2, 3}}, torch::kInt32).cuda();
+    prompt_logits.topk_logprobs = torch::tensor({{-0.2f, -1.7f}}).cuda();
+    result.prompt_logits = {prompt_logits};
+
+    const auto received =
+        pp_serialization::deserializeExecutionResult(pp_serialization::serializeExecutionResult(result));
+    EXPECT_TRUE(received.request_ids.device().is_cpu());
+    EXPECT_TRUE(received.new_token_ids.device().is_cpu());
+    EXPECT_TRUE(torch::equal(received.request_ids, result.request_ids));
+    EXPECT_TRUE(torch::equal(received.new_token_ids, result.new_token_ids));
+    EXPECT_EQ(received.hidden_states.device(), result.hidden_states.device());
+    EXPECT_TRUE(torch::equal(received.hidden_states, result.hidden_states));
+    ASSERT_EQ(received.prompt_logits.size(), 1u);
+    ASSERT_TRUE(received.prompt_logits.front().has_value());
+    EXPECT_EQ(received.prompt_logits.front()->topk_token_ids.device(), prompt_logits.topk_token_ids.device());
+    EXPECT_EQ(received.prompt_logits.front()->topk_logprobs.device(), prompt_logits.topk_logprobs.device());
+    EXPECT_TRUE(torch::equal(received.prompt_logits.front()->topk_token_ids, prompt_logits.topk_token_ids));
+    EXPECT_TRUE(torch::equal(received.prompt_logits.front()->topk_logprobs, prompt_logits.topk_logprobs));
 }
 
 TEST_F(PPSerializationTest, SamplingPlanRoundTripPreservesMixedAndHomogeneousProposalModes) {

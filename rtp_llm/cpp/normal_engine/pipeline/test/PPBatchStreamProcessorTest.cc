@@ -702,7 +702,8 @@ TEST_F(PPBatchStreamProcessorTest, VerifyModelInputUsesCurrentAnchorAndPreserves
             std::vector<int32_t> expected_tokens(first_proposals);
             expected_tokens.insert(expected_tokens.end(), second_proposals.begin(), second_proposals.end());
             EXPECT_EQ(tensorToVector<int32_t>(input.combo_tokens), expected_tokens);
-            EXPECT_TRUE(input.combo_tokens.is_cuda());
+            EXPECT_TRUE(input.combo_tokens.device().is_cpu());
+            EXPECT_TRUE(input.combo_tokens.is_pinned());
             EXPECT_TRUE(input.is_target_verify);
             EXPECT_EQ(input.sequence_lengths.numel(), 0);
             EXPECT_EQ(tensorToVector<int32_t>(input.prefix_lengths), (std::vector<int32_t>{2, 3}));

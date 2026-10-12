@@ -14,10 +14,7 @@ PPCommTicket::PPCommTicket(std::unique_ptr<P2PWork> work): work_(std::move(work)
 PPCommTicket::~PPCommTicket() = default;
 
 void PPCommTicket::wait() {
-    if (work_) {
-        work_->wait();
-        work_.reset();
-    }
+    work_->wait();
 }
 
 TorchDistributedPPTransport::TorchDistributedPPTransport(int64_t previous_rank, int64_t next_rank):

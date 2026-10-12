@@ -13,6 +13,7 @@
 #include "absl/status/statusor.h"
 #include "rtp_llm/cpp/config/ConfigModules.h"
 #include "rtp_llm/cpp/config/RankLayout.h"
+#include "rtp_llm/cpp/cuda_graph/cuda_graph_device_shims.h"
 #include "rtp_llm/cpp/engine_base/Executor.h"
 #include "rtp_llm/cpp/engine_base/stream/SamplingState.h"
 #include "rtp_llm/cpp/engine_base/stream/StreamGroups.h"
@@ -101,12 +102,14 @@ private:
 
     absl::Status processImpl(const ScheduleOutput& schedule_output, int64_t schedule_time_us, bool shutdown);
 
+    void waitLastRun();
+
     void releaseAllModelBuffers();
 
     void prepareStreams(std::list<GenerateStreamPtr>& streams);
 
-    absl::StatusOr<PPExecutionPlan> buildPlan(const StreamGroups&         stream_groups,
-                                              const std::vector<int64_t>& finished_request_ids);
+    absl::StatusOr<PPExecutionPlan>
+    buildPlan(const StreamGroups& stream_groups, const std::vector<int64_t>& finished_request_ids, bool shutdown);
 
     void sampleTokens(const PPExecutionPlan& plan, const GptModelOutputs& model_output, PPExecutionResult& result);
 
@@ -149,13 +152,13 @@ private:
 
     void fillFailedDraftRows(PPExecutionResult& result);
 
-    void asyncSendPlan(const PPExecutionPlan& plan, bool metadata_only, PPTickets& tickets);
+    void asyncSendPlan(const torch::Tensor& plan_payload, PPTickets& tickets);
 
-    PPExecutionPlan receivePlan();
+    PPExecutionPlan receivePlan(torch::Tensor& plan_payload);
 
     void asyncSendTensors(const PPIntermediateTensors& tensors, PPTickets& tickets);
 
-    PPIntermediateTensors receiveTensors(PPTickets& tickets);
+    PPIntermediateTensors receiveTensors();
 
     void asyncSendExecutionResult(const PPExecutionResult& result, PPTickets& tickets);
 
@@ -228,6 +231,12 @@ private:
     std::unique_ptr<PPTransport> transport_;
     std::vector<InflightBatch>   slots_;
     size_t                       current_slot_ = 0;
+
+    /** Covers the last execution's model-buffer consumers, including outgoing activation copies. */
+    torch::Event last_compute_done_ = cuda_graph::makeGraphEvent();
+
+    /** Submit receives independently so NCCL does not wait for the previous forward. */
+    torch::Stream recv_stream_;
 
     /** Match MTP publication completion on the DSpARK P tail, which owns the draft COMMIT. */
     const bool    track_dspark_cache_store_;

@@ -16,10 +16,8 @@ public:
     ~PPCommTicket();
 
     /**
-     * Different behaviors for CPU or CUDA：
-     * 1. CPU waits for local completion
-     * 2. CUDA enqueues a wait on the tensor device's current stream and will not block the CPU.
-     * P2PWork is released after wait() returns; subsequent calls are no-ops.
+     * Delegates to Work: CPU waits for completion; CUDA orders the current stream after communication.
+     * The work retains its tensor until ticket destruction, independently of wait().
      */
     void wait();
 

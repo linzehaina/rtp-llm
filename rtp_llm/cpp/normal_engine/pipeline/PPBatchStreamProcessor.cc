@@ -883,8 +883,7 @@ absl::StatusOr<GptModelInputs> PPBatchStreamProcessor::gatherTargetVerifyModelIn
         }
         ++row;
     }
-    host_holder.hold_host(tokens);
-    model_input.combo_tokens = tokens.reshape({-1}).to(torch::kCUDA, /*non_blocking=*/true);
+    model_input.combo_tokens = tokens.reshape({-1});
     model_input.prefix_lengths = model_input.sequence_lengths.clone();
     model_input.sequence_lengths = torch::empty({0}, model_input.sequence_lengths.options());
     model_input.input_lengths = torch::full({batch_size}, score_len, model_input.input_lengths.options());

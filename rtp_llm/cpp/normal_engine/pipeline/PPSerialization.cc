@@ -99,10 +99,12 @@ struct ByteWriter {
 struct ByteReader {
     const uint8_t* p   = nullptr;
     const uint8_t* end = nullptr;
+    const bool     restore_device;
 
-    ByteReader(const torch::Tensor& buffer):
+    ByteReader(const torch::Tensor& buffer, bool restore_device = true):
         p(static_cast<const uint8_t*>(buffer.data_ptr())),
-        end(p + static_cast<size_t>(buffer.numel()) * buffer.element_size()) {
+        end(p + static_cast<size_t>(buffer.numel()) * buffer.element_size()),
+        restore_device(restore_device) {
         RTP_LLM_CHECK_WITH_INFO(buffer.dtype() == torch::kUInt8 && buffer.dim() == 1,
                                 "PP serialization payload must be a 1-D uint8 tensor");
     }
@@ -165,7 +167,7 @@ struct ByteReader {
             RTP_LLM_CHECK_WITH_INFO(sizes[d] >= 0, "PP serialization tensor has negative dim");
         }
         const auto dtype   = static_cast<torch::ScalarType>(val<int32_t>());
-        const bool is_cuda = flag();
+        const bool is_cuda = flag() && restore_device;
         const auto nbytes  = val<uint64_t>();
         /** Host tensors come back pinned: downstream fused H2D copies assert pinned memory. */
         auto out = torch::empty(
@@ -442,7 +444,7 @@ torch::Tensor serializePlan(const PPExecutionPlan& plan, bool metadata_only) {
     ByteWriter w;
     w.val<uint32_t>(kVersion);
     w.flag(metadata_only);
-    w.flag(plan.shutdown);
+    w.flag(plan.model_input.shutdown);
     if (metadata_only) {
         /** TP peers need the upstream tag identities before synchronizing numeric cache rows. */
         w.strings(plan.model_input.kv_cache_group_tags);
@@ -461,11 +463,12 @@ torch::Tensor serializePlan(const PPExecutionPlan& plan, bool metadata_only) {
 }
 
 PPExecutionPlan deserializePlan(const torch::Tensor& buffer) {
-    ByteReader r(buffer);
+    /** Decode on CPU; receivePlan submits the H2D copies required for local execution. */
+    ByteReader r(buffer, false);
     RTP_LLM_CHECK_WITH_INFO(r.val<uint32_t>() == kVersion, "PP plan payload version mismatch");
     PPExecutionPlan plan;
     const bool      metadata_only = r.flag();
-    plan.shutdown                 = r.flag();
+    plan.model_input.shutdown     = r.flag();
     if (metadata_only) {
         plan.model_input.kv_cache_group_tags = r.strings();
         r.expectEnd();

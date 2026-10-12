@@ -144,16 +144,32 @@ torch::Tensor PPExecutor::receiveObject() {
     return object;
 }
 
-void PPExecutor::asyncSendPlan(const PPExecutionPlan& plan, bool metadata_only, PPTickets& tickets) {
+void PPExecutor::asyncSendPlan(const torch::Tensor& plan_payload, PPTickets& tickets) {
     RTP_LLM_PROFILE_SCOPE("executor.pp.send_plan");
-    sendObject(pp_serialization::serializePlan(plan, metadata_only), tickets);
+    sendObject(plan_payload, tickets);
 }
 
-PPExecutionPlan PPExecutor::receivePlan() {
+PPExecutionPlan PPExecutor::receivePlan(torch::Tensor& plan_payload) {
     RTP_LLM_PROFILE_SCOPE("executor.pp.recv_plan");
-    auto plan = pp_serialization::deserializePlan(receiveObject());
-    if (plan.shutdown) {
+    plan_payload = receiveObject();
+    auto plan    = pp_serialization::deserializePlan(plan_payload);
+    if (plan.model_input.shutdown) {
         RTP_LLM_LOG_INFO("received pipeline shutdown sentinel from previous stage");
+    }
+
+    /** Restore MM inputs for local TP execution while preserving the CPU payload for forwarding. */
+    auto& model_input = plan.model_input;
+    if (model_input.multimodal_features) {
+        for (auto& tensor : *model_input.multimodal_features) {
+            buffer_holder_.hold_host(tensor);
+            tensor = tensor.to(torch::kCUDA, true);
+        }
+    }
+    if (model_input.mm_extra_input) {
+        for (auto& tensor : *model_input.mm_extra_input) {
+            buffer_holder_.hold_host(tensor);
+            tensor = tensor.to(torch::kCUDA, true);
+        }
     }
     return plan;
 }
@@ -168,17 +184,33 @@ void PPExecutor::asyncSendTensors(const PPIntermediateTensors& tensors, PPTicket
     sendObject(pp_serialization::serializeTensorsMetadata(tensors), tickets);
     for (const auto& tensor_entry : tensors.tensors) {
         if (tensor_entry.second.numel() != 0) {
-            tickets.push_back(transport_->asyncSend(tensor_entry.second));
+            /** Snapshot on the compute stream so model buffers can be reused while NCCL sends the ticket-owned copy. */
+            auto snapshot = tensor_entry.second.clone(torch::MemoryFormat::Contiguous);
+            tickets.push_back(transport_->asyncSend(snapshot));
         }
     }
 }
 
-PPIntermediateTensors PPExecutor::receiveTensors(PPTickets& tickets) {
+PPIntermediateTensors PPExecutor::receiveTensors() {
     RTP_LLM_PROFILE_SCOPE("executor.pp.recv_activations");
-    auto tensors = pp_serialization::deserializeTensorsMetadata(receiveObject());
+    PPTickets             tickets;
+    PPIntermediateTensors tensors;
+    {
+        cuda_graph::GraphStreamGuard stream_guard(cuda_graph::toGraphStream(recv_stream_));
+        tensors = pp_serialization::deserializeTensorsMetadata(receiveObject());
+        for (auto& tensor_entry : tensors.tensors) {
+            if (tensor_entry.second.numel() != 0) {
+                tickets.push_back(transport_->asyncReceive(tensor_entry.second));
+            }
+        }
+    }
+
+    /** Wait orders forward after NCCL writes; record_stream protects storage until forward's reads finish. */
+    waitAll(tickets);
+    const auto stream = cuda_graph::graphGetCurrentStream();
     for (auto& tensor_entry : tensors.tensors) {
         if (tensor_entry.second.numel() != 0) {
-            tickets.push_back(transport_->asyncReceive(tensor_entry.second));
+            tensor_entry.second.record_stream(stream);
         }
     }
     return tensors;
@@ -240,6 +272,7 @@ PPExecutor::PPExecutor(const EngineInitParams&                params,
     parallelism_config_(params.parallelism_config),
     pp_layout_(RankLayout::fromParallelismConfig(parallelism_config_)),
     slots_(parallelism_config_.pp_size + 1),
+    recv_stream_(cuda_graph::graphGetStreamFromPool(false)),
     track_dspark_cache_store_(is_dspark_ && role_type_ == RoleType::PREFILL && isLastStage() && !warm_up_),
     dspark_cache_store_sync_stream_(cuda_graph::graphGetStreamFromPool(true)),
     profile_step_start_(std::move(profile_step_start)),
@@ -491,7 +524,14 @@ PPExecutor::PPExecutor(const EngineInitParams&                params,
 }
 
 PPExecutor::~PPExecutor() {
+    /** Finish local model-buffer consumers before destroying the models. */
+    last_compute_done_.synchronize();
     cudaProfilerEnd();
+}
+
+void PPExecutor::waitLastRun() {
+    RTP_LLM_PROFILE_SCOPE("executor.pp.wait_last_batch");
+    last_compute_done_.synchronize();
 }
 
 void PPExecutor::releaseAllModelBuffers() {
@@ -595,7 +635,8 @@ void PPExecutor::prepareStreams(std::list<GenerateStreamPtr>& streams) {
 }
 
 absl::StatusOr<PPExecutionPlan> PPExecutor::buildPlan(const StreamGroups&         stream_groups,
-                                                      const std::vector<int64_t>& finished_request_ids) {
+                                                      const std::vector<int64_t>& finished_request_ids,
+                                                      bool                        shutdown) {
     RTP_LLM_PROFILE_SCOPE("executor.pp.build_plan");
     RTP_LLM_CHECK_WITH_INFO(isFirstStage(), "only the first PP stage can build an execution plan from streams");
 
@@ -617,6 +658,7 @@ absl::StatusOr<PPExecutionPlan> PPExecutor::buildPlan(const StreamGroups&       
     RETURN_IF_STATUS_OR_ERROR(model_input_status);
     plan.model_input          = std::move(model_input_status.value());
     plan.model_input.skip_run = stream_groups.empty();
+    plan.model_input.shutdown = shutdown;
 
     if (!plan.model_input.skip_run) {
         plan.draft_next_position_ids =
@@ -1140,18 +1182,19 @@ absl::Status PPExecutor::processImpl(const ScheduleOutput& schedule_output, int6
 
     /** 1. recv the plan from the previous stage */
     PPExecutionPlan plan;
+    torch::Tensor   plan_payload;
     StreamGroups    scheduled_stream_groups;
     if (isFirstStage()) {
         scheduled_stream_groups = StreamGroups(streams);
         /** PP input preparation covers the complete execution plan. */
         const auto start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
-        auto       plan_status   = buildPlan(scheduled_stream_groups, schedule_output.finished_request_ids);
+        auto       plan_status   = buildPlan(scheduled_stream_groups, schedule_output.finished_request_ids, shutdown);
         RETURN_IF_STATUS_OR_ERROR(plan_status);
-        plan                                    = std::move(plan_status.value());
-        plan.shutdown                            = shutdown;
+        plan                                     = std::move(plan_status.value());
         executor_collector.gather_model_input_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
+        plan_payload                             = pp_serialization::serializePlan(plan, !isStageRoot());
     } else {
-        plan = receivePlan();
+        plan = receivePlan(plan_payload);
     }
 
     if (isLastStage() && isStageRoot()) {
@@ -1166,17 +1209,9 @@ absl::Status PPExecutor::processImpl(const ScheduleOutput& schedule_output, int6
     {
         RTP_LLM_PROFILE_SCOPE("executor.pp.tp_sync_input");
         const auto start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
-        if (isFirstStage() && parallelism_config_.tp_size > 1) {
-            /** First-stage TP peers enter independently; use the root's terminal plan to stop on the same round. */
-            auto shutdown_tensor = torch::tensor({static_cast<int64_t>(plan.shutdown)}, torch::kInt64);
-            execBroadcastCpu({{shutdown_tensor}, 0});
-            plan.shutdown = shutdown_tensor.item<int64_t>() != 0;
-        }
         tpSyncModelInputs(model_input, parallelism_config_);
         executor_collector.tp_sync_input_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
     }
-
-    releaseAllModelBuffers();
 
     /** 3. Wait on this slot's previous sends before resetting it. CUDA waits order subsequent operations on the current
      * stream after communication. */
@@ -1197,24 +1232,26 @@ absl::Status PPExecutor::processImpl(const ScheduleOutput& schedule_output, int6
 
     /** 4. send the plan to next stage  */
     if (!isLastStage()) {
-        asyncSendPlan(plan, !isStageRoot(), inflight.plan_sends);
+        asyncSendPlan(plan_payload, inflight.plan_sends);
     }
 
     /** 5. run the batch. */
-    if (!model_input.skip_run) {
+    if (model_input.skip_run) {
+        waitLastRun();
+        releaseAllModelBuffers();
+    } else {
         if (profile_step_start_) {
             profile_step_start_();
         }
 
         collectExecutorMetrics(model_input, plan.sampling_plan.sequence_lengths, executor_collector);
 
-        PPTickets             tensor_receives;
         PPIntermediateTensors input_tensors;
-
         if (!isFirstStage()) {
-            input_tensors = receiveTensors(tensor_receives);
-            waitAll(tensor_receives);
+            input_tensors = receiveTensors();
         }
+        waitLastRun();
+        releaseAllModelBuffers();
 
         if (cache_manager_) {
             RTP_LLM_PROFILE_SCOPE("executor.pp.kv_cache_update");
@@ -1262,11 +1299,6 @@ absl::Status PPExecutor::processImpl(const ScheduleOutput& schedule_output, int6
                 expert_balancer_->stepForward(*model_, executor_collector, !model_input.is_fake_stream);
                 executor_collector.eplb_step_latency_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
             }
-
-            RTP_LLM_PROFILE_SCOPE("executor.pp.wait_forward_done");
-            auto forward_done = cuda_graph::makeGraphEvent();
-            forward_done.record(cuda_graph::graphGetCurrentStream());
-            forward_done.synchronize();
         }
 
         if (!isLastStage()) {
@@ -1320,6 +1352,7 @@ absl::Status PPExecutor::processImpl(const ScheduleOutput& schedule_output, int6
                 asyncSendExecutionResult(execution_result, inflight.execution_result_sends);
             }
         }
+        last_compute_done_.record(cuda_graph::graphGetCurrentStream());
         if (isFirstStage() && isStageRoot()) {
             inflight.executor_collector = executor_collector;
         }
@@ -1336,7 +1369,7 @@ absl::Status PPExecutor::processImpl(const ScheduleOutput& schedule_output, int6
         RETURN_IF_STATUS_ERROR(processExecutionResult(next_batch));
     }
 
-    stopped_ = plan.shutdown;
+    stopped_ = model_input.shutdown;
     return absl::OkStatus();
 }
 

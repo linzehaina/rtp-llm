@@ -83,10 +83,9 @@ torch::Tensor reorderCacheCopyRows(const torch::Tensor& mapping, const std::vect
         return mapping;
     }
     const auto source_rows = mapping.select(1, 0).to(torch::kInt64);
-    RTP_LLM_CHECK_WITH_INFO(torch::logical_and(source_rows.ge(0), source_rows.lt(static_cast<int64_t>(rows.size())))
-                                .all()
-                                .item<bool>(),
-                            "cache copy payload row is out of range");
+    RTP_LLM_CHECK_WITH_INFO(
+        torch::logical_and(source_rows.ge(0), source_rows.lt(static_cast<int64_t>(rows.size()))).all().item<bool>(),
+        "cache copy payload row is out of range");
     const auto row_map = torch::tensor(rows, torch::TensorOptions().dtype(torch::kInt64).device(mapping.device()));
     auto       result  = mapping.clone();
     result.select(1, 0).copy_(row_map.index_select(0, source_rows).to(torch::kInt32));
@@ -171,6 +170,7 @@ GptModelInputShapeHints getModelInputShapeHints(const GptModelInputs& inputs) {
     encode_flag(inputs.skip_run, GptModelInputControlFlag::kControlSkipRun);
     encode_flag(inputs.is_fake_stream, GptModelInputControlFlag::kControlFakeStream);
     encode_flag(inputs.is_target_verify, GptModelInputControlFlag::kControlTargetVerify);
+    encode_flag(inputs.is_draft_extend, GptModelInputControlFlag::kControlDraftExtend);
     encode_flag(inputs.pd_separation, GptModelInputControlFlag::kControlPdSeparation);
     encode_flag(inputs.decode_entrance, GptModelInputControlFlag::kControlDecodeEntrance);
     encode_flag(inputs.use_opaque_kv_cache_store, GptModelInputControlFlag::kControlOpaqueKvCacheStore);
@@ -257,9 +257,9 @@ void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallel
 
     // Tags are rank-local configuration metadata. Every rank validates its local
     // set, while numeric payloads travel in the shared canonical tag order.
-    const bool           legacy_untagged_cache = inputs.kv_cache_group_tags.empty();
-    const auto           sorted_rows = legacy_untagged_cache ? std::vector<int64_t>{0} :
-                                                               sortedCacheGroupRows(inputs.kv_cache_group_tags);
+    const bool legacy_untagged_cache = inputs.kv_cache_group_tags.empty();
+    const auto sorted_rows =
+        legacy_untagged_cache ? std::vector<int64_t>{0} : sortedCacheGroupRows(inputs.kv_cache_group_tags);
     std::vector<int64_t> local_rows(sorted_rows.size());
     for (size_t i = 0; i < sorted_rows.size(); ++i) {
         local_rows[sorted_rows[i]] = static_cast<int64_t>(i);
@@ -267,10 +267,10 @@ void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallel
     torch::Tensor wire_blocks, wire_kernel_blocks, wire_group_types, wire_copy_mapping;
     if (parallelism_config.tp_rank == 0 && !inputs.skip_run) {
         if (legacy_untagged_cache) {
-            RTP_LLM_CHECK_WITH_INFO((!inputs.kv_cache_block_id.defined() || inputs.kv_cache_block_id.dim() == 2)
-                                        && (!inputs.kv_cache_kernel_block_id.defined()
-                                            || inputs.kv_cache_kernel_block_id.dim() == 2),
-                                    "untagged cache payload only supports 2-D single-group block tables");
+            RTP_LLM_CHECK_WITH_INFO(
+                (!inputs.kv_cache_block_id.defined() || inputs.kv_cache_block_id.dim() == 2)
+                    && (!inputs.kv_cache_kernel_block_id.defined() || inputs.kv_cache_kernel_block_id.dim() == 2),
+                "untagged cache payload only supports 2-D single-group block tables");
             RTP_LLM_CHECK_WITH_INFO(!inputs.kv_cache_update_mapping.defined()
                                         || inputs.kv_cache_update_mapping.numel() == 0,
                                     "cache update mapping requires cache group tags");
@@ -279,7 +279,7 @@ void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallel
         wire_kernel_blocks = reorderCacheRows(inputs.kv_cache_kernel_block_id, sorted_rows, true);
         wire_group_types   = reorderCacheRows(inputs.kv_cache_group_types, sorted_rows, false);
         wire_copy_mapping  = legacy_untagged_cache && inputs.kv_cache_update_mapping.defined()
-                                 && inputs.kv_cache_update_mapping.numel() == 0 ?
+                                    && inputs.kv_cache_update_mapping.numel() == 0 ?
                                  inputs.kv_cache_update_mapping :
                                  reorderCacheCopyRows(inputs.kv_cache_update_mapping, local_rows);
     }
@@ -319,6 +319,7 @@ void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallel
     inputs.skip_run                  = has_flag(GptModelInputControlFlag::kControlSkipRun);
     inputs.is_fake_stream            = has_flag(GptModelInputControlFlag::kControlFakeStream);
     inputs.is_target_verify          = has_flag(GptModelInputControlFlag::kControlTargetVerify);
+    inputs.is_draft_extend           = has_flag(GptModelInputControlFlag::kControlDraftExtend);
     inputs.pd_separation             = has_flag(GptModelInputControlFlag::kControlPdSeparation);
     inputs.decode_entrance           = has_flag(GptModelInputControlFlag::kControlDecodeEntrance);
     inputs.use_opaque_kv_cache_store = has_flag(GptModelInputControlFlag::kControlOpaqueKvCacheStore);
@@ -423,16 +424,16 @@ void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallel
         };
 
         inputs.combo_tokens     = allocBuf(rtp_llm::DataType::TYPE_INT32,
-                                       {checkedHint(GptModelInputIndex::comboTokens, "comboTokens")},
+                                           {checkedHint(GptModelInputIndex::comboTokens, "comboTokens")},
                                        pickAlloc(GptModelInputDeviceBit::kDeviceBitComboTokens));
         inputs.input_lengths    = allocBuf(rtp_llm::DataType::TYPE_INT32,
-                                        {checkedHint(GptModelInputIndex::inputLengths, "inputLengths")},
+                                           {checkedHint(GptModelInputIndex::inputLengths, "inputLengths")},
                                         pickAlloc(GptModelInputDeviceBit::kDeviceBitInputLengths));
         inputs.sequence_lengths = allocBuf(rtp_llm::DataType::TYPE_INT32,
                                            {checkedHint(GptModelInputIndex::sequenceLengths, "sequenceLengths")},
                                            pickAlloc(GptModelInputDeviceBit::kDeviceBitSequenceLengths));
         inputs.prefix_lengths   = allocBuf(rtp_llm::DataType::TYPE_INT32,
-                                         {context_batch_size},
+                                           {context_batch_size},
                                          pickAlloc(GptModelInputDeviceBit::kDeviceBitPrefixLengths));
         if (max_kernel_blocks != 0) {
             // kv_cache_kernel_block_id residency follows the producer (rank 0): device only when
@@ -485,7 +486,7 @@ void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallel
                                                 {request_length},
                                                 pickAlloc(GptModelInputDeviceBit::kDeviceBitRequestPdSeparation));
         inputs.lm_output_indexes     = allocBuf(rtp_llm::DataType::TYPE_INT32,
-                                            {checkedHint(GptModelInputIndex::lmOutputIndexes, "lmOutputIndexes")},
+                                                {checkedHint(GptModelInputIndex::lmOutputIndexes, "lmOutputIndexes")},
                                             pickAlloc(GptModelInputDeviceBit::kDeviceBitLmOutputIndexes));
         if (combo_position_ids_size) {
             inputs.combo_position_ids = allocBuf(rtp_llm::DataType::TYPE_INT32,
@@ -746,7 +747,7 @@ void tpSyncModelInputs(GptModelInputs& inputs, const ParallelismConfig& parallel
             inputs.kv_cache_block_id        = reorderCacheRows(wire_blocks, local_rows, true);
             inputs.kv_cache_kernel_block_id = reorderCacheRows(wire_kernel_blocks, local_rows, true);
             inputs.kv_cache_group_types     = reorderCacheRows(wire_group_types, local_rows, false);
-            inputs.kv_cache_update_mapping = reorderCacheCopyRows(wire_copy_mapping, sorted_rows);
+            inputs.kv_cache_update_mapping  = reorderCacheCopyRows(wire_copy_mapping, sorted_rows);
         }
     }
 }

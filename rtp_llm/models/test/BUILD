@@ -32,3 +32,9 @@ py_test(
     deps = ["//rtp_llm:testlib"],
     target_compatible_with = _DSV4_CUDA13_ONLY,
 )
+
+py_test(
+    name = "glm5_kv_cache_test",
+    srcs = ["glm5_kv_cache_test.py"],
+    deps = ["//rtp_llm:testlib"],
+)

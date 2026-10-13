@@ -8,6 +8,7 @@ import org.flexlb.enums.FlexMetricType;
 import org.flexlb.enums.FlexPriorityType;
 import org.flexlb.metric.FlexMetricTags;
 import org.flexlb.metric.FlexMonitor;
+import org.flexlb.metric.SafeFlexMonitor;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
@@ -58,7 +59,7 @@ public class DeliveryMetricsReporter {
 
     @Autowired
     public DeliveryMetricsReporter(FlexMonitor monitor) {
-        this.monitor = monitor;
+        this.monitor = SafeFlexMonitor.wrap(monitor);
     }
 
     @PostConstruct
@@ -262,19 +263,11 @@ public class DeliveryMetricsReporter {
     }
 
     /** Completion observers are independent: a failed metric must not suppress the next one. */
-    public void reportBatchCompletion(String engineIp, long batchId, long predictedMs, long actualMs) {
+    public void reportBatchCompletion(String engineIp, long predictedMs, long actualMs) {
         FlexMetricTags tags = FlexMetricTags.ofEngine(engineIp, "role", RoleType.PREFILL.name());
-        reportCompletionMetric(BATCH_PREDICTED_TIME_MS, tags, predictedMs, batchId);
-        reportCompletionMetric(BATCH_ACTUAL_TIME_MS, tags, actualMs, batchId);
-        reportCompletionMetric(BATCH_PREDICT_GAP_MS, tags, actualMs - predictedMs, batchId);
-    }
-
-    private void reportCompletionMetric(String metric, FlexMetricTags tags, long value, long batchId) {
-        try {
-            monitor.report(metric, tags, value);
-        } catch (RuntimeException failure) {
-            log.warn("Batch completion metric failed: batchId={} metric={}", batchId, metric, failure);
-        }
+        monitor.report(BATCH_PREDICTED_TIME_MS, tags, predictedMs);
+        monitor.report(BATCH_ACTUAL_TIME_MS, tags, actualMs);
+        monitor.report(BATCH_PREDICT_GAP_MS, tags, actualMs - predictedMs);
     }
 
     public enum Latency {

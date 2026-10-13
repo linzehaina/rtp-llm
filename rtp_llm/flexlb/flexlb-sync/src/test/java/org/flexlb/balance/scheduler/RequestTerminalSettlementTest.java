@@ -406,13 +406,13 @@ class RequestTerminalSettlementTest {
             assertFalse(context.installInactivityDeadline(mock(ExpirationTimer.InactivityDeadline.class)));
             return null;
         }).when(inactivity).cancel();
-        delivery.recordWorkerCompletion(f.item());
-        delivery.item.ctx().scheduler().settleDelivery(delivery);
+        context.recordDeliveryWorkerCompletion(delivery, f.item());
+        delivery.item.ctx().scheduler().advanceDelivery(delivery);
         SchedulerTestSupport.awaitRequestWork(f.scheduler().runtime);
         assertEquals(RequestContext.RequestStage.FINALIZING, context.stage(),
                 "resource evidence cannot archive before the terminal execution owner finishes");
         f.scheduler().onResponseUndeliverable(context);
-        assertFalse(delivery.cleanupRequired(), "late frontend failure cannot revoke completed execution evidence");
+        assertFalse(context.deliveryCleanupRequired(delivery), "late frontend failure cannot revoke completed execution evidence");
         f.scheduler().finalizationEffects(action, null).run();
         SchedulerTestSupport.awaitRequestWork(f.scheduler().runtime);
         assertEquals(RequestContext.RequestStage.FINISHED, context.stage());
@@ -483,11 +483,14 @@ class RequestTerminalSettlementTest {
         AbstractRequestScheduler requestOwner = RequestProtocolTestSupport.initialize(publisher, context, timer);
         when(SchedulerTestSupport.cancelChannel(requestOwner).cancel(any(), anyLong(), any(), anyLong()))
                 .thenReturn(java.util.concurrent.CompletableFuture.completedFuture(org.flexlb.balance.eviction.EngineCancelChannel.CancelAck.REQUEST_CLEANED));
-        when(publisher.tryRegister()).thenAnswer(call -> new ResponseCompletionExecutor.CompletionRegistration(publisher));
-        doAnswer(call -> {
-            ((java.util.function.BooleanSupplier) call.getArgument(1)).getAsBoolean();
-            return null;
-        }).when(publisher).submit(any(), any());
+        when(publisher.tryRegister()).thenAnswer(call -> {
+            var registration = mock(ResponseCompletionExecutor.CompletionRegistration.class);
+            doAnswer(completion -> {
+                ((java.util.function.BooleanSupplier) completion.getArgument(0)).getAsBoolean();
+                return null;
+            }).when(registration).submit(any());
+            return registration;
+        });
         var prefillServer = new org.flexlb.dao.loadbalance.ServerStatus();
         prefillServer.setServerIp("127.0.0.1");
         prefillServer.setGrpcPort(8090);

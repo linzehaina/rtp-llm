@@ -22,6 +22,8 @@ import reactor.netty.resources.LoopResources;
 import static org.flexlb.constant.MetricConstant.PREFILL_SELECTED_ESTIMATED_TTFT_MS;
 import static org.flexlb.constant.MetricConstant.PREFILL_SELECTED_EXECUTION_TIME_MS;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.doThrow;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.flexlb.constant.MetricConstant.CACHE_STATUS_CHECK_SUCCESS_PERIOD;
@@ -61,6 +63,21 @@ class EngineHealthReporterSelectionMetricTest {
         reporter = new EngineHealthReporter(
                 monitor, engineGrpcClient, loopResources,
                 workerDirectory);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void metricFailureCannotInterruptHealthMetricInitializationOrReporting(boolean error) {
+        Throwable failure = error ? new AssertionError("monitor failed") : new IllegalStateException("monitor failed");
+        doThrow(failure).when(monitor).register(PREFILL_SELECTED_ESTIMATED_TTFT_MS,
+                FlexMetricType.GAUGE, FlexPriorityType.PRECISE);
+        assertDoesNotThrow(reporter::init);
+        verify(monitor).register(PREFILL_SELECTED_EXECUTION_TIME_MS,
+                FlexMetricType.GAUGE, FlexPriorityType.PRECISE);
+        var tags = FlexMetricTags.of("engineIp", "10.0.0.1", "role", "PREFILL", "delivery_mode", "NON_BATCH");
+        doThrow(failure).when(monitor).report(PREFILL_SELECTED_ESTIMATED_TTFT_MS, tags, 1250);
+        assertDoesNotThrow(() -> reporter.reportPrefillSelectedEstimates(RoleType.PREFILL, "10.0.0.1", "NON_BATCH", 1250, 400));
+        verify(monitor).report(PREFILL_SELECTED_EXECUTION_TIME_MS, tags, 400);
     }
 
     @ParameterizedTest

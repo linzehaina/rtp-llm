@@ -30,7 +30,7 @@ class DeliveryClaimTest {
             assertTrue(f.owner.tryStartSend(f.claim));
             f.owner.completeDelivery(f.claim, DeliveryResult.delivered());
             SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
-            synchronized (f.context) { assertTrue(f.claim.recordAbandonmentLocked(CancelReason.CLIENT_CANCELLED)); }
+            synchronized (f.context) { assertTrue(f.context.recordDeliveryAbandonmentLocked(f.claim, CancelReason.CLIENT_CANCELLED)); }
             when(f.channel.cancel(any(), anyLong(), any(), anyLong()))
                     .thenReturn(CompletableFuture.completedFuture(EngineCancelChannel.CancelAck.REQUEST_CLEANED));
             var task = new DeliveryCleanupTask(f.claim, f.channel, SchedulerTestSupport.cleanupExecutor(f.owner.runtime),
@@ -99,8 +99,8 @@ class DeliveryClaimTest {
             f.owner.completeDelivery(f.claim, DeliveryResult.delivered());
             SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
             f.clearDecodeStateOwnership();
-            f.claim.recordDecodeTerminalStatus(f.decode, DecodeResources.DecodeRequestStatus.terminal(f.reservation, 0L));
-            f.owner.settleDelivery(f.claim);
+            f.recordDecodeStatus(f.decode, DecodeResources.DecodeRequestStatus.terminal(f.reservation, 0L));
+            f.owner.advanceDelivery(f.claim);
             Runnable terminal = f.context.scheduler().acceptDecodeStatus(f.context, f.decode,
                     DecodeResources.DecodeRequestStatus.terminal(f.reservation, 0L), System.currentTimeMillis());
             assertNotNull(terminal);
@@ -196,7 +196,7 @@ class DeliveryClaimTest {
             try {
                 producer.start();
                 assertTrue(entered.await(5, TimeUnit.SECONDS));
-                f.owner.settleDelivery(f.claim);
+                f.owner.advanceDelivery(f.claim);
                 assertTrue(f.settlement().isDone(), "exact proof may settle while local cleanup is being submitted");
                 terminal.run();
                 closer.start();
@@ -298,12 +298,12 @@ class DeliveryClaimTest {
             f.owner.onResponseUndeliverable(f.context);
             f.cancel.complete(EngineCancelChannel.CancelAck.REQUEST_FENCED);
             assertFalse(f.settlement().isDone());
-            f.claim.recordDecodeTerminalStatus(RequestProtocolTestSupport.decodeEndpoint(), DecodeResources.DecodeRequestStatus.terminal(f.reservation, 0L));
-            f.owner.settleDelivery(f.claim);
+            f.recordDecodeStatus(RequestProtocolTestSupport.decodeEndpoint(), DecodeResources.DecodeRequestStatus.terminal(f.reservation, 0L));
+            f.owner.advanceDelivery(f.claim);
             assertFalse(f.settlement().isDone(), "another endpoint is not proof");
-            f.claim.recordDecodeTerminalStatus(f.decode, DecodeResources.DecodeRequestStatus.terminal(
+            f.recordDecodeStatus(f.decode, DecodeResources.DecodeRequestStatus.terminal(
                     new DecodeResources.ReservationHandle(1L, 41L, 99L), 0L));
-            f.owner.settleDelivery(f.claim);
+            f.owner.advanceDelivery(f.claim);
             assertFalse(f.settlement().isDone(), "another reservation is not proof");
             f.applyDecodeTerminal();
             f.settlement().get(2, TimeUnit.SECONDS);
@@ -350,25 +350,36 @@ class DeliveryClaimTest {
             assertAll(
                     () -> assertFalse(f.settlement().isDone(), "cleanup execution failure is not resource settlement"),
                     () -> assertTrue(f.owner.requests.isCurrent(f.context)),
-                    () -> assertNull(f.claim.provenReleaseReason()),
+                    () -> assertNull(f.context.deliveryReleaseReason(f.claim)),
                     () -> verify(f.prefill, never()).releaseRequest(any()),
                     () -> verify(f.decode, never()).release(any(), any()));
         }
     }
 
-    @Test void activeDecodeHeartbeatCannotPublishAnUnprocessedNotSentResult() throws Exception {
+    @Test void activeDecodeHeartbeatCannotPublishSuccessWhileNotSentEffectsArePending() throws Exception {
         try (var f = new Fixture()) {
-            // Pause the sender between recording its result and scheduling the failure effects.
-            f.claim.recordSendResult(DeliveryResult.notSent(new IllegalStateException("not sent")));
-            Runnable heartbeat = f.owner.acceptDecodeStatus(f.context, f.decode,
-                    DecodeResources.DecodeRequestStatus.active(f.reservation), System.currentTimeMillis());
-            assertNotNull(heartbeat, "the current decision deadline must produce a heartbeat continuation");
-            heartbeat.run();
-            assertFalse(f.settlement().isDone(), "ACTIVE is not delivery release evidence");
-            f.owner.recordSchedulingFailure(f.context, org.flexlb.dao.loadbalance.StrategyErrorType.NO_AVAILABLE_WORKER, "not sent");
-            f.owner.settleDelivery(f.claim);
-            SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
+            var original = SchedulerTestSupport.requestWorkers(f.owner.runtime);
+            var held = mock(java.util.concurrent.ExecutorService.class);
+            var accepted = new java.util.ArrayList<Runnable>();
+            org.mockito.Mockito.doAnswer(call -> {
+                accepted.add(call.getArgument(0));
+                return null;
+            }).when(held).execute(any(Runnable.class));
+            ReflectionTestUtils.setField(f.owner.runtime, "requestWorkers", held);
+            try {
+                f.owner.completeDelivery(f.claim, DeliveryResult.notSent(new IllegalStateException("not sent")));
+                assertFalse(accepted.isEmpty(), "failure effects are deliberately paused");
+                Runnable heartbeat = f.owner.acceptDecodeStatus(f.context, f.decode,
+                        DecodeResources.DecodeRequestStatus.active(f.reservation), System.currentTimeMillis());
+                if (heartbeat != null) { heartbeat.run(); }
+                assertFalse(f.context.getFuture().isDone(), "ACTIVE cannot replace the selected send failure");
+                assertTrue(f.settlement().isDone(), "NOT_SENT itself proves delivery settlement");
+            } finally {
+                ReflectionTestUtils.setField(f.owner.runtime, "requestWorkers", original);
+                for (Runnable work : accepted) { work.run(); }
+            }
             f.awaitArchive();
+            assertFalse(f.context.getFuture().get(2, TimeUnit.SECONDS).isSuccess());
         }
     }
 
@@ -393,7 +404,7 @@ class DeliveryClaimTest {
             }
             f.awaitArchive();
             assertFalse(f.context.getFuture().get(2, TimeUnit.SECONDS).isSuccess());
-            assertNull(f.claim.cleanupEvidence().reason(), "NOT_SENT needs no remote abandonment protocol");
+            assertNull(f.context.deliveryCleanupEvidence(f.claim).reason(), "NOT_SENT needs no remote abandonment protocol");
             assertFalse(f.prefillOwned.get());
             assertFalse(f.decodeOwned.get());
             verify(f.decode).release(f.reservation, DecodeResources.ReleaseReason.NOT_SENT);
@@ -446,7 +457,7 @@ class DeliveryClaimTest {
             f.retireDecode();
             SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
 
-            assertTrue(f.claim.cleanupEvidence().remoteSettled(), "both exact generations have retired");
+            assertTrue(f.context.deliveryCleanupEvidence(f.claim).remoteSettled(), "both exact generations have retired");
             f.assertArchivedAfterCleanup();
         }
     }
@@ -506,7 +517,7 @@ class DeliveryClaimTest {
             assertFalse(f.owner.tryStartSend(f.claim), "uncertain delivery must not be sent again");
             assertFalse(f.settlement().isDone());
             assertTrue(f.owner.requests.isCurrent(f.context));
-            assertNull(f.claim.provenReleaseReason());
+            assertNull(f.context.deliveryReleaseReason(f.claim));
             verify(f.prefill, never()).releaseRequest(any());
             verify(f.decode, never()).release(any(), any());
 
@@ -623,11 +634,11 @@ class DeliveryClaimTest {
             var requestStatus = mismatch.equals("notTerminal")
                     ? DecodeResources.DecodeRequestStatus.active(reservation)
                     : DecodeResources.DecodeRequestStatus.terminal(reservation, 0L);
-            f.claim.recordDecodeTerminalStatus(source, requestStatus);
-            f.owner.settleDelivery(f.claim);
+            f.recordDecodeStatus(source, requestStatus);
+            f.owner.advanceDelivery(f.claim);
             SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
             assertFalse(f.settlement().isDone());
-            assertNull(f.claim.provenReleaseReason());
+            assertNull(f.context.deliveryReleaseReason(f.claim));
             assertTrue(f.decodeOwned.get(), "foreign facts cannot release the exact Decode owner");
             verify(f.prefill, never()).releaseRequest(any());
             verify(f.decode, never()).release(any(), any());
@@ -766,7 +777,7 @@ class DeliveryClaimTest {
             verify(f.channel, times(8)).cancel(any(), eq(41L), any(), anyLong());
             assertTrue(timer.retries.isEmpty(), "retry budget must end without scheduling a ninth attempt");
             assertTrue(f.owner.requests.isCurrent(f.context));
-            assertNull(f.claim.provenReleaseReason());
+            assertNull(f.context.deliveryReleaseReason(f.claim));
             verify(f.prefill, never()).releaseRequest(any());
             verify(f.decode, never()).release(any(), any());
         }
@@ -983,6 +994,10 @@ class DeliveryClaimTest {
             if (decodeOwned.getAndSet(false)) { decodeClearedByState.set(true); }
         }
 
+        void recordDecodeStatus(DecodeEndpoint source, DecodeResources.DecodeRequestStatus status) {
+            synchronized (context) { context.consumeDecodeStatusLocked(source, status, System.currentTimeMillis()); }
+        }
+
         void applyDecodeTerminal() {
             clearDecodeStateOwnership();
             owner.onDecodeStatus(context, decode, DecodeResources.DecodeRequestStatus.terminal(reservation, 0L));
@@ -1028,9 +1043,9 @@ class DeliveryClaimTest {
         void assertArchivedAfterCleanup() throws Exception {
             settlement().get(2, TimeUnit.SECONDS);
             synchronized (context) {
-                assertEquals(CancelReason.CLIENT_CANCELLED, ReflectionTestUtils.getField(claim, "abandonmentReason"));
-                assertEquals(true, ReflectionTestUtils.getField(claim, "prefillReleaseProven"));
-                assertEquals(true, ReflectionTestUtils.getField(claim, "decodeReleaseProven"));
+                assertEquals(CancelReason.CLIENT_CANCELLED, ReflectionTestUtils.getField(ReflectionTestUtils.getField(context, "deliveryState"), "abandonmentReason"));
+                assertEquals(true, ReflectionTestUtils.getField(ReflectionTestUtils.getField(context, "deliveryState"), "prefillReleaseProven"));
+                assertEquals(true, ReflectionTestUtils.getField(ReflectionTestUtils.getField(context, "deliveryState"), "decodeReleaseProven"));
             }
             awaitArchive();
             SchedulerTestSupport.awaitRequestWork(owner.runtime);

@@ -2,6 +2,9 @@ package org.flexlb.balance.scheduler;
 
 
 import com.google.protobuf.DescriptorProtos;
+import io.micrometer.core.instrument.Meter;
+import io.micrometer.core.instrument.config.MeterFilter;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import com.google.protobuf.Descriptors;
 import com.google.protobuf.DynamicMessage;
 import org.flexlb.balance.delivery.CapacityBoundary;
@@ -71,6 +74,28 @@ class DefaultBatchDispatcherTest {
     void tearDown() {
         org.flexlb.telemetry.FlexlbTrace.configure(null, "");
         dispatcher.shutdown();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void metricRegistrationFailureCannotPreventBatchDispatch(boolean error) throws Exception {
+        var registry = new SimpleMeterRegistry();
+        try {
+            registry.config().meterFilter(new MeterFilter() {
+                @Override
+                public Meter.Id map(Meter.Id id) {
+                    if (error) {
+                        throw new AssertionError("monitor failed");
+                    }
+                    throw new IllegalStateException("monitor failed");
+                }
+            });
+            dispatcher.shutdown();
+            dispatcher = assertDoesNotThrow(() -> new DefaultBatchDispatcher(grpcClient, configService, registry));
+            assertDispatchedTraceContexts(true, false);
+        } finally {
+            registry.close();
+        }
     }
 
     @Test

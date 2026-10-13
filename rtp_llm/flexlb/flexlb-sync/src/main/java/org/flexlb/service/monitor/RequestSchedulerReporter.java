@@ -6,6 +6,7 @@ import org.flexlb.enums.FlexMetricType;
 import org.flexlb.enums.FlexPriorityType;
 import org.flexlb.metric.FlexMetricTags;
 import org.flexlb.metric.FlexMonitor;
+import org.flexlb.metric.SafeFlexMonitor;
 import org.flexlb.util.PriorityNormalizer;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
@@ -51,7 +52,7 @@ public class RequestSchedulerReporter {
 
     @Autowired
     public RequestSchedulerReporter(FlexMonitor monitor) {
-        this.monitor = monitor;
+        this.monitor = SafeFlexMonitor.wrap(monitor);
     }
 
     private static FlexMetricTags[] buildPriorityTags() {

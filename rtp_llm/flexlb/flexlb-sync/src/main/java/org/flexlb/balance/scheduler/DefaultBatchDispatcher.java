@@ -12,6 +12,7 @@ import org.flexlb.balance.projection.RouteProjection;
 import org.flexlb.config.ConfigService;
 import org.flexlb.config.DispatcherConfig;
 import org.flexlb.constant.MetricConstant;
+import org.flexlb.metric.SafeFlexMonitor;
 import org.flexlb.dao.loadbalance.ServerStatus;
 import org.flexlb.dao.route.RoleType;
 import org.flexlb.engine.grpc.EngineGrpcClient;
@@ -186,27 +187,31 @@ public class DefaultBatchDispatcher {
             return;
         }
 
-        Gauge.builder(METRIC_PREFIX + MetricConstant.DISPATCH_EXECUTOR_ACTIVE_THREADS,
+        SafeFlexMonitor.run(MetricConstant.DISPATCH_EXECUTOR_ACTIVE_THREADS,
+                () -> Gauge.builder(METRIC_PREFIX + MetricConstant.DISPATCH_EXECUTOR_ACTIVE_THREADS,
                         dispatchExecutor, ThreadPoolExecutor::getActiveCount)
                 .description("Dispatch executor active thread count")
-                .register(meterRegistry);
+                .register(meterRegistry));
 
-        Gauge.builder(METRIC_PREFIX + MetricConstant.DISPATCH_EXECUTOR_QUEUE_SIZE,
+        SafeFlexMonitor.run(MetricConstant.DISPATCH_EXECUTOR_QUEUE_SIZE,
+                () -> Gauge.builder(METRIC_PREFIX + MetricConstant.DISPATCH_EXECUTOR_QUEUE_SIZE,
                         dispatchExecutor, exec -> exec.getQueue().size())
                 .description("Dispatch executor pending task queue size")
-                .register(meterRegistry);
+                .register(meterRegistry));
 
-        Gauge.builder(METRIC_PREFIX + MetricConstant.DISPATCH_EXECUTOR_POOL_SIZE,
+        SafeFlexMonitor.run(MetricConstant.DISPATCH_EXECUTOR_POOL_SIZE,
+                () -> Gauge.builder(METRIC_PREFIX + MetricConstant.DISPATCH_EXECUTOR_POOL_SIZE,
                         dispatchExecutor, ThreadPoolExecutor::getPoolSize)
                 .description("Dispatch executor current pool size")
-                .register(meterRegistry);
+                .register(meterRegistry));
 
-        FunctionCounter.builder(METRIC_PREFIX + MetricConstant.DISPATCH_EXECUTOR_COMPLETED_TASKS,
+        SafeFlexMonitor.run(MetricConstant.DISPATCH_EXECUTOR_COMPLETED_TASKS,
+                () -> FunctionCounter.builder(METRIC_PREFIX + MetricConstant.DISPATCH_EXECUTOR_COMPLETED_TASKS,
                         dispatchExecutor, ThreadPoolExecutor::getCompletedTaskCount)
                 .description("Dispatch executor total completed tasks")
-                .register(meterRegistry);
+                .register(meterRegistry));
 
-        Logger.info("FlexLB dispatch executor metrics registered with MeterRegistry");
+        Logger.info("FlexLB dispatch executor metric registration finished");
     }
 
     public CapacityBoundary.Attempt<PreparedSubmission>

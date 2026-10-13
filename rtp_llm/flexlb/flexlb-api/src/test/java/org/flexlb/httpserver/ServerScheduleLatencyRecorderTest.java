@@ -20,7 +20,7 @@ class ServerScheduleLatencyRecorderTest {
         org.springframework.test.util.ReflectionTestUtils.setField(context, "serviceStartNanos", end - TimeUnit.MILLISECONDS.toNanos(18));
         context.setRouteSubmittedNanos(end - TimeUnit.MILLISECONDS.toNanos(15));
         context.setBatchDispatchedNanos(end - TimeUnit.MILLISECONDS.toNanos(10));
-        context.setAckAtNanos(end - TimeUnit.MILLISECONDS.toNanos(2));
+        org.springframework.test.util.ReflectionTestUtils.setField(context, "ackAtNanos", end - TimeUnit.MILLISECONDS.toNanos(2));
 
         recorder.recordArrival(end - TimeUnit.SECONDS.toNanos(1));
         recorder.recordArrival(end);
@@ -42,7 +42,7 @@ class ServerScheduleLatencyRecorderTest {
         ServerScheduleLatencyRecorder recorder = new ServerScheduleLatencyRecorder();
         long end = System.nanoTime();
         RequestContext terminalFirst = contextWithBatchWait(end, 20L, null);
-        terminalFirst.setAckAtNanos(0L);
+        org.springframework.test.util.ReflectionTestUtils.setField(terminalFirst, "ackAtNanos", 0L);
 
         recorder.recordCompletion(terminalFirst, end);
         recorder.recordCompletion(contextWithBatchWait(end, 5L, null), end);
@@ -64,7 +64,7 @@ class ServerScheduleLatencyRecorderTest {
         long end = System.nanoTime();
         RequestContext route = contextWithBatchWait(end, 5L, null);
         route.setBatchDispatchedNanos(0L);
-        route.setAckAtNanos(0L);
+        org.springframework.test.util.ReflectionTestUtils.setField(route, "ackAtNanos", 0L);
 
         recorder.recordCompletion(route, end);
 
@@ -167,7 +167,7 @@ class ServerScheduleLatencyRecorderTest {
         org.springframework.test.util.ReflectionTestUtils.setField(context, "serviceStartNanos", end - TimeUnit.MILLISECONDS.toNanos(batchWaitMs + 8));
         context.setRouteSubmittedNanos(end - TimeUnit.MILLISECONDS.toNanos(batchWaitMs + 5));
         context.setBatchDispatchedNanos(end - TimeUnit.MILLISECONDS.toNanos(5));
-        context.setAckAtNanos(end - TimeUnit.MILLISECONDS.toNanos(2));
+        org.springframework.test.util.ReflectionTestUtils.setField(context, "ackAtNanos", end - TimeUnit.MILLISECONDS.toNanos(2));
         context.setSchedulingMetadata(metadata);
         return context;
     }

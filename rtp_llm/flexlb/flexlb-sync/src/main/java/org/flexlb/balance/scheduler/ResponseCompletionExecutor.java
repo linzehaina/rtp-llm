@@ -4,7 +4,6 @@ import org.flexlb.util.Failures;
 
 import java.util.Collections;
 import java.util.IdentityHashMap;
-import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
@@ -15,8 +14,6 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BooleanSupplier;
-
-import static com.google.common.base.Preconditions.checkState;
 
 /**
  * Runs asynchronous frontend completion tasks on dedicated workers. External Future
@@ -32,20 +29,42 @@ final class ResponseCompletionExecutor implements AutoCloseable {
      * submit or completeNow releases accepted registrations after execution, including failure.
      * Contains no request state or response policy.
      */
-    static final class CompletionRegistration {
-        private final ResponseCompletionExecutor owner;
+    final class CompletionRegistration {
         private final AtomicBoolean closed = new AtomicBoolean();
 
-        CompletionRegistration(ResponseCompletionExecutor owner) {
-            this.owner = Objects.requireNonNull(owner);
+        private CompletionRegistration() { }
+
+        /** Runs a scheduler-owned completion operation, without interpreting request facts. */
+        void submit(BooleanSupplier operation) {
+            try {
+                try {
+                    completionWorkers.execute(() -> completeNow(operation));
+                } catch (RejectedExecutionException rejection) {
+                    // An accepted operation must not run client callbacks on its submitter.
+                    rejectedTaskWorker.execute(() -> completeNow(operation));
+                }
+            } catch (RuntimeException | Error failure) {
+                close();
+                throw failure;
+            }
         }
 
-        void submit(BooleanSupplier operation) { owner.submit(this, operation); }
-
-        boolean completeNow(BooleanSupplier operation) { return owner.completeNow(this, operation); }
+        /** External Future mutations stay synchronous; every execution releases its registration. */
+        boolean completeNow(BooleanSupplier operation) {
+            try {
+                return operation.getAsBoolean();
+            } finally {
+                close();
+            }
+        }
 
         void close() {
-            if (closed.compareAndSet(false, true)) { owner.exitCompletion(this); }
+            if (closed.compareAndSet(false, true)) {
+                synchronized (registrations) {
+                    registrations.remove(this);
+                    if (registrations.isEmpty()) { registrations.notifyAll(); }
+                }
+            }
         }
     }
 
@@ -78,46 +97,9 @@ final class ResponseCompletionExecutor implements AutoCloseable {
     CompletionRegistration tryRegister() {
         synchronized (registrations) {
             if (closeResult != null) { return null; }
-            var registration = new CompletionRegistration(this);
+            var registration = new CompletionRegistration();
             registrations.add(registration);
             return registration;
-        }
-    }
-
-    private void exitCompletion(CompletionRegistration registration) {
-        synchronized (registrations) {
-            registrations.remove(registration);
-            if (registrations.isEmpty()) { registrations.notifyAll(); }
-        }
-    }
-
-    private void requireOwnedRegistration(CompletionRegistration registration) {
-        checkState(registration.owner == this, "completion registration belongs to another executor");
-    }
-
-    /** Runs a scheduler-owned completion operation, without interpreting request facts. */
-    void submit(CompletionRegistration registration, BooleanSupplier operation) {
-        try {
-            requireOwnedRegistration(registration);
-            try {
-                completionWorkers.execute(() -> completeNow(registration, operation));
-            } catch (RejectedExecutionException rejection) {
-                // An accepted operation must not run client callbacks on its submitter.
-                rejectedTaskWorker.execute(() -> completeNow(registration, operation));
-            }
-        } catch (RuntimeException | Error failure) {
-            registration.close();
-            throw failure;
-        }
-    }
-
-    /** External Future mutations stay synchronous; every execution releases its registration. */
-    boolean completeNow(CompletionRegistration registration, BooleanSupplier operation) {
-        try {
-            requireOwnedRegistration(registration);
-            return operation.getAsBoolean();
-        } finally {
-            registration.close();
         }
     }
 

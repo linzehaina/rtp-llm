@@ -59,7 +59,7 @@ class RequestCompletionPublicationRaceTest {
         var callbackEntered = new CountDownLatch(1);
         var resumeCallback = new CountDownLatch(1);
         var outerCallback = outer.thenRun(() -> {
-            assertTrue(responseExecutor.completeNow(innerRegistration, () -> inner.completeOwned(response)));
+            assertTrue(innerRegistration.completeNow(() -> inner.completeOwned(response)));
             callbackEntered.countDown();
             await(resumeCallback);
         });
@@ -68,9 +68,9 @@ class RequestCompletionPublicationRaceTest {
         try {
             var execution = CompletableFuture.runAsync(() -> {
                 if (asyncOuter) {
-                    responseExecutor.submit(outerRegistration, () -> outer.completeOwned(response));
+                    outerRegistration.submit(() -> outer.completeOwned(response));
                 } else {
-                    assertTrue(responseExecutor.completeNow(outerRegistration, () -> outer.completeOwned(response)));
+                    assertTrue(outerRegistration.completeNow(() -> outer.completeOwned(response)));
                 }
             });
             assertTrue(callbackEntered.await(3, TimeUnit.SECONDS));
@@ -102,32 +102,6 @@ class RequestCompletionPublicationRaceTest {
             closer.shutdownNow();
             assertTrue(closer.awaitTermination(5, TimeUnit.SECONDS));
             responseExecutor.close();
-        }
-    }
-
-    @ParameterizedTest
-    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
-    @Timeout(15)
-    void foreignCompletionRejectionReturnsTheOriginalOwnersRegistration(boolean async) {
-        try (var owner = new ResponseCompletionExecutor(1);
-             var other = new ResponseCompletionExecutor(1)) {
-            var registration = owner.tryRegister();
-            try {
-                java.util.function.BooleanSupplier forbiddenOperation = () -> {
-                    throw new AssertionError("foreign completion must not execute");
-                };
-                assertThrows(IllegalStateException.class, () -> {
-                    if (async) {
-                        other.submit(registration, forbiddenOperation);
-                    } else {
-                        other.completeNow(registration, forbiddenOperation);
-                    }
-                });
-                assertTrue(((java.util.Set<?>) org.springframework.test.util.ReflectionTestUtils
-                        .getField(owner, "registrations")).isEmpty());
-            } finally {
-                registration.close();
-            }
         }
     }
 
@@ -416,7 +390,7 @@ class RequestCompletionPublicationRaceTest {
                 await(resume);
             });
             var registration = completions.tryRegister();
-            completions.submit(registration, () -> blockedFuture.completeOwned(new Response()));
+            registration.submit(() -> blockedFuture.completeOwned(new Response()));
             try {
                 assertTrue(entered.await(2, TimeUnit.SECONDS));
                 fixture.scheduler().deliveryEffects(fixture.requestContext(), fixture.delivery(), null).run();
@@ -433,7 +407,7 @@ class RequestCompletionPublicationRaceTest {
                 }
                 var selected = AbstractRequestScheduler.selectPublication(fixture.requestContext(), terminal.publication(),
                         RequestContext.ResponseCompletion.RESPONSE, failure, null);
-                completions.submit(terminal.publication().registration, () -> AbstractRequestScheduler.completeFutureResult(terminal.publication(), selected));
+                terminal.publication().registration.submit(() -> AbstractRequestScheduler.completeFutureResult(terminal.publication(), selected));
                 resume.countDown();
                 blockedCallback.get(2, TimeUnit.SECONDS);
                 assertSame(failure, fixture.requestContext().future().get(2, TimeUnit.SECONDS));
@@ -627,7 +601,7 @@ class RequestCompletionPublicationRaceTest {
 
     private static Fixture fixture() {
         var executor = mock(ResponseCompletionExecutor.class);
-        when(executor.tryRegister()).thenAnswer(invocation -> new ResponseCompletionExecutor.CompletionRegistration(executor));
+        when(executor.tryRegister()).thenAnswer(invocation -> mock(ResponseCompletionExecutor.CompletionRegistration.class));
         return fixture(executor);
     }
 

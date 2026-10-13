@@ -704,7 +704,7 @@ public class PrefillEndpoint extends WorkerEndpoint {
         }
 
         try {
-            reporter.reportBatchCompletion(getIp(), batchId, predictedMs, actualMs);
+            reporter.reportBatchCompletion(getIp(), predictedMs, actualMs);
         } catch (RuntimeException telemetryFailure) {
             logger.warn("batch completion metrics failed: batchId={} engine={}",
                     batchId, getIp(), telemetryFailure);

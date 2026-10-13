@@ -13,7 +13,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Consumer;
 
-/** Executes bounded remote cleanup; the claim remains the authority for release evidence. */
+/** Executes bounded remote cleanup; RequestContext remains the authority for release evidence. */
 final class DeliveryCleanupTask {
     static final long CLEANUP_TIMEOUT_MS = 5_000L;
     private static final int MAX_CANCEL_ATTEMPTS = 8;
@@ -52,7 +52,7 @@ final class DeliveryCleanupTask {
     }
 
     private synchronized void attemptCancel() {
-        var evidence = claim.cleanupEvidence();
+        var evidence = claim.item.ctx().deliveryCleanupEvidence(claim);
         if (stopped || cancelUnsupported || settlement.isDone() || evidence.remoteSettled() || !evidence.needsRemoteCancel()) { return; }
         int current = ++attempt;
         CompletableFuture<EngineCancelChannel.CancelAck> reply = new CompletableFuture<>();
@@ -94,7 +94,7 @@ final class DeliveryCleanupTask {
         synchronized (this) {
             if (stopped || cancelUnsupported || settlement.isDone() || current != attempt) { return; }
             if (ackDeadline != null) { ackDeadline.cancel(false); }
-            if (claim.cleanupEvidence().remoteSettled()) { return; }
+            if (claim.item.ctx().deliveryCleanupEvidence(claim).remoteSettled()) { return; }
             if (current >= MAX_CANCEL_ATTEMPTS) {
                 stop(failure == null ? new IllegalStateException(
                         "cancel lacks cleanup proof: request_id=" + claim.item.requestId() + " ack=" + ack) : failure);
@@ -116,7 +116,7 @@ final class DeliveryCleanupTask {
         Logger.warn("[delivery-cleanup] remote cancellation unsupported: request_id={}, worker={}:{}, reason={}; "
                         + "active cancellation retries stopped; waiting for Worker completion or retirement",
                 claim.item.requestId(), claim.item.prefillEp().getIp(), claim.item.prefillEp().getGrpcPort(),
-                claim.cleanupEvidence().reason());
+                claim.item.ctx().deliveryCleanupEvidence(claim).reason());
     }
 
     private void stop(Throwable failure) {

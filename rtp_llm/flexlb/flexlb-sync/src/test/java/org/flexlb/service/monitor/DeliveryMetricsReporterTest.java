@@ -9,6 +9,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
@@ -30,6 +31,8 @@ import static org.mockito.ArgumentMatchers.anyDouble;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.doThrow;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 
 @ExtendWith(MockitoExtension.class)
@@ -43,6 +46,23 @@ class DeliveryMetricsReporterTest {
     @BeforeEach
     void setUp() {
         reporter = new DeliveryMetricsReporter(monitor);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void metricFailureCannotInterruptDeliveryInitializationOrReporting(boolean error) {
+        Throwable failure = error ? new AssertionError("monitor failed") : new IllegalStateException("monitor failed");
+        doThrow(failure).when(monitor).register(ROUTING_QUEUE_LENGTH, FlexMetricType.GAUGE, FlexPriorityType.PRECISE);
+        assertDoesNotThrow(reporter::init);
+        verify(monitor).register(ROUTING_QUEUE_WAIT_TIME_MS, FlexMetricType.TIMER, FlexPriorityType.PRECISE);
+        var tags = FlexMetricTags.ofEngine("10.0.0.1", "role", "PREFILL");
+        doThrow(failure).when(monitor).prepare(DISPATCH_ACK_TIME_MS, tags);
+        assertDoesNotThrow(() -> reporter.prepareEndpointMetrics("PREFILL", "10.0.0.1"));
+        verify(monitor).prepare(ROUTE_SUBMIT_TIME_MS, tags);
+        doThrow(failure).when(monitor).report(INFLIGHT_REQUEST_COUNT,
+                FlexMetricTags.ofEngine("10.0.0.1", "role", "DECODE"), 2);
+        assertDoesNotThrow(() -> reporter.reportDecodeInflight("10.0.0.1", 2, 3, 4, 5, 6));
+        verify(monitor).report(DECODE_TOTAL_LOAD, FlexMetricTags.ofEngine("10.0.0.1", "role", "DECODE"), 3);
     }
 
     @ParameterizedTest
@@ -174,7 +194,7 @@ class DeliveryMetricsReporterTest {
         }
 
         org.junit.jupiter.api.Assertions.assertDoesNotThrow(() ->
-                reporter.reportBatchCompletion("10.0.0.1", 9L, 100L, 75L));
+                reporter.reportBatchCompletion("10.0.0.1", 100L, 75L));
 
         verify(monitor).report(predicted, tags, 100.0);
         verify(monitor).report(actual, tags, 75.0);

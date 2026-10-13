@@ -1077,7 +1077,7 @@ class FlexlbServiceImplTest {
                 ctx.setRouteSubmittedNanos(now - 30_000_000L);
                 ctx.setBatchDispatchedNanos(now - 10_000_000L);
                 if (!missingAck) {
-                    ctx.setAckAtNanos(now - 1_000_000L);
+                    org.springframework.test.util.ReflectionTestUtils.setField(ctx, "ackAtNanos", now - 1_000_000L);
                 }
                 return null;
             }).when(engineHealthReporter).reportArriveDelayTime(any());

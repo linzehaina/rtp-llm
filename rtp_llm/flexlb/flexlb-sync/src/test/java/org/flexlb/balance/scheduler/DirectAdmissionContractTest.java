@@ -203,8 +203,9 @@ class DirectAdmissionContractTest {
                 RequestContext context = claim.item.ctx();
                 assertEquals(105L, context.getRequestId());
                 assertEquals(DeliveryClaimKind.ROUTE_DECISION, context.deliveryClaimKind());
-                assertEquals(RequestContext.DeliveryClaim.SendOutcome.NOT_STARTED,
-                        org.springframework.test.util.ReflectionTestUtils.getField(claim, "sendOutcome"));
+                assertEquals("NOT_STARTED",
+                        org.springframework.test.util.ReflectionTestUtils.getField(
+                                org.springframework.test.util.ReflectionTestUtils.getField(context, "deliveryState"), "sendOutcome").toString());
                 assertFalse(claim.settlement().toCompletableFuture().isDone());
 
                 fixture.applyWorkerStatus(fixture.decode, Map.of(), Map.of("105", task(105L, TaskPhase.RUNNING)));
@@ -214,8 +215,9 @@ class DirectAdmissionContractTest {
                 assertEquals(RequestContext.RequestStage.FINISHED, context.stage());
                 assertEquals(RequestState.Phase.COMPLETED, context.snapshot().state());
                 assertTrue(claim.settlement().toCompletableFuture().isDone());
-                assertEquals(RequestContext.DeliveryClaim.SendOutcome.NOT_STARTED,
-                        org.springframework.test.util.ReflectionTestUtils.getField(claim, "sendOutcome"),
+                assertEquals("NOT_STARTED",
+                        org.springframework.test.util.ReflectionTestUtils.getField(
+                                org.springframework.test.util.ReflectionTestUtils.getField(context, "deliveryState"), "sendOutcome").toString(),
                         "a worker terminal must not fabricate address publication");
                 fixture.assertNoPrefillOwnership();
                 assertNull(EndpointTestSupport.decodeReservation(fixture.decode, 105L));
@@ -227,8 +229,9 @@ class DirectAdmissionContractTest {
 
                 assertSame(terminal, context.getFuture().join());
                 assertEquals(RequestContext.RequestStage.FINISHED, context.stage());
-                assertEquals(RequestContext.DeliveryClaim.SendOutcome.NOT_STARTED,
-                        org.springframework.test.util.ReflectionTestUtils.getField(claim, "sendOutcome"));
+                assertEquals("NOT_STARTED",
+                        org.springframework.test.util.ReflectionTestUtils.getField(
+                                org.springframework.test.util.ReflectionTestUtils.getField(context, "deliveryState"), "sendOutcome").toString());
                 raced.set(true);
                 return null;
             }).when(fixture.requests).publishRoute(any(), any(), org.mockito.ArgumentMatchers.anyLong());

@@ -7,13 +7,30 @@ import org.flexlb.metric.FlexMonitor;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import static org.flexlb.constant.MetricConstant.GRACEFUL_LIFECYCLE_EVENT;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.doThrow;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 
 class GracefulLifecycleReporterTest {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void monitoringFailureCannotInterruptLifecycle(boolean error) {
+        var monitor = mock(FlexMonitor.class);
+        Throwable failure = error ? new AssertionError("monitor failed") : new IllegalStateException("monitor failed");
+        doThrow(failure).when(monitor).register(GRACEFUL_LIFECYCLE_EVENT, FlexMetricType.GAUGE, FlexPriorityType.PRECISE);
+        var reporter = assertDoesNotThrow(() -> new GracefulLifecycleReporter(monitor));
+        var tags = FlexMetricTags.of("type", "shutdown_complete", "duration_ms", "17");
+        doThrow(failure).when(monitor).report(GRACEFUL_LIFECYCLE_EVENT, tags, 1);
+        assertDoesNotThrow(() -> reporter.reportDuration(GracefulLifecycleReporter.Event.SHUTDOWN_COMPLETE, 17));
+        reporter.reportProcessOk();
+        verify(monitor).report(GRACEFUL_LIFECYCLE_EVENT, FlexMetricTags.of("type", "process_ok"), 1);
+    }
+
     @ParameterizedTest
     @CsvSource({
             "HEALTH_CHECK_OFFLINE, health_check_offline",

@@ -116,9 +116,10 @@ public final class SchedulerRuntime implements RequestTaskScheduler {
             }
             Runnable task = () -> run(work);
             try { requestWorkers.execute(task); }
-            catch (RuntimeException rejected) {
+            catch (RuntimeException | Error rejected) {
+                if (rejected instanceof Error) { recordFailure(rejected); }
                 try { requestRecovery.execute(task); }
-                catch (RuntimeException recoveryRejected) {
+                catch (RuntimeException | Error recoveryRejected) {
                     // Accepted terminal/publication owners cannot be dropped or run on an RPC callback.
                     recordFailure(Failures.append(rejected, recoveryRejected));
                     try { Thread.ofPlatform().daemon().name("request-work-emergency").start(task); }

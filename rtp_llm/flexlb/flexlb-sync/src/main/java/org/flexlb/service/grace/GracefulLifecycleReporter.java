@@ -4,6 +4,7 @@ import org.flexlb.enums.FlexMetricType;
 import org.flexlb.enums.FlexPriorityType;
 import org.flexlb.metric.FlexMetricTags;
 import org.flexlb.metric.FlexMonitor;
+import org.flexlb.metric.SafeFlexMonitor;
 import org.springframework.stereotype.Component;
 
 import java.util.Locale;
@@ -19,8 +20,8 @@ public class GracefulLifecycleReporter {
     private final FlexMonitor monitor;
 
     public GracefulLifecycleReporter(FlexMonitor monitor) {
-        this.monitor = monitor;
-        monitor.register(GRACEFUL_LIFECYCLE_EVENT, FlexMetricType.GAUGE, FlexPriorityType.PRECISE);
+        this.monitor = SafeFlexMonitor.wrap(monitor);
+        this.monitor.register(GRACEFUL_LIFECYCLE_EVENT, FlexMetricType.GAUGE, FlexPriorityType.PRECISE);
     }
 
     public enum Event {

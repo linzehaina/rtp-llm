@@ -32,8 +32,11 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertAll;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -352,6 +355,224 @@ class DeliverySettlementTest {
         assertOccupancy(0, 0);
         assertSame(response, member.item().future().join());
         assertThrows(IllegalStateException.class, () -> member.claim().item.ctx().scheduler().completeDelivery(member.claim(), DeliveryResult.delivered()));
+    }
+
+    @ParameterizedTest(name = "decodeStatusFirst={0}")
+    @ValueSource(booleans = {true, false})
+    void uncertainDeliveryIsAcknowledgedRegardlessOfDecodeStatusOrder(boolean decodeStatusFirst) {
+        Member member = dispatchedMember(122L);
+        DeliveryResult unknown = DeliveryResult.uncertain(new IllegalStateException("reply lost"));
+        try {
+            if (decodeStatusFirst) {
+                DeliverySettlementTestSupport.decodeStatus(member.item().decodeEp(), 122L, false);
+            } else {
+                registry.completeDelivery(member.claim(), unknown);
+            }
+            SchedulerTestSupport.awaitRequestWork(registry.runtime);
+            assertFalse(member.item().future().isDone(),
+                    "neither Decode acceptance alone nor UNKNOWN alone may acknowledge delivery");
+
+            if (decodeStatusFirst) {
+                registry.completeDelivery(member.claim(), unknown);
+            } else {
+                DeliverySettlementTestSupport.decodeStatus(member.item().decodeEp(), 122L, false);
+            }
+            SchedulerTestSupport.awaitRequestWork(registry.runtime);
+            synchronized (member.requestContext()) {
+                assertTrue(member.requestContext().decodeAccepted(), "the exact Decode status was accepted");
+            }
+
+            Response response = assertDoesNotThrow(() -> member.item().future().get(2, TimeUnit.SECONDS),
+                    "UNKNOWN plus exact Decode ACTIVE must acknowledge delivery in either event order");
+            assertTrue(response.isSuccess());
+            assertFalse(member.claim().settlement().toCompletableFuture().isDone(),
+                    "acknowledgement must retain execution ownership until Worker terminal");
+            assertOccupancy(1, 1);
+            assertEquals(1, member.item().decodeEp().routingView().engineCapacityUsed());
+            assertTrue(cancellations.isEmpty(), "delivery confirmation must not cancel execution");
+        } finally {
+            ledger.finish(122L, member.item()).forEach(status ->
+                    registry.onPrefillStatus(member.requestContext(), prefill, RoleType.PREFILL, status));
+            DeliverySettlementTestSupport.decodeStatus(member.item().decodeEp(), 122L, true);
+            SchedulerTestSupport.awaitRequestWork(registry.runtime);
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = EngineCancelChannel.CancelAck.class, names = {"UNSUPPORTED", "FAILED"})
+    void cancelledBatchSettlesFromWorkerTerminalsWithoutRemoteCleanupAck(EngineCancelChannel.CancelAck ack)
+            throws Exception {
+        Member member = dispatchedMember(120L);
+        try {
+            registry.completeDelivery(member.claim(), DeliveryResult.delivered());
+            assertTrue(member.item().future().get(2, TimeUnit.SECONDS).isSuccess());
+            registry.cancel(120L, 0L, CancelReason.CLIENT_CANCELLED);
+            cancellations.get(120L).complete(ack);
+            SchedulerTestSupport.awaitRequestWork(registry.runtime);
+            assertFalse(member.claim().settlement().toCompletableFuture().isDone(),
+                    "a cancel outcome alone cannot prove Worker cleanup");
+
+            ledger.finish(120L, member.item()).forEach(status ->
+                    registry.onPrefillStatus(member.requestContext(), prefill, RoleType.PREFILL, status));
+            DeliverySettlementTestSupport.decodeStatus(member.item().decodeEp(), 120L, true);
+            SchedulerTestSupport.awaitRequestWork(registry.runtime);
+
+            assertTerminalsSettledAndArchived(member);
+        } finally {
+            registry.acceptDeliveryCleanup(member.claim(), EngineCancelChannel.CancelAck.REQUEST_CLEANED);
+            SchedulerTestSupport.awaitRequestWork(registry.runtime);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"PDS", "PSD", "DPS", "DSP", "SPD", "SDP"})
+    void cancelledBatchRequiresBothTerminalsAndSenderExitInEveryOrder(String order) throws Exception {
+        Member member = dispatchedMember(123L);
+        try {
+            registry.cancel(123L, 0L, CancelReason.CLIENT_CANCELLED);
+            cancellations.get(123L).complete(EngineCancelChannel.CancelAck.UNSUPPORTED);
+            for (int i = 0; i < order.length(); i++) {
+                switch (order.charAt(i)) {
+                    case 'P' -> ledger.finish(123L, member.item()).forEach(status ->
+                            registry.onPrefillStatus(member.requestContext(), prefill, RoleType.PREFILL, status));
+                    case 'D' -> DeliverySettlementTestSupport.decodeStatus(member.item().decodeEp(), 123L, true);
+                    case 'S' -> registry.completeDelivery(member.claim(), DeliveryResult.uncertain(new IllegalStateException("reply lost")));
+                    default -> throw new AssertionError(order);
+                }
+                SchedulerTestSupport.awaitRequestWork(registry.runtime);
+                if (i < 2) {
+                    assertFalse(member.claim().settlement().toCompletableFuture().isDone(),
+                            "partial evidence must retain delivery ownership: " + order.substring(0, i + 1));
+                    assertTrue(registry.requests.isCurrent(member.requestContext()));
+                }
+            }
+            assertTerminalsSettledAndArchived(member);
+            assertFalse(member.item().future().get(2, TimeUnit.SECONDS).isSuccess());
+        } finally {
+            registry.acceptDeliveryCleanup(member.claim(), EngineCancelChannel.CancelAck.REQUEST_CLEANED);
+            SchedulerTestSupport.awaitRequestWork(registry.runtime);
+        }
+    }
+
+    @org.junit.jupiter.api.RepeatedTest(10)
+    void concurrentUnknownAndDecodeActiveConfirmOnceWithoutReleasingExecution() throws Exception {
+        Member member = dispatchedMember(124L);
+        var published = new java.util.concurrent.atomic.AtomicInteger();
+        member.item().future().thenRun(() -> {
+            assertFalse(Thread.holdsLock(member.requestContext()));
+            published.incrementAndGet();
+        });
+        var start = new CountDownLatch(1);
+        try (var threads = Executors.newFixedThreadPool(2)) {
+            var sender = threads.submit(() -> {
+                await(start);
+                registry.completeDelivery(member.claim(), DeliveryResult.uncertain(new IllegalStateException("reply lost")));
+            });
+            var worker = threads.submit(() -> {
+                await(start);
+                DeliverySettlementTestSupport.decodeStatus(member.item().decodeEp(), 124L, false);
+                DeliverySettlementTestSupport.decodeStatus(member.item().decodeEp(), 124L, false);
+            });
+            start.countDown();
+            sender.get(5, TimeUnit.SECONDS);
+            worker.get(5, TimeUnit.SECONDS);
+            assertTrue(member.item().future().get(5, TimeUnit.SECONDS).isSuccess());
+            RequestProtocolTestSupport.awaitCondition(() -> published.get() == 1);
+            assertFalse(member.claim().settlement().toCompletableFuture().isDone());
+            assertOccupancy(1, 1);
+            assertEquals(1, member.item().decodeEp().routingView().engineCapacityUsed());
+            assertTrue(cancellations.isEmpty());
+        } finally {
+            ledger.finish(124L, member.item()).forEach(status ->
+                    registry.onPrefillStatus(member.requestContext(), prefill, RoleType.PREFILL, status));
+            DeliverySettlementTestSupport.decodeStatus(member.item().decodeEp(), 124L, true);
+            SchedulerTestSupport.awaitRequestWork(registry.runtime);
+        }
+        assertTerminalsSettledAndArchived(member);
+        assertEquals(1, published.get());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void decodeFailureBeforeSenderExitSettlesWithoutClientCancellation(boolean uncertainDelivery) throws Exception {
+        Member member = dispatchedMember(121L);
+        try {
+            ledger.finish(121L, member.item()).forEach(status ->
+                    registry.onPrefillStatus(member.requestContext(), prefill, RoleType.PREFILL, status));
+            DeliverySettlementTestSupport.decodeStatus(member.item().decodeEp(), 121L, true, 42L);
+            SchedulerTestSupport.awaitRequestWork(registry.runtime);
+            synchronized (member.requestContext()) {
+                assertNull(member.requestContext().cancellationReason(), "no client cancellation was recorded");
+            }
+            assertFalse(member.claim().settlement().toCompletableFuture().isDone(),
+                    "Worker terminals cannot substitute for sender exit");
+
+            assertFalse(cancellations.containsKey(121L),
+                    "both Worker terminals already prove remote cleanup; no Cancel ACK is required");
+            registry.completeDelivery(member.claim(), uncertainDelivery
+                    ? DeliveryResult.uncertain(new IllegalStateException("reply lost")) : DeliveryResult.delivered());
+            SchedulerTestSupport.awaitRequestWork(registry.runtime);
+
+            assertTerminalsSettledAndArchived(member);
+        } finally {
+            registry.acceptDeliveryCleanup(member.claim(), EngineCancelChannel.CancelAck.REQUEST_CLEANED);
+            SchedulerTestSupport.awaitRequestWork(registry.runtime);
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"true,true", "true,false", "false,true", "false,false"})
+    void batchAckTimestampBelongsToDeliveryConfirmation(boolean senderFirst, boolean workerSuccessful) throws Exception {
+        Member member = dispatchedMember(125L);
+        if (senderFirst) {
+            registry.completeDelivery(member.claim(), DeliveryResult.delivered());
+            assertTrue(member.item().future().get(5, TimeUnit.SECONDS).isSuccess());
+        }
+        ledger.finish(125L, member.item()).forEach(status ->
+                registry.onPrefillStatus(member.requestContext(), prefill, RoleType.PREFILL, status));
+        DeliverySettlementTestSupport.decodeStatus(member.item().decodeEp(), 125L, true,
+                workerSuccessful ? 0L : 42L);
+        member.item().future().get(5, TimeUnit.SECONDS);
+        long responseObservedAtNanos = System.nanoTime();
+        if (!senderFirst) {
+            assertEquals(0L, member.requestContext().getAckAtNanos());
+            registry.completeDelivery(member.claim(), DeliveryResult.delivered());
+        }
+        SchedulerTestSupport.awaitRequestWork(registry.runtime);
+        assertTerminalsSettledAndArchived(member);
+        if (senderFirst) {
+            assertTrue(member.requestContext().getAckAtMs() > 0L);
+            assertTrue(member.requestContext().getAckAtNanos() > 0L);
+            assertTrue(member.requestContext().getAckAtNanos() <= responseObservedAtNanos);
+        } else {
+            assertEquals(0L, member.requestContext().getAckAtMs());
+            assertEquals(0L, member.requestContext().getAckAtNanos(),
+                    "a late sender cannot add an ACK to an already completed response");
+        }
+    }
+
+    private Member dispatchedMember(long id) {
+        DecodeEndpoint decode = EndpointTestSupport.decode(WorkerStatus.createDiscovered(
+                RoleType.DECODE, null, "127.0.0.1", 8180, 8181, null), registry.requests);
+        DecodeResources.ReservationHandle reservation;
+        try (var pin = decode.tryPinGeneration()) {
+            reservation = EndpointTestSupport.reserveUnqueuedDecode(decode, pin, id, 1L, 2L, 50);
+        }
+        Member member = member(id, id, decode, reservation);
+        ledger.commit(id, List.of(member.item()));
+        DeliverySettlementTestSupport.dispatchDecode(decode, reservation);
+        return member;
+    }
+
+    private void assertTerminalsSettledAndArchived(Member member) {
+        assertOccupancy(0, 0);
+        assertEquals(0, member.item().decodeEp().routingView().engineCapacityUsed());
+        assertFalse(member.item().decodeEp().hasOwnedResources(member.item().decodeReservation()));
+        assertAll("both Worker terminals and sender exit must finish request cleanup",
+                () -> assertTrue(member.claim().settlement().toCompletableFuture().isDone(),
+                        "delivery settlement still waits after both Worker terminals"),
+                () -> assertFalse(registry.requests.isCurrent(member.requestContext()),
+                        "request remains active after both resource ledgers are empty"));
     }
 
     private Member member(long id, long batchId) {

@@ -213,19 +213,17 @@ public class RequestContext {
 
     /**
      * Timestamp (ms) when the engine acknowledges the batch in BATCH mode.
-     * Set when the owning scheduler accepts a successful batch delivery result.
+     * Set when a successful batch delivery result wins delivery acknowledgement.
      * Used to measure acknowledgement-to-response latency in the API layer.
      * Remains 0 for non-BATCH paths or when ACK was not received.
      */
     @Getter
-    @Setter
     private long ackAtMs;
 
     /**
      * Monotonic counterpart of {@link #ackAtMs}.
      */
     @Getter
-    @Setter
     private long ackAtNanos;
 
     /**
@@ -323,6 +321,7 @@ public class RequestContext {
 
     /** 当前投递的精确身份及发送/清理事实，不能只凭 requestId 接收异步回调。 */
     private DeliveryClaim delivery;
+    private DeliveryState deliveryState;
     /** 已取得的终态执行权，防止多个结束事件重复领取清理和发布责任。 */
     private TerminalAction terminalAction;
 
@@ -1156,17 +1155,27 @@ public class RequestContext {
         }
     }
 
-    /**
-     * 一次已领取的投递及其结算责任，内部事实由 owner 的 monitor 保护。
-     * UNKNOWN 表示可能已经发送，不能按 NOT_SENT 释放资源。
-     * settlement 等待发送方结束，并取得执行完成或必要的远端清理证据；它不等于调度回包。
-     */
+    /** Exact delivery identity and its read-only settlement notification. Context owns all facts. */
     public static final class DeliveryClaim {
-        public enum SendOutcome { NOT_STARTED, SENDING, NOT_SENT, PREFILL_REJECTED, DELIVERED, UNKNOWN }
         final RequestRoute item;
         final DeliveryClaimKind kind;
-        private final RequestContext owner;
         final CompletableFuture<Void> settled = new CompletableFuture<>();
+
+        private DeliveryClaim(RequestRoute item, DeliveryClaimKind kind) {
+            this.item = item;
+            this.kind = kind;
+        }
+
+        public CompletionStage<Void> settlement() { return settled.minimalCompletionStage(); }
+    }
+
+    private enum SendOutcome { NOT_STARTED, SENDING, NOT_SENT, PREFILL_REJECTED, DELIVERED, UNKNOWN }
+
+    /**
+     * Sender and remote execution facts for the exact delivery, guarded by the Context monitor.
+     * Remote release evidence permits local cleanup; it does not mean that cleanup has executed.
+     */
+    private static final class DeliveryState {
         private SendOutcome sendOutcome = SendOutcome.NOT_STARTED;
         private boolean senderFinished;
         private CancelReason abandonmentReason;
@@ -1174,135 +1183,175 @@ public class RequestContext {
         private boolean decodeReleaseProven;
         private boolean executionFinished;
 
-        private DeliveryClaim(RequestRoute item, DeliveryClaimKind kind) {
-            this.item = item;
-            this.owner = item.ctx();
-            this.kind = kind;
-            this.decodeReleaseProven = item.decodeEp() == null || item.decodeReservation() == null;
+        private DeliveryState(RequestRoute route) {
+            decodeReleaseProven = route.decodeEp() == null || route.decodeReservation() == null;
         }
+    }
 
-        boolean awaitingSendLocked() {
-            owner.requireContextLock("delivery send eligibility");
-            return kind == DeliveryClaimKind.BATCH_ENQUEUE && sendOutcome == SendOutcome.NOT_STARTED;
+    boolean awaitingSendLocked(DeliveryClaim exact) {
+        requireContextLock("delivery send eligibility");
+        return delivery == exact && exact.kind == DeliveryClaimKind.BATCH_ENQUEUE
+                && deliveryState.sendOutcome == SendOutcome.NOT_STARTED;
+    }
+
+    CancelReason startSendLocked(DeliveryClaim exact, long now) {
+        requireContextLock("delivery send start");
+        checkArgument(delivery == exact, "stale delivery sender");
+        if (ownsActiveGenerationLocked() && cancellationReason == null && deliveryState.abandonmentReason == null
+                && !requestExpired(now) && !requestInactiveLocked(now)) {
+            deliveryState.sendOutcome = SendOutcome.SENDING;
+            return null;
         }
+        if (cancellationReason != null) { return cancellationReason; }
+        if (deliveryState.abandonmentReason != null) { return deliveryState.abandonmentReason; }
+        return ownsActiveGenerationLocked() ? CancelReason.DEADLINE_EXCEEDED : CancelReason.SHUTDOWN;
+    }
 
-        /** Return the refusal reason, or record that the exact sender may start. */
-        CancelReason startSendLocked(long now) {
-            owner.requireContextLock("delivery send start");
-            if (owner.delivery == this && owner.ownsActiveGenerationLocked()
-                    && owner.cancellationReason == null && abandonmentReason == null
-                    && !owner.requestExpired(now) && !owner.requestInactiveLocked(now)) {
-                sendOutcome = SendOutcome.SENDING;
-                return null;
+    void recordDeliverySendResultLocked(DeliveryClaim exact, DeliveryResult result) {
+        requireContextLock("delivery send result");
+        Objects.requireNonNull(result, "delivery result");
+        checkArgument(delivery == exact, "stale delivery result");
+        checkState(exact.kind == DeliveryClaimKind.BATCH_ENQUEUE, "batch callback requires a batch delivery");
+        checkState(!deliveryState.senderFinished, "delivery already completed: %s", exact.item.requestId());
+        deliveryState.senderFinished = true;
+        deliveryState.sendOutcome = switch (result.status()) {
+            case NOT_SENT -> SendOutcome.NOT_SENT;
+            case PREFILL_REJECTED -> SendOutcome.PREFILL_REJECTED;
+            case DELIVERED -> SendOutcome.DELIVERED;
+            case UNCERTAIN -> SendOutcome.UNKNOWN;
+        };
+        if (result.status() == DeliveryResult.Status.UNCERTAIN) {
+            markAwaitingConfirmationLocked("Delivery outcome uncertain");
+        }
+    }
+
+    void completeRouteLocked(DeliveryClaim exact) {
+        requireContextLock("route delivery completion");
+        checkArgument(delivery == exact && exact.kind == DeliveryClaimKind.ROUTE_DECISION, "invalid route delivery");
+        deliveryState.senderFinished = true;
+        deliveryState.sendOutcome = SendOutcome.DELIVERED;
+    }
+
+    boolean recordDeliveryAbandonmentLocked(DeliveryClaim exact, CancelReason reason) {
+        requireContextLock("delivery abandonment");
+        if (delivery != exact || deliveryState.abandonmentReason != null || canReleaseDeliveryLocked()) { return false; }
+        deliveryState.abandonmentReason = Objects.requireNonNull(reason);
+        if (exact.kind == DeliveryClaimKind.ROUTE_DECISION) { deliveryState.senderFinished = true; }
+        return true;
+    }
+
+    /** Terminal success proves execution; every other terminal preserves the remote cleanup obligation. */
+    boolean recordTerminalDeliveryLocked(TerminalAction action) {
+        requireContextLock("terminal delivery facts");
+        if (delivery == null) { return false; }
+        boolean successfulWorker = action.event() != null && action.event().kind() == DeferredTerminal.Kind.WORKER
+                && action.event().workerSuccessful();
+        if (successfulWorker && cancellationReason == null && deliveryState.abandonmentReason == null) {
+            recordDeliveryWorkerCompletion(delivery, action.item());
+            return false;
+        }
+        return abandonCurrentDeliveryLocked();
+    }
+
+    boolean abandonFailedDeliveryLocked() {
+        requireContextLock("failed delivery cleanup");
+        return delivery != null && cleanupSource() != null && abandonCurrentDeliveryLocked();
+    }
+
+    private boolean abandonCurrentDeliveryLocked() {
+        return recordDeliveryAbandonmentLocked(delivery,
+                cancellationReason == null ? CancelReason.CLIENT_CANCELLED : cancellationReason);
+    }
+
+    record DeliveryCleanupEvidence(CancelReason reason, boolean needsRemoteCancel, boolean remoteSettled) { }
+
+    synchronized DeliveryCleanupEvidence deliveryCleanupEvidence(DeliveryClaim exact) {
+        checkArgument(delivery == exact, "stale delivery cleanup");
+        return new DeliveryCleanupEvidence(deliveryState.abandonmentReason,
+                deliveryState.sendOutcome != SendOutcome.NOT_STARTED && deliveryState.sendOutcome != SendOutcome.NOT_SENT,
+                deliveryState.prefillReleaseProven && deliveryState.decodeReleaseProven);
+    }
+
+    synchronized void acceptDeliveryCleanupAck(DeliveryClaim exact, org.flexlb.balance.eviction.EngineCancelChannel.CancelAck ack) {
+        if (delivery != exact) { return; }
+        switch (ack) {
+            case REQUEST_CLEANED -> {
+                deliveryState.prefillReleaseProven = true;
+                deliveryState.decodeReleaseProven = true;
             }
-            return owner.cancellationReason != null ? owner.cancellationReason
-                    : abandonmentReason != null ? abandonmentReason
-                    : !owner.ownsActiveGenerationLocked() ? CancelReason.SHUTDOWN : CancelReason.DEADLINE_EXCEEDED;
+            case REQUEST_FENCED -> deliveryState.prefillReleaseProven = true;
+            default -> { } // Transport failure or lack of Cancel support proves no resource release.
         }
+    }
 
-        void recordSendResult(DeliveryResult result) {
-            Objects.requireNonNull(result, "delivery result");
-            synchronized (owner) {
-                checkState(kind == DeliveryClaimKind.BATCH_ENQUEUE, "not a batch delivery");
-                if (senderFinished) { throw new IllegalStateException("delivery already completed: " + item.requestId()); }
-                senderFinished = true;
-                sendOutcome = switch (result.status()) {
-                    case NOT_SENT -> SendOutcome.NOT_SENT;
-                    case PREFILL_REJECTED -> SendOutcome.PREFILL_REJECTED;
-                    case DELIVERED -> SendOutcome.DELIVERED;
-                    case UNCERTAIN -> SendOutcome.UNKNOWN;
-                };
-            }
-        }
+    synchronized boolean recordDeliveryWorkerCompletion(DeliveryClaim exact, RequestRoute route) {
+        if (delivery != exact || route != exact.item) { return false; }
+        deliveryState.executionFinished = true;
+        if (exact.kind == DeliveryClaimKind.ROUTE_DECISION) { deliveryState.senderFinished = true; }
+        return true;
+    }
 
-        void completeRoute() {
-            synchronized (owner) { senderFinished = true; sendOutcome = SendOutcome.DELIVERED; }
-        }
-
-        /** Record irreversible abandonment; false means no new fact was accepted. */
-        boolean recordAbandonmentLocked(CancelReason reason) {
-            owner.requireContextLock("delivery abandonment");
-            if (abandonmentReason != null || canReleaseLocked()) { return false; }
-            abandonmentReason = Objects.requireNonNull(reason);
-            if (kind == DeliveryClaimKind.ROUTE_DECISION) { senderFinished = true; }
+    synchronized boolean recordDeliveryRetirement(DeliveryClaim exact, org.flexlb.balance.endpoint.WorkerEndpoint source) {
+        if (delivery != exact) { return false; }
+        if (source instanceof DecodeEndpoint decode && !decode.isRetired()) { return false; }
+        if (source == exact.item.prefillEp()) { deliveryState.prefillReleaseProven = true; return true; }
+        if (source == exact.item.decodeEp()) {
+            deliveryState.decodeReleaseProven = true;
+            deliveryState.executionFinished = true;
             return true;
         }
+        return false;
+    }
 
-        record CleanupEvidence(CancelReason reason, boolean needsRemoteCancel, boolean remoteSettled) { }
+    private boolean canReleaseDeliveryLocked() {
+        requireContextLock("delivery release evidence");
+        if (delivery == null) { return true; }
+        if (!deliveryState.senderFinished) { return false; }
+        if (delivery.kind == DeliveryClaimKind.ROUTE_DECISION || deliveryState.sendOutcome == SendOutcome.NOT_SENT) { return true; }
+        return deliveryState.abandonmentReason == null ? deliveryState.executionFinished
+                : deliveryState.prefillReleaseProven && deliveryState.decodeReleaseProven;
+    }
 
-        CleanupEvidence cleanupEvidence() {
-            synchronized (owner) {
-                return new CleanupEvidence(abandonmentReason,
-                        sendOutcome != SendOutcome.NOT_STARTED && sendOutcome != SendOutcome.NOT_SENT,
-                        prefillReleaseProven && decodeReleaseProven);
-            }
+    synchronized DecodeResources.ReleaseReason deliveryReleaseReason(DeliveryClaim exact) {
+        checkArgument(delivery == exact, "stale delivery release");
+        if (deliveryState.sendOutcome == SendOutcome.NOT_SENT && deliveryState.senderFinished) {
+            return DecodeResources.ReleaseReason.NOT_SENT;
         }
-
-        void acceptCleanupAck(org.flexlb.balance.eviction.EngineCancelChannel.CancelAck ack) {
-            synchronized (owner) {
-                if (ack == org.flexlb.balance.eviction.EngineCancelChannel.CancelAck.REQUEST_CLEANED) {
-                    prefillReleaseProven = true;
-                    decodeReleaseProven = true;
-                } else if (ack == org.flexlb.balance.eviction.EngineCancelChannel.CancelAck.REQUEST_FENCED) {
-                    prefillReleaseProven = true;
-                }
-            }
+        if (canReleaseDeliveryLocked() && deliveryState.abandonmentReason != null
+                && deliveryState.prefillReleaseProven && deliveryState.decodeReleaseProven) {
+            return DecodeResources.ReleaseReason.REMOTE_CLEANUP;
         }
+        return null;
+    }
 
-        boolean recordDecodeTerminalStatus(DecodeEndpoint source, DecodeResources.DecodeRequestStatus requestStatus) {
-            synchronized (owner) {
-                if (source != item.decodeEp() || !Objects.equals(requestStatus.reservation(), item.decodeReservation())
-                        || requestStatus.kind() != DecodeResources.DecodeRequestStatus.Kind.TERMINAL) { return false; }
-                decodeReleaseProven = true;
-                executionFinished = true;
-                return true;
-            }
-        }
+    synchronized boolean deliveryCleanupRequired(DeliveryClaim exact) {
+        return delivery == exact && deliveryState.abandonmentReason != null;
+    }
 
-        boolean recordWorkerCompletion(RequestRoute exact) {
-            synchronized (owner) {
-                if (exact != item) { return false; }
-                executionFinished = true;
-                // A terminal Route decision revokes address publication; Batch still awaits its sender.
-                if (kind == DeliveryClaimKind.ROUTE_DECISION) { senderFinished = true; }
-                return true;
-            }
-        }
+    /** One interpretation of delivery facts, shared by sender, Worker, Cancel and retirement events. */
+    record DeliveryProgress(DeliveryClaim claim, boolean settle, boolean cleanup, RequestEndDecision confirmation) { }
 
-        boolean recordEndpointRetirement(org.flexlb.balance.endpoint.WorkerEndpoint source) {
-            synchronized (owner) {
-                if (source instanceof DecodeEndpoint decode && !decode.isRetired()) { return false; }
-                if (source == item.prefillEp()) { prefillReleaseProven = true; }
-                if (source == item.decodeEp()) { decodeReleaseProven = true; executionFinished = true; }
-                return true;
-            }
-        }
+    DeliveryProgress advanceDeliveryLocked() {
+        requireContextLock("delivery progress");
+        if (delivery == null) { return null; }
+        boolean releasable = canReleaseDeliveryLocked();
+        boolean settle = releasable && !delivery.settled.isDone();
+        // Only batch cleanup waits for remote send/release evidence. Route cleanup has its terminal owner.
+        boolean clean = delivery.kind == DeliveryClaimKind.BATCH_ENQUEUE && releasable && cleanup != null && !cleanup.ready()
+                && cleanup.phase != CleanupProgress.Phase.FINISHED;
+        RequestEndDecision confirmation = canConfirmDeliveryLocked() ? RequestEndDecision.DELIVERY : null;
+        return settle || clean || confirmation != null
+                ? new DeliveryProgress(delivery, settle, clean, confirmation) : null;
+    }
 
-        private boolean canReleaseLocked() {
-            owner.requireContextLock("delivery release evidence");
-            return senderFinished && (kind == DeliveryClaimKind.ROUTE_DECISION || sendOutcome == SendOutcome.NOT_SENT
-                    || (abandonmentReason == null ? executionFinished : prefillReleaseProven && decodeReleaseProven));
-        }
-
-        boolean readyToSettleLocked() {
-            owner.requireContextLock("delivery settlement");
-            return !settled.isDone() && canReleaseLocked();
-        }
-
-        DecodeResources.ReleaseReason provenReleaseReason() {
-            synchronized (owner) {
-                if (sendOutcome == SendOutcome.NOT_SENT && senderFinished) {
-                    return DecodeResources.ReleaseReason.NOT_SENT;
-                }
-                if (canReleaseLocked() && abandonmentReason != null && prefillReleaseProven && decodeReleaseProven) {
-                    return DecodeResources.ReleaseReason.REMOTE_CLEANUP;
-                }
-                return null;
-            }
-        }
-
-        public java.util.concurrent.CompletionStage<Void> settlement() { return settled.minimalCompletionStage(); }
-        boolean cleanupRequired() { synchronized (owner) { return abandonmentReason != null; } }
+    private boolean canConfirmDeliveryLocked() {
+        if (!ownsActiveGenerationLocked() || cleanup != null || terminalAction != null || cancellationReason != null
+                || deliveryAcknowledged || deliveryState.abandonmentReason != null || !deliveryState.senderFinished) { return false; }
+        return switch (deliveryState.sendOutcome) {
+            case DELIVERED -> true;
+            case UNKNOWN -> decodeAccepted;
+            default -> false;
+        };
     }
 
     enum ResponseCompletion {
@@ -1409,36 +1458,38 @@ public class RequestContext {
     }
 
     /**
-     * 本请求唯一的 Prefill/Decode 结算进度，由 context 锁保护。
+     * 本请求的本地账本清理与归档进度，由 context 锁保护。
+     * 远端释放证据由 DeliveryState 记录；这里记录本地清理是否真正完成，不能反过来证明远端结束。
      * RUN_AGAIN 表示当前锁外清理期间又来了事件，当前轮完成后必须再执行一轮。
      * expired 是清理阶段的超时事实，不等于两端资源已释放。
+     * Scheduler 只传递其身份；状态与变更仍封闭在 RequestContext 内。
      */
-    private static final class CleanupProgress {
+    static final class CleanupProgress {
 
         // PENDING blocks close before the first pass or while a requested follow-up has not started.
-        enum Phase { PENDING, QUEUED, RUNNING, RUN_AGAIN, WAITING, FINISHED }
+        private enum Phase { PENDING, QUEUED, RUNNING, RUN_AGAIN, WAITING, FINISHED }
 
-        final DeliveryResult.Status source;
+        private final DeliveryResult.Status source;
 
-        Phase phase = Phase.PENDING;
+        private Phase phase = Phase.PENDING;
 
-        boolean prefillSettled;
+        private boolean prefillSettled;
 
-        boolean decodeSettled;
+        private boolean decodeSettled;
 
         /**
          * Sticky decision: later Worker activity cannot revoke an already requested expiry.
          */
-        boolean expired;
-        boolean terminalEffectsFinished;
+        private boolean expired;
+        private boolean terminalEffectsFinished;
 
-        CleanupProgress(RequestRoute item, DeliveryResult.Status source) {
+        private CleanupProgress(RequestRoute item, DeliveryResult.Status source) {
             this.source = source;
             prefillSettled = item == null;
             decodeSettled = item == null || item.decodeEp() == null || item.decodeReservation() == null;
         }
 
-        boolean ready() {
+        private boolean ready() {
             return phase == Phase.WAITING && prefillSettled && decodeSettled;
         }
     }
@@ -1676,6 +1727,7 @@ public class RequestContext {
         requireContextLock("delivery claim");
         DeliveryClaim claim = new DeliveryClaim(exact, kind);
         delivery = claim;
+        deliveryState = new DeliveryState(exact);
         advanceStageLocked(RequestStage.DELIVERING);
         batchId = correlationId;
         if (kind == DeliveryClaimKind.BATCH_ENQUEUE) { batchEnqueueStartedAtMs = nowMs; }
@@ -1710,6 +1762,12 @@ public class RequestContext {
     DeliveryPublication acknowledgeDelivery(PublicationPermit permit, long nowMs) {
         requireContextLock("delivery acknowledgement");
         Response response = route.successResponse(deliveryClaimKind() == DeliveryClaimKind.BATCH_ENQUEUE);
+        // A sender that exits after terminal publication must not create a late ACK sample.
+        if (deliveryClaimKind() == DeliveryClaimKind.BATCH_ENQUEUE
+                && deliveryState.sendOutcome == SendOutcome.DELIVERED) {
+            ackAtMs = nowMs;
+            ackAtNanos = System.nanoTime();
+        }
         deliveryAcknowledged = true;
         detail = deliveryClaimKind() == DeliveryClaimKind.BATCH_ENQUEUE ? "batch enqueue acknowledged" : "route decision delivered";
         updatedAtMs = nowMs;
@@ -1723,6 +1781,10 @@ public class RequestContext {
     boolean consumePrefillStatusLocked(RoleType role, PrefillState.PrefillRequestStatus.Kind kind, long nowMs) {
         requireContextLock("Prefill execution evidence");
         recordWorkerActivityLocked(nowMs);
+        if (delivery != null && kind != PrefillState.PrefillRequestStatus.Kind.ACTIVE) {
+            deliveryState.prefillReleaseProven = true;
+            if (role == RoleType.PDFUSION) { deliveryState.executionFinished = true; }
+        }
         if (cleanup != null && kind != PrefillState.PrefillRequestStatus.Kind.ACTIVE) {
             recordCleanupSettlement(true, false, false);
             if (kind != PrefillState.PrefillRequestStatus.Kind.PRIORITY_CANCELED
@@ -1744,8 +1806,14 @@ public class RequestContext {
         return true;
     }
 
-    DecisionDeadline recordDecodeProgressLocked(DecodeResources.DecodeRequestStatus.Kind kind, long nowMs) {
+    DecisionDeadline consumeDecodeStatusLocked(DecodeEndpoint source, DecodeResources.DecodeRequestStatus status, long nowMs) {
         requireContextLock("Decode execution evidence");
+        if (!ownsDecodeReservationLocked(source, status.reservation())) { return null; }
+        var kind = status.kind();
+        if (delivery != null && kind == DecodeResources.DecodeRequestStatus.Kind.TERMINAL) {
+            deliveryState.decodeReleaseProven = true;
+            deliveryState.executionFinished = true;
+        }
         recordWorkerActivityLocked(nowMs);
         if (cleanup != null) { return null; }
         if (kind == DecodeResources.DecodeRequestStatus.Kind.ACTIVE) { return markDecodeAcceptedLocked(); }
@@ -1819,25 +1887,23 @@ public class RequestContext {
                        RequestDeadline requestDeadline, DecisionDeadline decisionDeadline) { }
 
     /** An unstarted pass owns QUEUED; a running owner consumes notifications through RUN_AGAIN. */
-    record CleanupQueue(CleanupProgress progress) { }
-
-    CleanupQueue tryQueueCleanupLocked() {
+    CleanupProgress tryQueueCleanupLocked() {
         requireContextLock("cleanup queue claim");
         if (cleanup == null || admission != null || cleanup.phase == CleanupProgress.Phase.FINISHED
                 || cleanup.phase == CleanupProgress.Phase.QUEUED
-                || delivery != null && !delivery.canReleaseLocked()) { return null; }
+                || delivery != null && !canReleaseDeliveryLocked()) { return null; }
         if (cleanup.phase == CleanupProgress.Phase.RUNNING || cleanup.phase == CleanupProgress.Phase.RUN_AGAIN) {
             cleanup.phase = CleanupProgress.Phase.RUN_AGAIN;
             return null;
         }
         cleanup.phase = CleanupProgress.Phase.QUEUED;
-        return new CleanupQueue(cleanup);
+        return cleanup;
     }
 
     /** Only the accepted task or its rejected submission can surrender its queue claim. */
-    void releaseCleanupQueueLocked(CleanupQueue exact) {
+    void releaseCleanupQueueLocked(CleanupProgress exact) {
         requireContextLock("cleanup queue release");
-        if (cleanup == exact.progress() && cleanup.phase == CleanupProgress.Phase.QUEUED) {
+        if (cleanup == exact && cleanup.phase == CleanupProgress.Phase.QUEUED) {
             cleanup.phase = CleanupProgress.Phase.PENDING;
         }
     }
@@ -1847,7 +1913,7 @@ public class RequestContext {
         CleanupProgress progress = cleanup;
         if (progress == null || admission != null || progress.phase == CleanupProgress.Phase.FINISHED
                 || progress.phase == CleanupProgress.Phase.QUEUED
-                || delivery != null && !delivery.canReleaseLocked()) { return null; }
+                || delivery != null && !canReleaseDeliveryLocked()) { return null; }
         if (progress.phase == CleanupProgress.Phase.RUNNING || progress.phase == CleanupProgress.Phase.RUN_AGAIN) {
             progress.phase = CleanupProgress.Phase.RUN_AGAIN;
             return null;
@@ -1856,7 +1922,7 @@ public class RequestContext {
         RequestDeadline request = requestDeadline;
         requestDeadline = null;
         DecisionDeadline decision = detachDecisionDeadlineLocked();
-        DecodeResources.ReleaseReason proof = delivery == null ? null : delivery.provenReleaseReason();
+        DecodeResources.ReleaseReason proof = delivery == null ? null : deliveryReleaseReason(delivery);
         if (proof == null) {
             proof = progress.expired ? DecodeResources.ReleaseReason.EXPIRED
                     : progress.source == null ? DecodeResources.ReleaseReason.COUNTERPART_FINISHED : null;
@@ -1893,7 +1959,7 @@ public class RequestContext {
         progress.prefillSettled |= prefillDone;
         progress.decodeSettled |= decodeDone;
         if (preemption != null && decodeDone && (progress.expired || progress.source == DeliveryResult.Status.NOT_SENT
-                || delivery != null && delivery.kind == DeliveryClaimKind.BATCH_ENQUEUE && delivery.cleanupRequired() && delivery.canReleaseLocked())) {
+                || delivery != null && delivery.kind == DeliveryClaimKind.BATCH_ENQUEUE && deliveryCleanupRequired(delivery) && canReleaseDeliveryLocked())) {
             preemption.tryFinish();
         }
         return progress.phase == CleanupProgress.Phase.PENDING ? CleanupNext.REPEAT : CleanupNext.TRY_FINISH;

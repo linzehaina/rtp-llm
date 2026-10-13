@@ -1043,8 +1043,8 @@ class RequestContextLifecycleTest {
         when(source.hasOwnedResources(registered.item().decodeReservation())).thenReturn(true);
         var claim = lifecycle.tryClaim(new DecodeResources.ReservationHandle(1L, 707L, 1L), 21L, "victim").orElseThrow();
         assertTrue(lifecycle.updatePreemption(claim, org.flexlb.balance.preemption.PreemptionCancelPhase.CANCEL_IN_FLIGHT));
-        delivery.recordWorkerCompletion(registered.item());
-        delivery.item.ctx().scheduler().settleDelivery(delivery);
+        context.recordDeliveryWorkerCompletion(delivery, registered.item());
+        delivery.item.ctx().scheduler().advanceDelivery(delivery);
         AbstractRequestScheduler.PublicationPermit permit;
         RequestContext.ResponseResult response;
         synchronized (context) {

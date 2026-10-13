@@ -17,6 +17,7 @@ import org.flexlb.enums.FlexMetricType;
 import org.flexlb.enums.FlexPriorityType;
 import org.flexlb.metric.FlexMetricTags;
 import org.flexlb.metric.FlexMonitor;
+import org.flexlb.metric.SafeFlexMonitor;
 import org.flexlb.metric.FlexStatisticsType;
 import org.flexlb.balance.endpoint.EndpointRegistry;
 import org.slf4j.Logger;
@@ -87,7 +88,7 @@ public class EngineHealthReporter {
                                 EngineGrpcClient engineGrpcClient,
                                 LoopResources serverLoopResources,
                                 EndpointRegistry endpointRegistry) {
-        this.monitor = monitor;
+        this.monitor = SafeFlexMonitor.wrap(monitor);
         this.engineGrpcClient = engineGrpcClient;
         this.endpointRegistry = endpointRegistry;
         this.eventLoopGroupMap = Map.of(

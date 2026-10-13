@@ -11,6 +11,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
@@ -19,6 +20,8 @@ import static org.flexlb.constant.MetricConstant.AUTO_TPM_CANCEL_QPS;
 import static org.flexlb.constant.MetricConstant.AUTO_TPM_CANCEL_REQUEST_COUNT;
 import static org.flexlb.constant.MetricConstant.AUTO_TPM_CANCEL_TIMEOUT_COUNT;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.doThrow;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.flexlb.constant.MetricConstant.AUTO_TPM_VICTIM_COUNT;
 import static org.flexlb.constant.MetricConstant.AUTO_TPM_PRIORITY_PREEMPT_COUNT;
@@ -39,6 +42,20 @@ class RequestSchedulerReporterTest {
     @BeforeEach
     void setUp() {
         reporter = new RequestSchedulerReporter(monitor);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void metricFailureCannotInterruptSchedulingOrSuppressNextMetric(boolean error) {
+        Throwable failure = error ? new AssertionError("monitor failed") : new IllegalStateException("monitor failed");
+        doThrow(failure).when(monitor).register(AUTO_TPM_CANCEL_QPS, FlexMetricType.QPS, FlexPriorityType.PRECISE);
+        assertDoesNotThrow(reporter::init);
+        verify(monitor).register(AUTO_TPM_CANCEL_REQUEST_COUNT, FlexMetricType.QPS, FlexPriorityType.PRECISE);
+        var tags = FlexMetricTags.of("victim_priority", "20", "incoming_priority", "70",
+                "stage", "decode_reserved", "case", "decode_kv_full");
+        doThrow(failure).when(monitor).report(AUTO_TPM_VICTIM_COUNT, tags, 1.0);
+        assertDoesNotThrow(() -> reporter.reportVictim(20, 70, "decode_reserved", "decode_kv_full"));
+        verify(monitor).report(AUTO_TPM_PRIORITY_PREEMPT_COUNT, FlexMetricTags.of("stage", "decode_reserved"), 1.0);
     }
 
     @ParameterizedTest

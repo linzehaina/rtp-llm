@@ -522,14 +522,14 @@ class PrefillEndpointTest {
         registerBatch(endpoint, 9L, 100, List.of(createRequestRoute(9L, 500, 200)));
         doThrow(new IllegalStateException("metrics unavailable"))
                 .when(endpointReporter)
-                .reportBatchCompletion("127.0.0.1", 9L, 100L, 125L);
+                .reportBatchCompletion("127.0.0.1", 100L, 125L);
 
         TaskInfo finished = taskInfo(9L, 9L, null, 0, 125);
         assertDoesNotThrow(() -> calibrate(Map.of("9", finished), Map.of()));
 
         assertEquals(0, endpoint.ownershipStats().batchCount());
         assertEquals(0, endpoint.admissionSummary(0).occupiedRequests());
-        verify(endpointReporter).reportBatchCompletion("127.0.0.1", 9L, 100L, 125L);
+        verify(endpointReporter).reportBatchCompletion("127.0.0.1", 100L, 125L);
     }
 
     @Test
@@ -609,7 +609,7 @@ class PrefillEndpointTest {
         assertEquals(0, endpoint.ownershipStats().batchCount());
         assertEquals(0, endpoint.admissionSummary(0).occupiedRequests());
         verify(endpointReporter, never()).reportBatchCompletion(
-                anyString(), org.mockito.ArgumentMatchers.anyLong(),
+                anyString(),
                 org.mockito.ArgumentMatchers.anyLong(), org.mockito.ArgumentMatchers.anyLong());
 
         calibrate(Map.of("1", firstFailure, "2", secondFailure), Map.of());
@@ -627,7 +627,7 @@ class PrefillEndpointTest {
         calibrate(Map.of("1", success), Map.of());
 
         assertEquals(0, endpoint.admissionSummary(0).occupiedRequests());
-        verify(endpointReporter).reportBatchCompletion("127.0.0.1", 1L, 100L, 40L);
+        verify(endpointReporter).reportBatchCompletion("127.0.0.1", 100L, 40L);
     }
 
     @Test
@@ -1149,7 +1149,7 @@ class PrefillEndpointTest {
         assertEquals(0, endpoint.ownershipStats().batchCount());
         assertEquals(0, endpoint.admissionSummary(0).occupiedRequests());
         verify(endpointReporter, never()).reportBatchCompletion(
-                anyString(), org.mockito.ArgumentMatchers.anyLong(),
+                anyString(),
                 org.mockito.ArgumentMatchers.anyLong(), org.mockito.ArgumentMatchers.anyLong());
 
         assertEquals(0, endpoint.admissionSummary(0).occupiedRequests());
@@ -1669,17 +1669,17 @@ class PrefillEndpointTest {
         doThrow(schedulerFailure).when(requestRuntime.events()).onPrefillGenerationRetired(
                 eq(endpoint), org.mockito.ArgumentMatchers.any());
         doThrow(firstReportFailure).when(endpointReporter)
-                .reportBatchCompletion(anyString(), eq(1L), eq(100L), eq(40L));
+                .reportBatchCompletion(anyString(), eq(100L), eq(40L));
         doThrow(secondReportFailure).when(endpointReporter)
-                .reportBatchCompletion(anyString(), eq(2L), eq(200L), eq(50L));
+                .reportBatchCompletion(anyString(), eq(200L), eq(50L));
 
         assertSame(schedulerFailure, assertThrows(IllegalStateException.class, endpoint::closeEndpoint));
         assertEquals(List.of(firstReportFailure, secondReportFailure),
                 List.of(schedulerFailure.getSuppressed()));
         assertEquals(0, endpoint.ownershipStats().locallyOwnedRequests());
         assertEquals(0, endpoint.ownershipStats().batchCount());
-        verify(endpointReporter).reportBatchCompletion(anyString(), eq(1L), eq(100L), eq(40L));
-        verify(endpointReporter).reportBatchCompletion(anyString(), eq(2L), eq(200L), eq(50L));
+        verify(endpointReporter).reportBatchCompletion(anyString(), eq(100L), eq(40L));
+        verify(endpointReporter).reportBatchCompletion(anyString(), eq(200L), eq(50L));
         assertDoesNotThrow(endpoint::closeEndpoint);
     }
 

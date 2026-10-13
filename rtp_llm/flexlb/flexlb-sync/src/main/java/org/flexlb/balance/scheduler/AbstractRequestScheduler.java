@@ -57,7 +57,6 @@ public abstract class AbstractRequestScheduler implements RequestScheduler {
 
     protected final RequestRepository requests;
     protected final SchedulerRuntime runtime;
-    protected final FlexlbConfig config;
     private final boolean directPlacement;
     protected final DecodeResources.AdmissionCapacity decodeAdmissionCapacity;
     private final RecentCacheKeyTraceReporter recentCacheKeyTraceReporter;
@@ -70,8 +69,7 @@ public abstract class AbstractRequestScheduler implements RequestScheduler {
                                        DecodeResources.AdmissionCapacity decodeAdmissionCapacity,
                                        RecentCacheKeyTraceReporter recentCacheKeyTraceReporter) {
         this.runtime = Objects.requireNonNull(runtime);
-        this.config = Objects.requireNonNull(config);
-        this.directPlacement = config.isDirect();
+        this.directPlacement = Objects.requireNonNull(config).isDirect();
         this.decodeAdmissionCapacity = Objects.requireNonNull(decodeAdmissionCapacity, "decodeAdmissionCapacity");
         this.requests = runtime.requests();
         this.recentCacheKeyTraceReporter = Objects.requireNonNull(recentCacheKeyTraceReporter, "recentCacheKeyTraceReporter");

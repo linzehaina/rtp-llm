@@ -93,12 +93,16 @@ class SchedulerRuntimeTest {
     }
 
     @Test
-    void directStartupUsesOneSchedulerAndSharedConfiguration() {
+    void directStartupUsesOneSchedulerAndRejectsQueueRequests() {
         try (var f = new Fixture(false)) {
             var scheduler = (AbstractRequestScheduler) SchedulerTestSupport.initializedScheduler(f.runtime);
             assertInstanceOf(DirectRequestScheduler.class, scheduler);
             assertSame(scheduler, SchedulerTestSupport.initializedScheduler(f.runtime));
-            assertSame(f.config, scheduler.config);
+            var wrongMode = new RequestContext(SchedulingTestConfig.newConfig());
+            var rejected = scheduler.submit(wrongMode).join();
+            assertFalse(rejected.isSuccess());
+            assertEquals("request configuration does not match scheduler mode", rejected.getErrorMessage());
+            assertEquals(0, f.runtime.requests().liveRequestCount());
             assertSame(f.config, new RequestContext(f.config).getConfig());
             assertThrows(IllegalStateException.class,
                     () -> f.runtime.registerScheduler(mock(AbstractRequestScheduler.class)));

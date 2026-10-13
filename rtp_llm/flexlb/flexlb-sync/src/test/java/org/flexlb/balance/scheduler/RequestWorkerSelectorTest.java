@@ -355,7 +355,6 @@ class RequestWorkerSelectorTest {
         context.setRequest(context.getRequest().toBuilder().seqLen(prompt).maxNewTokens(output).build());
         context.setSchedulingMetadata(SchedulingMetadata.explicit(73, Long.MAX_VALUE));
         var scheduler = mock(QueuedRequestScheduler.class, org.mockito.Mockito.CALLS_REAL_METHODS);
-        org.springframework.test.util.ReflectionTestUtils.setField(scheduler, "config", config);
         org.springframework.test.util.ReflectionTestUtils.setField(scheduler, "decodeAdmissionCapacity", capacity);
         var prefill = selection(RoleType.PREFILL, 701L, "10.0.0.1", 8080, "g1");
         var selectedDecode = selection(RoleType.DECODE, 701L, "10.0.0.2", 8080, "g1");

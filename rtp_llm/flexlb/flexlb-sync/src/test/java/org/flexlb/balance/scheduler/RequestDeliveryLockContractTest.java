@@ -514,7 +514,7 @@ class RequestDeliveryLockContractTest {
         claim.item.ctx().scheduler().completeDelivery(claim, DeliveryResult.delivered());
         assertSame(terminal, registered.future().join());
         assertEquals(RequestState.Phase.COMPLETED, original.snapshot().state());
-        SchedulerTestSupport.continuations(lifecycle.runtime).awaitIdle();
+        SchedulerTestSupport.awaitRequestWork(lifecycle.runtime);
         RequestState retiredRecord0 = org.flexlb.balance.scheduler.SchedulerTestSupport.repository(lifecycle).getRequestState(original.getRequestId(), 0L);
         assertTrue(org.flexlb.balance.scheduler.SchedulerTestSupport.repository(lifecycle).removeExactTerminal(org.flexlb.balance.scheduler.SchedulerTestSupport.terminalRecord(lifecycle, retiredRecord0), Long.MAX_VALUE));
 

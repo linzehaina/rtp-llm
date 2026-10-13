@@ -146,7 +146,7 @@ class RequestConfirmationTimeoutTest {
             // AUTOMATIC_TIMER relies only on ExpirationTimer; no manual expiry entry point runs.
             assertFalse(future.get(2L, TimeUnit.SECONDS).isSuccess());
             assertEquals(RequestState.Phase.TIMED_OUT, org.flexlb.balance.scheduler.SchedulerTestSupport.repository(requests).getRequestState(REQUEST_ID, 0L).state());
-            SchedulerTestSupport.continuations(SchedulerTestSupport.runtime(requests)).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(SchedulerTestSupport.runtime(requests));
             assertEquals(0, org.flexlb.balance.scheduler.SchedulerTestSupport.repository(requests).liveRequestCount());
             assertEquals(0L, prefill.admissionSummary(0).occupiedRequests());
             assertEquals(0, prefill.ownershipStats().locallyOwnedRequests());
@@ -166,7 +166,7 @@ class RequestConfirmationTimeoutTest {
             RequestProtocolTestSupport.applyPrefillStatus(requests, prefill, RoleType.PREFILL, PrefillState.PrefillRequestStatus.active(item));
             RequestProtocolTestSupport.applyDecodeStatus(requests, decode, DecodeResources.DecodeRequestStatus.active(reservation));
             assertEquals(RequestState.Phase.TIMED_OUT, org.flexlb.balance.scheduler.SchedulerTestSupport.repository(requests).getRequestState(REQUEST_ID, 0L).state());
-            SchedulerTestSupport.continuations(SchedulerTestSupport.runtime(requests)).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(SchedulerTestSupport.runtime(requests));
             assertEquals(0, org.flexlb.balance.scheduler.SchedulerTestSupport.repository(requests).liveRequestCount());
             assertEquals(0L, prefill.admissionSummary(0).occupiedRequests());
             assertEquals(0, decode.routingView().engineCapacityUsed());

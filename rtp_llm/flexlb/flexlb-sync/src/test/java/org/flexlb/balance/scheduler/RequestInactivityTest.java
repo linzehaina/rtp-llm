@@ -118,7 +118,7 @@ class RequestInactivityTest {
             registry.onDecodeStatus(requestContext, decode,
                     DecodeResources.DecodeRequestStatus.active(item.decodeReservation()));
         }
-        SchedulerTestSupport.continuations(registry.runtime).awaitIdle();
+        SchedulerTestSupport.awaitRequestWork(registry.runtime);
         assertTrue(scheduled.isCancelled(), "engine evidence must cancel the obsolete scheduled callback");
         assertNull(RequestProtocolTestSupport.field(requestContext, "decisionDeadline"));
         requestContext.onDecisionVisibilityDeadline(deadline);
@@ -234,20 +234,18 @@ class RequestInactivityTest {
     }
 
     @Test
-    void expiredSilenceRejectsAckWhileTheTimerContinuationIsBacklogged() throws Exception {
+    void expiredSilenceRejectsAckWhileTheTimerWorkIsBacklogged() throws Exception {
         ExpirationTimer.InactivityDeadline exact = (ExpirationTimer.InactivityDeadline) org.springframework.test.util.ReflectionTestUtils.getField(requestContext, "inactivityDeadline");
         assertNotNull(exact);
-        RequestContinuationExecutor continuations = SchedulerTestSupport.continuations(registry.runtime);
-        CountDownLatch started = new CountDownLatch(1);
+        int workers = Math.clamp(Runtime.getRuntime().availableProcessors(), 2, 8);
+        CountDownLatch started = new CountDownLatch(workers);
         CountDownLatch release = new CountDownLatch(1);
-        continuations.submit(requestContext, () -> {
-            started.countDown();
-            try {
-                release.await();
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
-            }
-        });
+        for (int i = 0; i < workers; i++) {
+            registry.runtime.executeRequestWork(requestContext, () -> {
+                started.countDown();
+                RequestProtocolTestSupport.await(release);
+            });
+        }
         assertTrue(started.await(1L, TimeUnit.SECONDS));
         try {
             long past = System.currentTimeMillis() - TIMEOUT_MS - 1_000L;
@@ -261,7 +259,7 @@ class RequestInactivityTest {
         } finally {
             release.countDown();
         }
-        SchedulerTestSupport.continuations(registry.runtime).awaitIdle();
+        SchedulerTestSupport.awaitRequestWork(registry.runtime);
         assertFalse(item.future().get(1L, TimeUnit.SECONDS).isSuccess());
     }
 
@@ -369,7 +367,7 @@ class RequestInactivityTest {
                 completeDelivery(DeliveryResult.uncertain(new IllegalStateException("sender exited")));
             }
             claim.settlement().toCompletableFuture().join();
-            SchedulerTestSupport.continuations(registry.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(registry.runtime);
         }
         assertEquals(0, org.flexlb.balance.scheduler.SchedulerTestSupport.repository(registry).liveRequestCount());
         assertEquals(expectedState, org.flexlb.balance.scheduler.SchedulerTestSupport.repository(registry).getRequestState(REQUEST_ID, 0L).state());

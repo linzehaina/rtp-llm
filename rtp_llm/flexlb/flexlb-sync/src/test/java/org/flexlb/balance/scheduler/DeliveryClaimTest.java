@@ -24,19 +24,40 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class DeliveryClaimTest {
-    @Test void decodeProofAndTerminalEffectsShareOneQueuedCleanupPass() throws Exception {
+    @Test @org.junit.jupiter.api.Timeout(15)
+    void alreadyCompletedCancelAckSettlesOutsideTaskAndContextMonitors() throws Exception {
         try (var f = new Fixture()) {
             assertTrue(f.owner.tryStartSend(f.claim));
             f.owner.completeDelivery(f.claim, DeliveryResult.delivered());
-            SchedulerTestSupport.continuations(f.owner.runtime).awaitIdle();
-            var executor = spy(SchedulerTestSupport.continuations(f.owner.runtime));
-            ReflectionTestUtils.setField(f.owner.runtime, "continuations", executor);
+            SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
+            synchronized (f.context) { assertTrue(f.claim.recordAbandonmentLocked(CancelReason.CLIENT_CANCELLED)); }
+            when(f.channel.cancel(any(), anyLong(), any(), anyLong()))
+                    .thenReturn(CompletableFuture.completedFuture(EngineCancelChannel.CancelAck.REQUEST_CLEANED));
+            var task = new DeliveryCleanupTask(f.claim, f.channel, SchedulerTestSupport.cleanupExecutor(f.owner.runtime),
+                    work -> f.owner.runtime.executeRequestWork(f.context, work));
+            var observed = f.settlement().thenRun(() -> {
+                assertFalse(Thread.holdsLock(task), "settlement dependents must not inherit the cleanup-task monitor");
+                assertFalse(Thread.holdsLock(f.context));
+                f.owner.cancel(41L, 0L, CancelReason.CLIENT_CANCELLED);
+            });
+            task.start();
+            observed.get(5, TimeUnit.SECONDS);
+            f.awaitArchive();
+            SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
+            verify(f.prefill, times(1)).releaseRequest(f.claim.item);
+            verify(f.decode).release(f.reservation, DecodeResources.ReleaseReason.REMOTE_CLEANUP);
+        }
+    }
 
+    @Test void decodeProofAndTerminalEffectsReleaseEachResourceOnce() throws Exception {
+        try (var f = new Fixture()) {
+            assertTrue(f.owner.tryStartSend(f.claim));
+            f.owner.completeDelivery(f.claim, DeliveryResult.delivered());
+            SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
             f.applyDecodeTerminal();
-            executor.awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
 
-            // The real per-context queue runs the status effect, then exactly one cleanup effect.
-            verify(executor, times(2)).submit(eq(f.context), any(Runnable.class));
+            // Concurrent status and terminal effects still release each exact resource once.
             assertTrue(f.settlement().isDone());
             assertFalse(f.owner.requests.isCurrent(f.context));
             assertFalse(f.prefillOwned.get());
@@ -49,12 +70,11 @@ class DeliveryClaimTest {
     @Test void terminalBeforeSenderFinishesQueuesCleanupOnlyAfterProofAndShutdownDrainsIt() throws Exception {
         try (var f = new Fixture()) {
             assertTrue(f.owner.tryStartSend(f.claim));
-            var executor = spy(SchedulerTestSupport.continuations(f.owner.runtime));
-            ReflectionTestUtils.setField(f.owner.runtime, "continuations", executor);
+            var executor = observeWorkers(f.owner.runtime);
 
             f.applyDecodeTerminal();
-            executor.awaitIdle();
-            verify(executor, times(1)).submit(eq(f.context), any(Runnable.class));
+            SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
+            verify(executor, times(1)).execute(any(Runnable.class));
             assertFalse(f.settlement().isDone());
             assertTrue(f.owner.requests.isCurrent(f.context));
             assertTrue(f.prefillOwned.get(), "the sender still pins Prefill ownership");
@@ -64,7 +84,6 @@ class DeliveryClaimTest {
             f.owner.completeDelivery(f.claim, DeliveryResult.delivered());
             f.owner.runtime.shutdown();
 
-            verify(executor, times(2)).submit(eq(f.context), any(Runnable.class));
             assertTrue(f.settlement().isDone());
             assertFalse(f.owner.requests.isCurrent(f.context));
             assertFalse(f.prefillOwned.get());
@@ -74,19 +93,18 @@ class DeliveryClaimTest {
         }
     }
 
-    @Test void rejectedCleanupQueueClaimRemainsRetryableWithoutReleasingResources() throws Exception {
+    @Test void rejectedWorkerSubmissionRetainsTheCleanupOwnerAndRecoversOffCaller() throws Exception {
         try (var f = new Fixture()) {
             assertTrue(f.owner.tryStartSend(f.claim));
             f.owner.completeDelivery(f.claim, DeliveryResult.delivered());
-            SchedulerTestSupport.continuations(f.owner.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
             f.clearDecodeStateOwnership();
             f.claim.recordDecodeTerminalStatus(f.decode, DecodeResources.DecodeRequestStatus.terminal(f.reservation, 0L));
             f.owner.settleDelivery(f.claim);
             Runnable terminal = f.context.scheduler().acceptDecodeStatus(f.context, f.decode,
                     DecodeResources.DecodeRequestStatus.terminal(f.reservation, 0L), System.currentTimeMillis());
             assertNotNull(terminal);
-            var executor = spy(SchedulerTestSupport.continuations(f.owner.runtime));
-            ReflectionTestUtils.setField(f.owner.runtime, "continuations", executor);
+            var executor = observeWorkers(f.owner.runtime);
             var rejected = new IllegalStateException("queue acceptance rejected");
             doAnswer(call -> {
                 assertFalse(Thread.holdsLock(f.context), "queue submission must run outside the request monitor");
@@ -94,20 +112,14 @@ class DeliveryClaimTest {
                 f.owner.enqueueCleanup(f.context);
                 assertTrue(f.prefillOwned.get(), "a synchronous event cannot consume an unaccepted queue claim");
                 throw rejected;
-            }).doCallRealMethod().when(executor).submit(eq(f.context), any(Runnable.class));
-
-            assertSame(rejected, assertThrows(IllegalStateException.class, () -> f.owner.enqueueCleanup(f.context)));
-            assertTrue(f.prefillOwned.get());
-            assertTrue(f.owner.requests.isCurrent(f.context));
-            verify(f.prefill, never()).releaseRequest(any());
+            }).when(executor).execute(any(Runnable.class));
 
             f.owner.enqueueCleanup(f.context);
-            executor.awaitIdle();
-            verify(executor, times(2)).submit(eq(f.context), any(Runnable.class));
-            assertFalse(f.prefillOwned.get(), "a rejected claim must not suppress the accepted retry");
+            SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
+            assertFalse(f.prefillOwned.get(), "accepted cleanup recovers without losing its queue claim");
             assertTrue(f.owner.requests.isCurrent(f.context), "terminal effects still own the archive gate");
             terminal.run();
-            executor.awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
             assertFalse(f.owner.requests.isCurrent(f.context));
             verify(f.prefill, times(1)).releaseRequest(f.claim.item);
             verify(f.decode, never()).release(any(), any());
@@ -118,9 +130,8 @@ class DeliveryClaimTest {
         try (var f = new Fixture()) {
             assertTrue(f.owner.tryStartSend(f.claim));
             f.owner.completeDelivery(f.claim, DeliveryResult.delivered());
-            SchedulerTestSupport.continuations(f.owner.runtime).awaitIdle();
-            var executor = spy(SchedulerTestSupport.continuations(f.owner.runtime));
-            ReflectionTestUtils.setField(f.owner.runtime, "continuations", executor);
+            SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
+            var executor = observeWorkers(f.owner.runtime);
             var entered = new java.util.concurrent.CountDownLatch(1);
             var release = new java.util.concurrent.CountDownLatch(1);
             doAnswer(call -> {
@@ -139,7 +150,10 @@ class DeliveryClaimTest {
                 f.applyDecodeTerminal();
                 assertTrue(entered.await(2, TimeUnit.SECONDS));
                 f.owner.enqueueCleanup(f.context);
-                verify(executor, times(3)).submit(eq(f.context), any(Runnable.class));
+                int submissions = mockingDetails(executor).getInvocations().size();
+                for (int i = 0; i < 100; i++) { f.owner.enqueueCleanup(f.context); }
+                assertEquals(submissions, mockingDetails(executor).getInvocations().size(),
+                        "running cleanup merges notifications without queuing more tasks");
                 shutdown.start();
                 RequestProtocolTestSupport.awaitCondition(() -> shutdown.getState() == Thread.State.WAITING);
                 assertTrue(shutdown.isAlive());
@@ -153,6 +167,96 @@ class DeliveryClaimTest {
             assertFalse(f.owner.requests.isCurrent(f.context));
             verify(f.prefill, times(1)).releaseRequest(f.claim.item);
             verify(f.decode, never()).release(any(), any());
+        }
+    }
+
+    @Test @org.junit.jupiter.api.Timeout(15)
+    void settlementAndShutdownSeeCleanupRegisteredBeforeItsSubmission() throws Exception {
+        try (var f = new Fixture()) {
+            assertTrue(f.owner.tryStartSend(f.claim));
+            f.owner.completeDelivery(f.claim, DeliveryResult.delivered());
+            SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
+            f.clearDecodeStateOwnership();
+            Runnable terminal = f.owner.acceptDecodeStatus(f.context, f.decode,
+                    DecodeResources.DecodeRequestStatus.terminal(f.reservation, 0L), System.currentTimeMillis());
+            assertNotNull(terminal);
+            var delegate = SchedulerTestSupport.requestWorkers(f.owner.runtime);
+            var workers = observeWorkers(f.owner.runtime);
+            var entered = new java.util.concurrent.CountDownLatch(1);
+            var release = new java.util.concurrent.CountDownLatch(1);
+            doAnswer(call -> {
+                assertFalse(Thread.holdsLock(f.context));
+                entered.countDown();
+                RequestProtocolTestSupport.await(release);
+                delegate.execute(call.getArgument(0));
+                return null;
+            }).when(workers).execute(any(Runnable.class));
+            var producer = new Thread(() -> f.owner.enqueueCleanup(f.context));
+            var closer = new Thread(f.owner.runtime::closeRequestWork);
+            try {
+                producer.start();
+                assertTrue(entered.await(5, TimeUnit.SECONDS));
+                f.owner.settleDelivery(f.claim);
+                assertTrue(f.settlement().isDone(), "exact proof may settle while local cleanup is being submitted");
+                terminal.run();
+                closer.start();
+                RequestProtocolTestSupport.awaitCondition(() -> closer.getState() == Thread.State.WAITING);
+                assertTrue(closer.isAlive(), "pre-registered cleanup blocks executor close before execute returns");
+                assertTrue(f.owner.requests.isCurrent(f.context));
+            } finally {
+                release.countDown();
+                producer.join(5_000);
+                closer.join(5_000);
+            }
+            assertFalse(closer.isAlive());
+            assertFalse(f.owner.requests.isCurrent(f.context));
+            verify(f.prefill, times(1)).releaseRequest(f.claim.item);
+        }
+    }
+
+    private static java.util.concurrent.ExecutorService observeWorkers(SchedulerRuntime runtime) {
+        var original = SchedulerTestSupport.requestWorkers(runtime);
+        var observed = mock(java.util.concurrent.ExecutorService.class,
+                org.mockito.AdditionalAnswers.delegatesTo(original));
+        ReflectionTestUtils.setField(runtime, "requestWorkers", observed);
+        return observed;
+    }
+
+    @Test @org.junit.jupiter.api.Timeout(15)
+    void acceptedStatusBlocksCloseBeforeItsEffectIsSubmitted() throws Exception {
+        try (var f = new Fixture()) {
+            assertTrue(f.owner.tryStartSend(f.claim));
+            f.owner.completeDelivery(f.claim, DeliveryResult.delivered());
+            SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
+            var delegate = SchedulerTestSupport.requestWorkers(f.owner.runtime);
+            var workers = observeWorkers(f.owner.runtime);
+            var entered = new java.util.concurrent.CountDownLatch(1);
+            var release = new java.util.concurrent.CountDownLatch(1);
+            doAnswer(call -> {
+                assertFalse(Thread.holdsLock(f.context));
+                entered.countDown();
+                RequestProtocolTestSupport.await(release);
+                delegate.execute(call.getArgument(0));
+                return null;
+            }).when(workers).execute(any(Runnable.class));
+            var source = new Thread(f::applyDecodeTerminal);
+            var closer = new Thread(f.owner.runtime::closeRequestWork);
+            try {
+                source.start();
+                assertTrue(entered.await(5, TimeUnit.SECONDS));
+                synchronized (f.context) { assertTrue(f.context.hasTerminalAction()); }
+                closer.start();
+                RequestProtocolTestSupport.awaitCondition(() -> closer.getState() == Thread.State.WAITING);
+                assertTrue(closer.isAlive(), "the terminal action has an owner before worker submission");
+            } finally {
+                release.countDown();
+                source.join(5_000);
+                closer.join(5_000);
+            }
+            assertFalse(closer.isAlive());
+            assertTrue(f.settlement().isDone());
+            assertFalse(f.owner.requests.isCurrent(f.context));
+            verify(f.prefill, times(1)).releaseRequest(f.claim.item);
         }
     }
 
@@ -241,7 +345,7 @@ class DeliveryClaimTest {
             f.owner.completeDelivery(f.claim, DeliveryResult.delivered());
 
             timeout.run();
-            SchedulerTestSupport.continuations(f.owner.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
 
             assertAll(
                     () -> assertFalse(f.settlement().isDone(), "cleanup execution failure is not resource settlement"),
@@ -263,28 +367,28 @@ class DeliveryClaimTest {
             assertFalse(f.settlement().isDone(), "ACTIVE is not delivery release evidence");
             f.owner.recordSchedulingFailure(f.context, org.flexlb.dao.loadbalance.StrategyErrorType.NO_AVAILABLE_WORKER, "not sent");
             f.owner.settleDelivery(f.claim);
-            SchedulerTestSupport.continuations(f.owner.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
             f.awaitArchive();
         }
     }
 
     @Test void notSentQueuesCleanupBeforePublishingTheSettlementBarrier() throws Exception {
         try (var f = new Fixture()) {
-            RequestContinuationExecutor original = SchedulerTestSupport.continuations(f.owner.runtime);
-            RequestContinuationExecutor held = mock(RequestContinuationExecutor.class);
+            var original = SchedulerTestSupport.requestWorkers(f.owner.runtime);
+            var held = mock(java.util.concurrent.ExecutorService.class);
             var accepted = new java.util.ArrayList<Runnable>();
             org.mockito.Mockito.doAnswer(call -> {
                 assertFalse(f.settlement().isDone(), "cleanup must be accepted before the settlement barrier opens");
-                accepted.add(call.getArgument(1));
+                accepted.add(call.getArgument(0));
                 return null;
-            }).when(held).submit(org.mockito.ArgumentMatchers.same(f.context), any(Runnable.class));
-            ReflectionTestUtils.setField(f.owner.runtime, "continuations", held);
+            }).when(held).execute(any(Runnable.class));
+            ReflectionTestUtils.setField(f.owner.runtime, "requestWorkers", held);
             try {
                 f.owner.completeDelivery(f.claim, DeliveryResult.notSent(new IllegalStateException("not sent")));
                 assertFalse(accepted.isEmpty(), "the failure must have a cleanup owner");
                 assertTrue(f.settlement().isDone(), "NOT_SENT proves remote resources can be released");
             } finally {
-                ReflectionTestUtils.setField(f.owner.runtime, "continuations", original);
+                ReflectionTestUtils.setField(f.owner.runtime, "requestWorkers", original);
                 for (Runnable work : accepted) { work.run(); }
             }
             f.awaitArchive();
@@ -318,7 +422,7 @@ class DeliveryClaimTest {
                 f.owner.acceptDeliveryCleanup(f.claim, EngineCancelChannel.CancelAck.REQUEST_CLEANED);
                 f.applyDecodeTerminal();
                 f.owner.onPrefillGenerationRetired(f.prefill, f.claim.item);
-                SchedulerTestSupport.continuations(f.owner.runtime).awaitIdle();
+                SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
 
                 assertSame(replacement, f.owner.requests.findActive(41L));
                 assertFalse(replacementFuture.isDone(), "old cleanup facts cannot finish a reused request identity");
@@ -340,7 +444,7 @@ class DeliveryClaimTest {
             timeout.run();
             f.owner.onPrefillGenerationRetired(f.prefill, f.claim.item);
             f.retireDecode();
-            SchedulerTestSupport.continuations(f.owner.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
 
             assertTrue(f.claim.cleanupEvidence().remoteSettled(), "both exact generations have retired");
             f.assertArchivedAfterCleanup();
@@ -359,7 +463,7 @@ class DeliveryClaimTest {
             f.owner.onDecodeStatus(f.context, RequestProtocolTestSupport.decodeEndpoint(), DecodeResources.DecodeRequestStatus.terminal(f.reservation, 0L));
             f.owner.onDecodeStatus(f.context, f.decode, DecodeResources.DecodeRequestStatus.terminal(
                     new DecodeResources.ReservationHandle(1L, 41L, 99L), 0L));
-            SchedulerTestSupport.continuations(f.owner.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
             assertFalse(f.settlement().isDone(), "Prefill fencing and foreign Decode facts do not settle the request");
             assertTrue(f.owner.requests.isCurrent(f.context));
             verify(f.decode, never()).release(any(), any());
@@ -377,7 +481,7 @@ class DeliveryClaimTest {
 
             timeout.run();
             f.cancel.complete(EngineCancelChannel.CancelAck.REQUEST_CLEANED);
-            SchedulerTestSupport.continuations(f.owner.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
             assertFalse(f.settlement().isDone(), "remote cleanup cannot settle an active sender");
             assertTrue(f.owner.requests.isCurrent(f.context));
             verify(f.prefill, never()).releaseRequest(any());
@@ -398,7 +502,7 @@ class DeliveryClaimTest {
             f.owner.completeDelivery(f.claim, DeliveryResult.uncertain(new IllegalStateException("reply lost")));
             f.owner.onResponseUndeliverable(f.context);
             f.cancel.complete(ack);
-            SchedulerTestSupport.continuations(f.owner.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
             assertFalse(f.owner.tryStartSend(f.claim), "uncertain delivery must not be sent again");
             assertFalse(f.settlement().isDone());
             assertTrue(f.owner.requests.isCurrent(f.context));
@@ -422,13 +526,13 @@ class DeliveryClaimTest {
             Runnable decodeProof = f::applyDecodeTerminal;
             if (decodeFirst) { decodeProof.run(); }
             else { f.cancel.complete(EngineCancelChannel.CancelAck.REQUEST_FENCED); }
-            SchedulerTestSupport.continuations(f.owner.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
             assertFalse(f.settlement().isDone(), "one side of the cleanup proof cannot settle delivery");
             verify(f.prefill, never()).releaseRequest(any());
 
             if (decodeFirst) { f.cancel.complete(EngineCancelChannel.CancelAck.REQUEST_FENCED); }
             else { decodeProof.run(); }
-            SchedulerTestSupport.continuations(f.owner.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
             if (!senderFirst) {
                 assertFalse(f.settlement().isDone(), "complete remote proof still needs sender exit");
                 f.owner.completeDelivery(f.claim, DeliveryResult.uncertain(new IllegalStateException("reply lost")));
@@ -436,7 +540,7 @@ class DeliveryClaimTest {
             f.assertArchivedAfterCleanup();
             f.owner.acceptDeliveryCleanup(f.claim, EngineCancelChannel.CancelAck.REQUEST_CLEANED);
             decodeProof.run();
-            SchedulerTestSupport.continuations(f.owner.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
             verify(f.prefill, times(1)).releaseRequest(f.claim.item);
             f.assertDecodeOwnershipReleasedOnce();
         }
@@ -449,7 +553,7 @@ class DeliveryClaimTest {
             f.owner.cancel(41L, 0L, CancelReason.CLIENT_CANCELLED);
             f.owner.cancel(41L, 0L, CancelReason.SHUTDOWN);
             f.owner.onResponseUndeliverable(f.context);
-            SchedulerTestSupport.continuations(f.owner.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
             verify(f.channel, times(1)).cancel(any(), eq(41L), eq(CancelReason.CLIENT_CANCELLED), anyLong());
             f.owner.completeDelivery(f.claim, DeliveryResult.uncertain(new IllegalStateException("reply lost")));
             f.cancel.complete(EngineCancelChannel.CancelAck.REQUEST_CLEANED);
@@ -476,7 +580,7 @@ class DeliveryClaimTest {
                     case 'D' -> f.applyDecodeTerminal();
                     default -> throw new AssertionError(order);
                 }
-                SchedulerTestSupport.continuations(f.owner.runtime).awaitIdle();
+                SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
                 if (index < order.length() - 1) {
                     assertFalse(f.settlement().isDone(), "partial evidence: " + order.substring(0, index + 1));
                     assertTrue(f.owner.requests.isCurrent(f.context));
@@ -488,7 +592,7 @@ class DeliveryClaimTest {
             assertThrows(IllegalStateException.class, () -> f.owner.completeDelivery(f.claim, DeliveryResult.delivered()));
             f.owner.acceptDeliveryCleanup(f.claim, EngineCancelChannel.CancelAck.REQUEST_CLEANED);
             f.applyDecodeTerminal();
-            SchedulerTestSupport.continuations(f.owner.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
             verify(f.prefill, times(1)).releaseRequest(f.claim.item);
             f.assertDecodeOwnershipReleasedOnce();
         }
@@ -521,7 +625,7 @@ class DeliveryClaimTest {
                     : DecodeResources.DecodeRequestStatus.terminal(reservation, 0L);
             f.claim.recordDecodeTerminalStatus(source, requestStatus);
             f.owner.settleDelivery(f.claim);
-            SchedulerTestSupport.continuations(f.owner.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
             assertFalse(f.settlement().isDone());
             assertNull(f.claim.provenReleaseReason());
             assertTrue(f.decodeOwned.get(), "foreign facts cannot release the exact Decode owner");
@@ -547,12 +651,12 @@ class DeliveryClaimTest {
             assertTrue(f.owner.tryStartSend(f.claim));
             f.owner.cancel(41L, 0L, CancelReason.CLIENT_CANCELLED);
             f.owner.completeDelivery(f.claim, DeliveryResult.uncertain(new IllegalStateException("reply lost")));
-            SchedulerTestSupport.continuations(f.owner.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
             for (int attempt = 1; attempt <= successfulAttempt; attempt++) {
                 assertEquals(attempt, replies.size());
                 replies.get(attempt - 1).complete(attempt == successfulAttempt
                         ? EngineCancelChannel.CancelAck.REQUEST_CLEANED : EngineCancelChannel.CancelAck.NOT_FOUND);
-                SchedulerTestSupport.continuations(f.owner.runtime).awaitIdle();
+                SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
                 if (attempt < successfulAttempt) {
                     assertFalse(f.settlement().isDone());
                     verify(f.prefill, never()).releaseRequest(any());
@@ -578,11 +682,11 @@ class DeliveryClaimTest {
             assertTrue(f.owner.tryStartSend(f.claim));
             f.owner.cancel(41L, 0L, CancelReason.CLIENT_CANCELLED);
             f.owner.completeDelivery(f.claim, DeliveryResult.uncertain(new IllegalStateException("reply lost")));
-            SchedulerTestSupport.continuations(f.owner.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
             assertEquals(1, replies.size());
 
             timer.runAckTimeout();
-            SchedulerTestSupport.continuations(f.owner.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
             assertFalse(f.settlement().isDone());
             timer.runRetry(25L);
             assertEquals(2, replies.size());
@@ -602,12 +706,12 @@ class DeliveryClaimTest {
             assertTrue(f.owner.tryStartSend(f.claim));
             f.owner.cancel(41L, 0L, CancelReason.CLIENT_CANCELLED);
             f.owner.completeDelivery(f.claim, DeliveryResult.uncertain(new IllegalStateException("reply lost")));
-            SchedulerTestSupport.continuations(f.owner.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
             verify(f.channel, times(1)).cancel(any(), eq(41L), any(), eq(500L));
 
             timer.runDeadline();
             timer.runRetry(25L); // A callback already taken from the timer queue may still run.
-            SchedulerTestSupport.continuations(f.owner.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
             verify(f.channel, times(1)).cancel(any(), eq(41L), any(), eq(500L));
             assertFalse(f.settlement().isDone());
             org.junit.jupiter.api.Assertions.assertNotNull(SchedulerTestSupport.failure(f.owner));
@@ -625,12 +729,12 @@ class DeliveryClaimTest {
             assertTrue(f.owner.tryStartSend(f.claim));
             f.owner.cancel(41L, 0L, CancelReason.CLIENT_CANCELLED);
             f.owner.completeDelivery(f.claim, DeliveryResult.uncertain(new IllegalStateException("reply lost")));
-            SchedulerTestSupport.continuations(f.owner.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
             timer.runAckTimeout();
-            SchedulerTestSupport.continuations(f.owner.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
             for (int attempt = 1; attempt < 8; attempt++) {
                 timer.runRetry(Math.min(400L, 25L << (attempt - 1)));
-                SchedulerTestSupport.continuations(f.owner.runtime).awaitIdle();
+                SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
             }
             assertEquals(8, calls.get());
             org.junit.jupiter.api.Assertions.assertNotNull(SchedulerTestSupport.failure(f.owner));
@@ -653,11 +757,11 @@ class DeliveryClaimTest {
             assertTrue(f.owner.tryStartSend(f.claim));
             f.owner.cancel(41L, 0L, CancelReason.CLIENT_CANCELLED);
             f.owner.completeDelivery(f.claim, DeliveryResult.uncertain(new IllegalStateException("reply lost")));
-            SchedulerTestSupport.continuations(f.owner.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
             for (int attempt = 1; attempt < 8; attempt++) {
                 verify(f.channel, times(attempt)).cancel(any(), eq(41L), any(), anyLong());
                 timer.runRetry(Math.min(400L, 25L << (attempt - 1)));
-                SchedulerTestSupport.continuations(f.owner.runtime).awaitIdle();
+                SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
             }
             verify(f.channel, times(8)).cancel(any(), eq(41L), any(), anyLong());
             assertTrue(timer.retries.isEmpty(), "retry budget must end without scheduling a ninth attempt");
@@ -806,7 +910,7 @@ class DeliveryClaimTest {
                 assertEquals(true, ReflectionTestUtils.getField(claim, "decodeReleaseProven"));
             }
             awaitArchive();
-            SchedulerTestSupport.continuations(owner.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(owner.runtime);
             assertFalse(context.getFuture().join().isSuccess());
             assertFalse(prefillOwned.get(), "archival requires Prefill ownership to be released");
             verify(prefill, times(1)).releaseRequest(claim.item);

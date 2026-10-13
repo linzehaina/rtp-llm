@@ -195,7 +195,7 @@ class RequestSchedulerModeTest {
             if (queue != null) { queue.close(); }
             requests.awaitAdmissionMutations();
             SchedulerTestSupport.timer(org.flexlb.balance.scheduler.SchedulerTestSupport.runtime(requests)).close();
-            SchedulerTestSupport.continuations(requests.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(requests.runtime);
             requests.closeOutstandingAndTerminalize();
             SchedulerTestSupport.closeRequestExecutors(org.flexlb.balance.scheduler.SchedulerTestSupport.runtime(requests));
         }

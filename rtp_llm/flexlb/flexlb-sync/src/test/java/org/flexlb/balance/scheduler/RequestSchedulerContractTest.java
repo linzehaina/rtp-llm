@@ -138,7 +138,7 @@ class RequestSchedulerContractTest {
 
             f.requests.enqueueInactivityDeadline(request, deadline, Long.MAX_VALUE,
                     () -> { throw new AssertionError("stale deadline must not rearm"); });
-            SchedulerTestSupport.continuations(f.requests.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(f.requests.runtime);
         }
     }
 
@@ -415,7 +415,7 @@ class RequestSchedulerContractTest {
             doThrow(failure).when(endpoint).releaseRequest(route);
             SchedulerTestSupport.runtime(api).stopAccepting();
             assertTrue(future.completeExceptionally(new IllegalStateException("request failed")));
-            SchedulerTestSupport.continuations(f.requests.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(f.requests.runtime);
             assertSame(failure, SchedulerTestSupport.failure(api));
             assertTrue(future.isCompletedExceptionally(), "cleanup failure must not revoke the selected response");
             assertEquals(RequestContext.RequestStage.FINALIZING, request.stage());
@@ -473,7 +473,7 @@ class RequestSchedulerContractTest {
             RequestProtocolTestSupport.close(scheduler);
             requests.awaitAdmissionMutations();
             SchedulerTestSupport.timer(org.flexlb.balance.scheduler.SchedulerTestSupport.runtime(requests)).close();
-            SchedulerTestSupport.continuations(requests.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(requests.runtime);
             requests.closeOutstandingAndTerminalize();
             SchedulerTestSupport.closeRequestExecutors(org.flexlb.balance.scheduler.SchedulerTestSupport.runtime(requests));
         }

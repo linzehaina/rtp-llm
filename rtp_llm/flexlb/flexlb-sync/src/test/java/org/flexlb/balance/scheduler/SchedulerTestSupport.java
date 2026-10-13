@@ -58,8 +58,9 @@ public final class SchedulerTestSupport {
             return lifecycle == null ? null : (RequestScheduler) ReflectionTestUtils.getField(lifecycle, "scheduler");
         }
     }
-    static RequestContinuationExecutor continuations(SchedulerRuntime runtime) {
-        return (RequestContinuationExecutor) ReflectionTestUtils.getField(runtime, "continuations");
+    public static void awaitRequestWork(SchedulerRuntime runtime) { runtime.awaitRequestWork(); }
+    static java.util.concurrent.ExecutorService requestWorkers(SchedulerRuntime runtime) {
+        return (java.util.concurrent.ExecutorService) ReflectionTestUtils.getField(runtime, "requestWorkers");
     }
     static ResponseCompletionExecutor responseCompletions(SchedulerRuntime runtime) {
         return (ResponseCompletionExecutor) ReflectionTestUtils.getField(runtime, "responseCompletions");

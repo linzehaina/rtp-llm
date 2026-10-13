@@ -1818,23 +1818,26 @@ public class RequestContext {
                        DecodeResources.ReleaseReason releaseReason, DeliveryResult.Status source,
                        RequestDeadline requestDeadline, DecisionDeadline decisionDeadline) { }
 
-    /** An unstarted pass owns QUEUED; running notifications leave their phase unchanged. */
-    record CleanupQueue(CleanupProgress progress, boolean queued) { }
+    /** An unstarted pass owns QUEUED; a running owner consumes notifications through RUN_AGAIN. */
+    record CleanupQueue(CleanupProgress progress) { }
 
     CleanupQueue tryQueueCleanupLocked() {
         requireContextLock("cleanup queue claim");
         if (cleanup == null || admission != null || cleanup.phase == CleanupProgress.Phase.FINISHED
                 || cleanup.phase == CleanupProgress.Phase.QUEUED
                 || delivery != null && !delivery.canReleaseLocked()) { return null; }
-        boolean queued = cleanup.phase == CleanupProgress.Phase.PENDING || cleanup.phase == CleanupProgress.Phase.WAITING;
-        if (queued) { cleanup.phase = CleanupProgress.Phase.QUEUED; }
-        return new CleanupQueue(cleanup, queued);
+        if (cleanup.phase == CleanupProgress.Phase.RUNNING || cleanup.phase == CleanupProgress.Phase.RUN_AGAIN) {
+            cleanup.phase = CleanupProgress.Phase.RUN_AGAIN;
+            return null;
+        }
+        cleanup.phase = CleanupProgress.Phase.QUEUED;
+        return new CleanupQueue(cleanup);
     }
 
     /** Only the accepted task or its rejected submission can surrender its queue claim. */
     void releaseCleanupQueueLocked(CleanupQueue exact) {
         requireContextLock("cleanup queue release");
-        if (exact.queued() && cleanup == exact.progress() && cleanup.phase == CleanupProgress.Phase.QUEUED) {
+        if (cleanup == exact.progress() && cleanup.phase == CleanupProgress.Phase.QUEUED) {
             cleanup.phase = CleanupProgress.Phase.PENDING;
         }
     }

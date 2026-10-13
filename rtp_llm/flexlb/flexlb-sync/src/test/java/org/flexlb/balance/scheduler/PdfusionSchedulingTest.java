@@ -137,7 +137,7 @@ class PdfusionSchedulingTest {
                 worker.lock.unlock();
             }
             projection.run();
-            SchedulerTestSupport.continuations(lifecycle.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(lifecycle.runtime);
             assertEquals(0, endpoint.admissionSummary(0).occupiedRequests());
             assertEquals(0, endpoint.ownershipStats().batchCount());
             assertTrue(committedWork.containsRequest(requestId), "published snapshots stay immutable");

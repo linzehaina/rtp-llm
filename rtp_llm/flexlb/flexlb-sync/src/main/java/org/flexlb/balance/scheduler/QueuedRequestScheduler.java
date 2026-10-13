@@ -257,13 +257,13 @@ public final class QueuedRequestScheduler extends AbstractRequestScheduler imple
     }
 
     @Override
-    boolean completeExternal(RequestContext ctx, ResponseCompletion completion, Response response, Throwable error) {
+    boolean completeExternalRegistered(RequestContext ctx, ResponseCompletion completion, Response response, Throwable error) {
         ctx.requireOutsideContextLock("external Future completion");
         if (completion == ResponseCompletion.CANCELLATION) {
             Boolean cancelled = cancelQueuedExternal(ctx);
             if (cancelled != null) { return cancelled; }
         }
-        return super.completeExternal(ctx, completion, response, error);
+        return super.completeExternalRegistered(ctx, completion, response, error);
     }
 
     @Override

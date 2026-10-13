@@ -63,7 +63,7 @@ class RequestTerminalSettlementTest {
         var context = RequestProtocolTestSupport.context(SchedulingTestConfig.newConfig(), 4202L);
         AbstractRequestScheduler requestOwner = RequestProtocolTestSupport.initialize(mock(ResponseCompletionExecutor.class), context, mock(ExpirationTimer.Scheduling.class));
         requestOwner.onDecodeGenerationRetired(context, RequestProtocolTestSupport.decodeEndpoint(), new DecodeResources.ReservationHandle(1L, 4202L, 7L));
-        SchedulerTestSupport.continuations(requestOwner.runtime).awaitIdle();
+        SchedulerTestSupport.awaitRequestWork(requestOwner.runtime);
         assertTrue(context.isOpen());
         assertFalse(context.getFuture().isDone());
     }
@@ -77,7 +77,7 @@ class RequestTerminalSettlementTest {
                 RESERVATION.endpointGenerationId(), RESERVATION.requestId(), RESERVATION.reservationToken() + 1);
 
         f.scheduler().onDecodeGenerationRetired(f.requestContext(), source, reservation);
-        SchedulerTestSupport.continuations(f.scheduler().runtime).awaitIdle();
+        SchedulerTestSupport.awaitRequestWork(f.scheduler().runtime);
 
         assertTrue(f.requestContext().isOpen());
         assertFalse(f.requestContext().future().isDone());
@@ -98,7 +98,7 @@ class RequestTerminalSettlementTest {
         assertNull(claim.resolvedRequestResult());
 
         f.scheduler().onDecodeGenerationRetired(f.requestContext(), f.item().decodeEp(), RESERVATION);
-        SchedulerTestSupport.continuations(f.scheduler().runtime).awaitIdle();
+        SchedulerTestSupport.awaitRequestWork(f.scheduler().runtime);
 
         assertTrue(claim.isFinished());
         assertNotNull(claim.resolvedRequestResult(), "retirement must notify the detached original claim");
@@ -144,13 +144,12 @@ class RequestTerminalSettlementTest {
             cleanupThread.set(Thread.currentThread().getName());
             return true;
         });
-        try (RequestContinuationExecutor continuations = new RequestContinuationExecutor()) {
-            org.springframework.test.util.ReflectionTestUtils.setField(f.scheduler().runtime, "continuations", continuations);
+        {
             org.mockito.Mockito.doCallRealMethod().when(f.scheduler()).onDecodeGenerationRetired(any(), any(), any());
             f.scheduler().onDecodeGenerationRetired(f.requestContext(), f.item().decodeEp(), RESERVATION);
             assertFalse(f.requestContext().isOpen());
             assertEquals(RequestState.Phase.FAILED, f.requestContext().snapshot().state());
-            continuations.awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(f.scheduler().runtime);
             assertNotNull(cleanupThread.get());
             assertNotEquals(Thread.currentThread().getName(), cleanupThread.get());
         }
@@ -166,7 +165,7 @@ class RequestTerminalSettlementTest {
         assertTrue(f.scheduler().updatePreemption(claim, PreemptionCancelPhase.CANCEL_IN_FLIGHT));
         RequestProtocolTestSupport.applyDecodeStatus(f.scheduler(), f.requestContext(), f.item().decodeEp(), DecodeResources.DecodeRequestStatus.terminal(RESERVATION, 0L));
         verify(f.item().decodeEp(), never()).reconcilePreemptionResources(anyLong(), argThat(update -> update.kind() == DecodeResources.PreemptionUpdate.Kind.FINISHED));
-        SchedulerTestSupport.continuations(f.scheduler().runtime).awaitIdle();
+        SchedulerTestSupport.awaitRequestWork(f.scheduler().runtime);
         assertTrue((f.requestContext().stage() == RequestContext.RequestStage.FINISHED));
         assertTrue(claim.isFinished());
     }
@@ -243,7 +242,7 @@ class RequestTerminalSettlementTest {
         RequestProtocolTestSupport.applyPrefillStatus(f.scheduler(), f.requestContext(), f.item().prefillEp(), role, failed);
         verify(f.item().decodeEp(), times(2)).reconcilePreemptionResources(4L, DecodeResources.PreemptionUpdate.finished(RESERVATION));
         assertEquals(RequestState.Phase.FAILED, f.requestContext().snapshot().state());
-        SchedulerTestSupport.continuations(f.scheduler().runtime).awaitIdle();
+        SchedulerTestSupport.awaitRequestWork(f.scheduler().runtime);
         assertTrue((f.requestContext().stage() == RequestContext.RequestStage.FINISHED));
         assertEquals(org.flexlb.balance.preemption.VictimResolution.Outcome.REQUEST_END,
                 claim.requestResolution().toCompletableFuture().join().outcome());
@@ -304,10 +303,10 @@ class RequestTerminalSettlementTest {
         RequestProtocolTestSupport.expireInactivity(f.scheduler(), requestContext, inactivity, RequestProtocolTestSupport.<Long>inspect(f.scheduler(), requestContext, "inactivityExpiresAtMsLocked"));
         assertFalse(delivery.settlement().toCompletableFuture().isDone(), "sender has not exited");
         delivery.item.ctx().scheduler().completeDelivery(delivery, DeliveryResult.notSent(new IllegalStateException("expired before send")));
-        SchedulerTestSupport.continuations(f.scheduler().runtime).awaitIdle();
+        SchedulerTestSupport.awaitRequestWork(f.scheduler().runtime);
         RequestState ended = requestContext.snapshot();
         assertEquals(RequestState.Phase.CANCELLED, ended.state());
-        SchedulerTestSupport.continuations(f.scheduler().runtime).awaitIdle();
+        SchedulerTestSupport.awaitRequestWork(f.scheduler().runtime);
         assertTrue((requestContext.stage() == RequestContext.RequestStage.FINISHED));
         assertTrue(claim.isFinished());
         assertNull(requestContext.activeRoute());
@@ -333,7 +332,7 @@ class RequestTerminalSettlementTest {
         RequestProtocolTestSupport.expireInactiveRequest(f.scheduler(), f.requestContext(), RequestProtocolTestSupport.<Long>inspect(f.scheduler(), f.requestContext(), "inactivityExpiresAtMsLocked"));
         assertEquals(RequestState.Phase.TIMED_OUT, f.requestContext().snapshot().state());
         assertSame(delivered, f.requestContext().future().join());
-        SchedulerTestSupport.continuations(f.scheduler().runtime).awaitIdle();
+        SchedulerTestSupport.awaitRequestWork(f.scheduler().runtime);
         assertTrue((f.requestContext().stage() == RequestContext.RequestStage.FINISHED));
     }
 
@@ -344,7 +343,7 @@ class RequestTerminalSettlementTest {
         f.scheduler().cancelRequest(f.requestContext(), 0L, CancelReason.CLIENT_CANCELLED);
         if (retirement) {
             f.scheduler().onDecodeGenerationRetired(f.requestContext(), f.item().decodeEp(), RESERVATION);
-            SchedulerTestSupport.continuations(f.scheduler().runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(f.scheduler().runtime);
         } else {
             RequestProtocolTestSupport.applyDecodeStatus(f.scheduler(), f.requestContext(), f.item().decodeEp(),
                     DecodeResources.DecodeRequestStatus.terminal(RESERVATION, 0L));
@@ -353,7 +352,7 @@ class RequestTerminalSettlementTest {
         assertFalse(f.requestContext().future().isDone());
         f.admission().finish();
         assertEquals(RequestState.Phase.CANCELLED, f.requestContext().snapshot().state());
-        SchedulerTestSupport.continuations(f.scheduler().runtime).awaitIdle();
+        SchedulerTestSupport.awaitRequestWork(f.scheduler().runtime);
         assertTrue((f.requestContext().stage() == RequestContext.RequestStage.FINISHED));
         assertFalse(f.requestContext().future().join().isSuccess());
     }
@@ -379,7 +378,7 @@ class RequestTerminalSettlementTest {
         RequestProtocolTestSupport.applyDecodeStatus(f.scheduler(), requestContext, f.item().decodeEp(), DecodeResources.DecodeRequestStatus.terminal(RESERVATION, 42L));
         assertEquals(RequestState.Phase.FAILED, requestContext.snapshot().state());
         delivery.item.ctx().scheduler().completeDelivery(delivery, DeliveryResult.delivered());
-        SchedulerTestSupport.continuations(f.scheduler().runtime).awaitIdle();
+        SchedulerTestSupport.awaitRequestWork(f.scheduler().runtime);
         assertTrue((requestContext.stage() == RequestContext.RequestStage.FINISHED));
         assertFalse(requestContext.future().join().isSuccess());
         verify(f.item().prefillEp()).releaseRequest(f.item());
@@ -409,13 +408,13 @@ class RequestTerminalSettlementTest {
         }).when(inactivity).cancel();
         delivery.recordWorkerCompletion(f.item());
         delivery.item.ctx().scheduler().settleDelivery(delivery);
-        SchedulerTestSupport.continuations(f.scheduler().runtime).awaitIdle();
+        SchedulerTestSupport.awaitRequestWork(f.scheduler().runtime);
         assertEquals(RequestContext.RequestStage.FINALIZING, context.stage(),
                 "resource evidence cannot archive before the terminal execution owner finishes");
         f.scheduler().onResponseUndeliverable(context);
         assertFalse(delivery.cleanupRequired(), "late frontend failure cannot revoke completed execution evidence");
         f.scheduler().finalizationEffects(action, null).run();
-        SchedulerTestSupport.continuations(f.scheduler().runtime).awaitIdle();
+        SchedulerTestSupport.awaitRequestWork(f.scheduler().runtime);
         assertEquals(RequestContext.RequestStage.FINISHED, context.stage());
         verify(f.item().prefillEp(), times(1)).releaseRequest(f.item());
     }

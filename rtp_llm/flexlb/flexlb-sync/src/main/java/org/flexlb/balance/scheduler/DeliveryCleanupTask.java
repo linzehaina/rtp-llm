@@ -78,20 +78,23 @@ final class DeliveryCleanupTask {
         } catch (Throwable failure) { reply.completeExceptionally(failure); }
     }
 
-    private synchronized void finishCancel(int current, EngineCancelChannel.CancelAck ack, Throwable failure) {
+    private void finishCancel(int current, EngineCancelChannel.CancelAck ack, Throwable failure) {
         // Exact proof remains valid after this attempt timed out, a retry started, or the task stopped.
+        // Settlement may run dependent callbacks and enqueue local cleanup; never hold the task monitor.
         if (ack != null) { claim.item.ctx().scheduler().acceptDeliveryCleanup(claim, ack); }
-        if (stopped || settlement.isDone() || current != attempt) { return; }
-        if (ackDeadline != null) { ackDeadline.cancel(false); }
-        if (settlement.isDone() || claim.cleanupEvidence().remoteSettled()) { return; }
-        if (current >= MAX_CANCEL_ATTEMPTS) {
-            stop(failure == null ? new IllegalStateException(
-                    "cancel lacks cleanup proof: request_id=" + claim.item.requestId() + " ack=" + ack) : failure);
-            return;
+        synchronized (this) {
+            if (stopped || settlement.isDone() || current != attempt) { return; }
+            if (ackDeadline != null) { ackDeadline.cancel(false); }
+            if (claim.cleanupEvidence().remoteSettled()) { return; }
+            if (current >= MAX_CANCEL_ATTEMPTS) {
+                stop(failure == null ? new IllegalStateException(
+                        "cancel lacks cleanup proof: request_id=" + claim.item.requestId() + " ack=" + ack) : failure);
+                return;
+            }
+            try {
+                retry = timer.schedule(this::attemptCancel, Math.min(400L, 25L << (current - 1)), TimeUnit.MILLISECONDS);
+            } catch (RuntimeException rejected) { stop(rejected); }
         }
-        try {
-            retry = timer.schedule(this::attemptCancel, Math.min(400L, 25L << (current - 1)), TimeUnit.MILLISECONDS);
-        } catch (RuntimeException rejected) { stop(rejected); }
     }
 
     private void stop(Throwable failure) {

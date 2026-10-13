@@ -415,7 +415,7 @@ class DecodeCapacityAcquirerProtocolTest {
             assertTrue(entered.await(5, TimeUnit.SECONDS), "both settlements must be blocked before probing the timer");
             org.flexlb.balance.scheduler.SchedulerTestSupport.cleanupExecutor(runtime).schedule(deadlineRan::countDown, 1, TimeUnit.MILLISECONDS);
             assertTrue(deadlineRan.await(1, TimeUnit.SECONDS), "blocked settlement must not occupy the shared deadline threads");
-            assertTrue(settlementThreads.stream().allMatch(name -> name.startsWith("request-continuation-")),
+            assertTrue(settlementThreads.stream().allMatch(name -> name.startsWith("request-work-")),
                     "settlement threads: " + settlementThreads);
             assertTrue(outcomes.stream().noneMatch(CompletableFuture::isDone));
         } finally {
@@ -458,9 +458,8 @@ class DecodeCapacityAcquirerProtocolTest {
     @ParameterizedTest
     @org.junit.jupiter.params.provider.CsvSource({"false,true", "true,true", "true,false"})
     @org.junit.jupiter.api.Timeout(15)
-    void settlementPreservesRequestOrderAndShutdownDrainsIt(
+    void settlementHasAnExplicitDependencyAndShutdownDrainsIt(
             boolean terminalWins, boolean admissionOpenAtSettlement) throws Exception {
-        runtime = org.mockito.Mockito.spy(runtime);
         Fixture fixture = fixture();
         var context = mock(org.flexlb.balance.scheduler.RequestContext.class);
         when(context.scheduler()).thenReturn(fixture.requests());
@@ -470,7 +469,6 @@ class DecodeCapacityAcquirerProtocolTest {
         var channel = mock(EngineCancelChannel.class);
         when(channel.cancel(any(), anyLong(), eq(CancelReason.PRIORITY_PREEMPTED), anyLong()))
                 .thenReturn(CompletableFuture.completedFuture(EngineCancelChannel.CancelAck.ACCEPTED));
-        var entered = new java.util.concurrent.CountDownLatch(1);
         var release = new java.util.concurrent.CountDownLatch(1);
         var settlementQueued = new java.util.concurrent.CountDownLatch(1);
         var afterSettlement = new CompletableFuture<Boolean>();
@@ -478,33 +476,38 @@ class DecodeCapacityAcquirerProtocolTest {
         var admissionOpen = new java.util.concurrent.atomic.AtomicBoolean(true);
         Thread closer = null;
         try {
-            runtime.executeContinuation(context, () -> {
-                entered.countDown();
-                try { assertTrue(release.await(10, TimeUnit.SECONDS)); }
-                catch (InterruptedException failure) { throw new AssertionError(failure); }
-            });
-            assertTrue(entered.await(5, TimeUnit.SECONDS));
-            org.mockito.Mockito.doAnswer(call -> {
-                call.callRealMethod();
-                settlementQueued.countDown();
-                return null;
-            }).when(runtime).executeContinuation(eq(context), any());
-            var acquirer = new DecodeCapacityAcquirer(channel, SchedulerTestSupport.repository(fixture.requests()), runtime, mock(RequestSchedulerReporter.class), SchedulingTestConfig.configService(SchedulingTestConfig.newConfig()), new DecodeResources.AdmissionCapacity(1L, 100L));
+            var tasks = new org.flexlb.balance.scheduler.RequestTaskScheduler() {
+                @Override public Cancellation scheduleTimeout(Runnable work, long delayMs) {
+                    return runtime.scheduleTimeout(work, delayMs);
+                }
+                @Override public void executeRequestWork(org.flexlb.balance.scheduler.RequestContext exact, Runnable work) {
+                    runtime.executeRequestWork(exact, () -> {
+                        settlementQueued.countDown();
+                        try { assertTrue(release.await(10, TimeUnit.SECONDS)); }
+                        catch (InterruptedException failure) { throw new AssertionError(failure); }
+                        work.run();
+                    });
+                }
+            };
+            var acquirer = new DecodeCapacityAcquirer(channel, SchedulerTestSupport.repository(fixture.requests()), tasks, mock(RequestSchedulerReporter.class), SchedulingTestConfig.configService(SchedulingTestConfig.newConfig()), new DecodeResources.AdmissionCapacity(1L, 100L));
             var outcome = acquirer.preempt(context, new DecodeCapacityAcquirer.PreemptionCommand(
                     fixture.endpoint(), incoming(), org.flexlb.dao.SchedulingMetadata.explicit(70, Long.MAX_VALUE), List.of(victim(11L, 101L)),
-                    50L, terminalWins ? 5_000L : 20L, admissionOpen::get, "ordered settlement"));
+                    50L, terminalWins ? 5_000L : 20L, admissionOpen::get, "explicit settlement dependency"));
             if (terminalWins) {
                 terminal.complete(new VictimResolution(11L, VictimResolution.Outcome.REQUEST_END));
             }
             assertTrue(settlementQueued.await(5, TimeUnit.SECONDS));
-            assertFalse(outcome.isDone(), "settlement cannot overtake the request's earlier continuation");
+            assertFalse(outcome.isDone(), "settlement is paused before endpoint commit");
             verify(fixture.endpoint(), never()).commitPreemption(anyLong());
             verify(fixture.endpoint(), never()).abortPreemption(anyLong());
             if (!terminalWins) {
                 assertFalse(terminal.isDone(), "timeout retains the exact late resolution observer");
                 terminal.complete(new VictimResolution(11L, VictimResolution.Outcome.REQUEST_END));
             }
-            runtime.executeContinuation(context, () -> afterSettlement.complete(outcome.isDone()));
+            outcome.thenRun(() -> afterSettlement.complete(true));
+            var independent = new CompletableFuture<Void>();
+            runtime.executeRequestWork(context, () -> independent.complete(null));
+            independent.get(5, TimeUnit.SECONDS);
             closer = new Thread(() -> {
                 try {
                     org.springframework.test.util.ReflectionTestUtils.invokeMethod(runtime, "shutdown");
@@ -516,7 +519,7 @@ class DecodeCapacityAcquirerProtocolTest {
             admissionOpen.set(admissionOpenAtSettlement);
             release.countDown();
             assertEquals(terminalWins && admissionOpenAtSettlement, outcome.get(5, TimeUnit.SECONDS).committed());
-            assertTrue(afterSettlement.get(5, TimeUnit.SECONDS), "later request work must follow settlement");
+            assertTrue(afterSettlement.get(5, TimeUnit.SECONDS), "dependent work follows the settlement future");
             shutdown.get(5, TimeUnit.SECONDS);
             assertTrue(org.flexlb.balance.scheduler.SchedulerTestSupport.cleanupExecutor(runtime).isTerminated());
             if (!terminalWins || !admissionOpenAtSettlement) {

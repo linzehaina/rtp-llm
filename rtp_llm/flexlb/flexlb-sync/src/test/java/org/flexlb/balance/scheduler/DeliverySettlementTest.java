@@ -122,7 +122,7 @@ class DeliverySettlementTest {
         assertFalse(member.claim().settlement().toCompletableFuture().isDone());
         DeliverySettlementTestSupport.decodeStatus(decode, 2L, true);
         member.claim().settlement().toCompletableFuture().get(2, TimeUnit.SECONDS);
-        SchedulerTestSupport.continuations(registry.runtime).awaitIdle();
+        SchedulerTestSupport.awaitRequestWork(registry.runtime);
         assertEquals(0, decode.routingView().engineCapacityUsed());
         assertOccupancy(0, 0);
     }
@@ -175,7 +175,7 @@ class DeliverySettlementTest {
             finished.get(2, TimeUnit.SECONDS);
         }
         member.claim().settlement().toCompletableFuture().get(2, TimeUnit.SECONDS);
-        SchedulerTestSupport.continuations(registry.runtime).awaitIdle();
+        SchedulerTestSupport.awaitRequestWork(registry.runtime);
         assertThrows(IllegalStateException.class, () -> reject(member));
         ledger.finish(40L, member.item());
         assertOccupancy(0, 0);
@@ -193,7 +193,7 @@ class DeliverySettlementTest {
         ledger.commit(51L, List.of(replacement.item()));
         decodeFinished(old);
         ledger.finish(50L, old.item()).forEach(status -> registry.onPrefillStatus(status.route().ctx(), prefill, RoleType.PREFILL, status));
-        SchedulerTestSupport.continuations(registry.runtime).awaitIdle();
+        SchedulerTestSupport.awaitRequestWork(registry.runtime);
         assertOccupancy(1, 1);
         assertSame(replacement.requestContext(), registry.requests.findActive(50L));
         assertFalse(replacement.item().future().isDone());
@@ -252,7 +252,7 @@ class DeliverySettlementTest {
                 .thenAnswer(invocation -> { assertFalse(Thread.holdsLock(member.requestContext())); return false; });
         member.claim().item.ctx().scheduler().completeDelivery(member.claim(), DeliveryResult.notSent(new IllegalStateException("serialization failed")));
         member.claim().settlement().toCompletableFuture().get(2, TimeUnit.SECONDS);
-        SchedulerTestSupport.continuations(registry.runtime).awaitIdle();
+        SchedulerTestSupport.awaitRequestWork(registry.runtime);
         assertFalse(member.item().future().get(2, TimeUnit.SECONDS).isSuccess());
         assertOccupancy(0, 0);
         assertTrue(cancellations.isEmpty());
@@ -306,7 +306,7 @@ class DeliverySettlementTest {
             releaseCleanup.countDown();
             callback.shutdownNow();
         }
-        SchedulerTestSupport.continuations(registry.runtime).awaitIdle();
+        SchedulerTestSupport.awaitRequestWork(registry.runtime);
         assertOccupancy(0, 0);
     }
 
@@ -331,7 +331,7 @@ class DeliverySettlementTest {
                 }
                 default -> throw new AssertionError(order);
             }
-            SchedulerTestSupport.continuations(registry.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(registry.runtime);
             assertEquals(decodeEnded ? 0 : 1, decode.routingView().engineCapacityUsed());
             if (index == 0 && order.charAt(index) == 'A') {
                 assertOccupancy(1, 1);
@@ -348,7 +348,7 @@ class DeliverySettlementTest {
         assertTrue(cancellations.isEmpty(), "normal completion must not start Engine cancel");
         DeliverySettlementTestSupport.decodeStatus(decode, 70L, true);
         ledger.finish(70L, member.item()).forEach(status -> registry.onPrefillStatus(status.route().ctx(), prefill, RoleType.PREFILL, status));
-        SchedulerTestSupport.continuations(registry.runtime).awaitIdle();
+        SchedulerTestSupport.awaitRequestWork(registry.runtime);
         assertOccupancy(0, 0);
         assertSame(response, member.item().future().join());
         assertThrows(IllegalStateException.class, () -> member.claim().item.ctx().scheduler().completeDelivery(member.claim(), DeliveryResult.delivered()));
@@ -378,7 +378,7 @@ class DeliverySettlementTest {
         cancellations.computeIfAbsent(member.item().requestId(), ignored -> new java.util.concurrent.CompletableFuture<>())
                 .complete(EngineCancelChannel.CancelAck.REQUEST_CLEANED);
         member.claim().settlement().toCompletableFuture().get(2, TimeUnit.SECONDS);
-        SchedulerTestSupport.continuations(registry.runtime).awaitIdle();
+        SchedulerTestSupport.awaitRequestWork(registry.runtime);
     }
 
     private void reject(Member member) {

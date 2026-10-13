@@ -103,7 +103,10 @@ public abstract class AbstractRequestScheduler implements RequestScheduler {
         Objects.requireNonNull(reason, "reason");
         RequestContext context = requests.findActive(requestId);
         if (context != null) {
-            return context.scheduler() == this ? cancelRequest(context, batchId, reason) : null;
+            if (context.scheduler() != this) { return null; }
+            try (var source = runtime.tryRegisterRequestWork(context)) {
+                if (source != null) { return cancelRequest(context, batchId, reason); }
+            }
         }
         RequestRepository.TerminalRecord terminal = requests.findTerminal(requestId);
         return terminal != null && terminal.owner() == this && terminal.state().matchesBatch(batchId)
@@ -160,7 +163,11 @@ public abstract class AbstractRequestScheduler implements RequestScheduler {
                                 PrefillState.PrefillRequestStatus requestStatus) {
         try {
             if (context != null && context.scheduler() == this) {
-                submitContinuation(context, acceptPrefillStatus(context, source, role, requestStatus, System.currentTimeMillis()));
+                try (var accepted = runtime.tryRegisterRequestWork(context)) {
+                    if (accepted == null) { return; }
+                    Runnable work = acceptPrefillStatus(context, source, role, requestStatus, System.currentTimeMillis());
+                    if (work != null) { accepted.submit(work); }
+                }
             }
         } catch (Throwable failure) {
             logEndpointFailure("Prefill status", failure);
@@ -171,16 +178,14 @@ public abstract class AbstractRequestScheduler implements RequestScheduler {
                                DecodeResources.DecodeRequestStatus requestStatus) {
         try {
             if (context != null && context.scheduler() == this) {
-                submitContinuation(context, acceptDecodeStatus(context, source, requestStatus, System.currentTimeMillis()));
+                try (var accepted = runtime.tryRegisterRequestWork(context)) {
+                    if (accepted == null) { return; }
+                    Runnable work = acceptDecodeStatus(context, source, requestStatus, System.currentTimeMillis());
+                    if (work != null) { accepted.submit(work); }
+                }
             }
         } catch (Throwable failure) {
             logEndpointFailure("Decode status", failure);
-        }
-    }
-
-    private void submitContinuation(RequestContext context, Runnable work) {
-        if (work != null) {
-            runtime.executeContinuation(context, work);
         }
     }
 
@@ -197,11 +202,15 @@ public abstract class AbstractRequestScheduler implements RequestScheduler {
         try {
             RequestContext context = exact.ctx();
             if (!isCurrentContext(context)) { return; }
-            DeliveryClaim delivery = context.delivery();
-            if (delivery != null && delivery.item == exact) {
-                if (delivery.recordEndpointRetirement(source)) { settleDelivery(delivery); }
+            try (var accepted = runtime.tryRegisterRequestWork(context)) {
+                if (accepted == null) { return; }
+                DeliveryClaim delivery = context.delivery();
+                if (delivery != null && delivery.item == exact) {
+                    if (delivery.recordEndpointRetirement(source)) { settleDelivery(delivery); }
+                }
+                Runnable work = acceptPrefillRetirement(context, source, exact);
+                if (work != null) { accepted.submit(work); }
             }
-            submitContinuation(context, acceptPrefillRetirement(context, source, exact));
         } catch (Throwable failure) {
             logEndpointFailure("Prefill retirement", failure);
         }
@@ -212,33 +221,39 @@ public abstract class AbstractRequestScheduler implements RequestScheduler {
         if (source == null || exact == null) { return; }
         try {
             if (!isCurrentContext(context)) { return; }
-            DeliveryClaim delivery = context.delivery();
-            if (delivery != null && Objects.equals(delivery.item.decodeReservation(), exact)) {
-                if (delivery.recordEndpointRetirement(source)) { settleDelivery(delivery); }
+            try (var accepted = runtime.tryRegisterRequestWork(context)) {
+                if (accepted == null) { return; }
+                DeliveryClaim delivery = context.delivery();
+                if (delivery != null && Objects.equals(delivery.item.decodeReservation(), exact)) {
+                    if (delivery.recordEndpointRetirement(source)) { settleDelivery(delivery); }
+                }
+                Runnable work;
+                synchronized (context) {
+                    work = context.ownsDecodeReservationLocked(source, exact)
+                            ? advanceRequestEndLocked(context, context.route(), DeferredTerminal.decodeGenerationRetired(
+                                    "Decode endpoint generation retired: generation=" + exact.endpointGenerationId()))
+                            : null;
+                }
+                if (work != null) { accepted.submit(work); }
             }
-            Runnable work;
-            synchronized (context) {
-                work = context.ownsDecodeReservationLocked(source, exact)
-                        ? advanceRequestEndLocked(context, context.route(), DeferredTerminal.decodeGenerationRetired(
-                                "Decode endpoint generation retired: generation=" + exact.endpointGenerationId()))
-                        : null;
-            }
-            submitContinuation(context, work);
         } catch (Throwable failure) {
             logEndpointFailure("Decode retirement", failure);
         }
     }
 
     public void enqueueInactivityDeadline(RequestContext ctx, ExpirationTimer.InactivityDeadline exact, long nowMs, Runnable rearm) {
-        Runnable effect;
-        synchronized (ctx) {
-            if (!ctx.consumeInactivityDeadlineLocked(exact)) { return; }
-            effect = decideInactivityLocked(ctx, nowMs, null);
+        try (var accepted = runtime.tryRegisterRequestWork(ctx)) {
+            if (accepted == null) { return; }
+            Runnable effect;
+            synchronized (ctx) {
+                if (!ctx.consumeInactivityDeadlineLocked(exact)) { return; }
+                effect = decideInactivityLocked(ctx, nowMs, null);
+            }
+            accepted.submit(() -> {
+                try { execute(ctx, effect); }
+                finally { rearm.run(); }
+            });
         }
-        runtime.executeContinuation(ctx, () -> {
-            try { execute(ctx, effect); }
-            finally { rearm.run(); }
-        });
     }
 
     private CompletableFuture<Response> registerRequest(RequestContext context, StrategyErrorType expiredError) {
@@ -569,12 +584,14 @@ public abstract class AbstractRequestScheduler implements RequestScheduler {
     }
 
     void completeDelivery(DeliveryClaim claim, DeliveryResult result) {
-        claim.recordSendResult(result);
-        if (result.failed()) { abandonDelivery(claim, CancelReason.CLIENT_CANCELLED); }
-        try {
-            Runnable work = acceptDeliveryResult(claim, result);
-            if (work != null) { submitContinuation(claim.item.ctx(), work); }
-        } finally { settleDelivery(claim); }
+        try (var accepted = runtime.registerRequestWork(claim.item.ctx())) {
+            claim.recordSendResult(result);
+            if (result.failed()) { abandonDelivery(claim, CancelReason.CLIENT_CANCELLED); }
+            try {
+                Runnable work = acceptDeliveryResult(claim, result);
+                if (work != null) { accepted.submit(work); }
+            } finally { settleDelivery(claim); }
+        }
     }
 
     void abandonDelivery(DeliveryClaim claim, CancelReason reason) {
@@ -602,8 +619,8 @@ public abstract class AbstractRequestScheduler implements RequestScheduler {
             cleanupPending = ctx.hasCleanup() && claim.kind == DeliveryClaimKind.BATCH_ENQUEUE;
         }
         if (ready) {
-            try { if (cleanupPending) { enqueueCleanup(ctx); } }
-            finally { claim.settled.complete(null); }
+            if (cleanupPending) { enqueueCleanup(ctx); }
+            claim.settled.complete(null);
         }
     }
 
@@ -639,20 +656,22 @@ public abstract class AbstractRequestScheduler implements RequestScheduler {
 
     public void publishRoute(DeliveryClaim claim, WorkSnapshot work, long predictedMs) {
         RequestContext ctx = claim.item.ctx();
-        Runnable effect;
-        DecisionDeadline obsolete;
-        synchronized (ctx) {
-            if (!ctx.ownsActiveRoute(claim.item)) {
-                return;
+        try (var accepted = runtime.registerRequestWork(ctx)) {
+            Runnable effect;
+            DecisionDeadline obsolete;
+            synchronized (ctx) {
+                if (!ctx.ownsActiveRoute(claim.item)) {
+                    return;
+                }
+                checkArgument(ctx.deliveryClaimKind() == DeliveryClaimKind.ROUTE_DECISION,
+                        "route publication requires a route claim");
+                obsolete = applyDeliveryPredictionLocked(ctx, work, predictedMs, System.currentTimeMillis());
+                effect = acknowledgeDeliveryLocked(ctx, null);
             }
-            checkArgument(ctx.deliveryClaimKind() == DeliveryClaimKind.ROUTE_DECISION,
-                    "route publication requires a route claim");
-            obsolete = applyDeliveryPredictionLocked(ctx, work, predictedMs, System.currentTimeMillis());
-            effect = acknowledgeDeliveryLocked(ctx, null);
+            claim.completeRoute();
+            settleDelivery(claim);
+            executeEngineEffects(ctx, effect, obsolete);
         }
-        claim.completeRoute();
-        settleDelivery(claim);
-        executeEngineEffects(ctx, effect, obsolete);
     }
 
     private Runnable acceptDeliveryResult(DeliveryClaim claim, DeliveryResult result) {
@@ -789,10 +808,14 @@ public abstract class AbstractRequestScheduler implements RequestScheduler {
         Runnable work = null;
         DecisionDeadline obsolete = null;
         boolean capacityChanged = false;
+        DeliveryClaim delivery;
+        boolean deliverySettled;
         synchronized (ctx) {
             if (!ctx.ownsDecodeReservationLocked(source, requestStatus.reservation())) {
                 return null;
             }
+            delivery = ctx.delivery();
+            deliverySettled = delivery != null && delivery.recordDecodeTerminalStatus(source, requestStatus);
             obsolete = ctx.recordDecodeProgressLocked(requestStatus.kind(), nowMs);
             if (requestStatus.kind() == DecodeResources.DecodeRequestStatus.Kind.TERMINAL) {
                 work = advanceRequestEndLocked(ctx, ctx.route(), DeferredTerminal.worker(
@@ -823,8 +846,7 @@ public abstract class AbstractRequestScheduler implements RequestScheduler {
         return () -> {
             Throwable notificationFailure = publishCapacity ? Failures.run(null, source::publishCapacityRelease) : null;
             try {
-                DeliveryClaim delivery = ctx.delivery();
-                if (delivery != null && delivery.recordDecodeTerminalStatus(source, requestStatus)) { settleDelivery(delivery); }
+                if (deliverySettled) { settleDelivery(delivery); }
                 executeEngineEffects(ctx, effect, deadline);
             } catch (Throwable failure) {
                 throw Failures.propagate(Failures.append(failure, notificationFailure), "Decode request status continuation failed");
@@ -935,9 +957,12 @@ public abstract class AbstractRequestScheduler implements RequestScheduler {
 
     public void onResponseUndeliverable(RequestContext exact) {
         if (exact == null || exact.scheduler() != this) { return; }
-        DeliveryClaim delivery = exact.delivery();
-        if (delivery != null) { abandonDelivery(delivery, CancelReason.CLIENT_CANCELLED); }
-        cancelRequest(exact, 0L, CancelReason.CLIENT_CANCELLED);
+        try (var accepted = runtime.tryRegisterRequestWork(exact)) {
+            if (accepted == null) { return; }
+            DeliveryClaim delivery = exact.delivery();
+            if (delivery != null) { abandonDelivery(delivery, CancelReason.CLIENT_CANCELLED); }
+            cancelRequest(exact, 0L, CancelReason.CLIENT_CANCELLED);
+        }
     }
 
     final boolean recordCancellationLocked(RequestContext ctx, CancelReason reason, String message) {
@@ -1022,7 +1047,7 @@ public abstract class AbstractRequestScheduler implements RequestScheduler {
 
     void scheduleWorkerQueueCancellation(RequestContext ctx, RequestRoute exact) {
         if (!exact.prefillEp().signalQueuedControl(exact)) {
-            runtime.executeContinuation(ctx, () -> cancelInWorkerQueue(ctx, exact));
+            runtime.executeRequestWork(ctx, () -> cancelInWorkerQueue(ctx, exact));
         }
     }
 
@@ -1317,7 +1342,14 @@ public abstract class AbstractRequestScheduler implements RequestScheduler {
         return true;
     }
 
-    boolean completeExternal(RequestContext ctx, ResponseCompletion completion, Response response, Throwable error) {
+    final boolean completeExternal(RequestContext ctx, ResponseCompletion completion, Response response, Throwable error) {
+        ctx.requireOutsideContextLock("external Future completion");
+        try (var accepted = runtime.tryRegisterRequestWork(ctx)) {
+            return accepted != null && completeExternalRegistered(ctx, completion, response, error);
+        }
+    }
+
+    boolean completeExternalRegistered(RequestContext ctx, ResponseCompletion completion, Response response, Throwable error) {
         ctx.requireOutsideContextLock("external Future completion");
         TerminalOutcome outcome = switch(completion) {
             case RESPONSE ->
@@ -1433,10 +1465,18 @@ public abstract class AbstractRequestScheduler implements RequestScheduler {
     /** Resume the one request cleanup owner when delivery release evidence becomes complete. */
     void enqueueCleanup(RequestContext ctx) {
         RequestContext.CleanupQueue queued;
-        synchronized (ctx) { queued = ctx.tryQueueCleanupLocked(); }
-        if (queued == null) { return; }
-        try {
-            submitContinuation(ctx, () -> {
+        SchedulerRuntime.WorkRegistration accepted;
+        synchronized (ctx) {
+            queued = ctx.tryQueueCleanupLocked();
+            if (queued == null) { return; }
+            try { accepted = runtime.registerRequestWork(ctx); }
+            catch (RuntimeException | Error failure) {
+                ctx.releaseCleanupQueueLocked(queued);
+                throw failure;
+            }
+        }
+        try (accepted) {
+            accepted.submit(() -> {
                 synchronized (ctx) { ctx.releaseCleanupQueueLocked(queued); }
                 resumeCleanup(ctx);
             });

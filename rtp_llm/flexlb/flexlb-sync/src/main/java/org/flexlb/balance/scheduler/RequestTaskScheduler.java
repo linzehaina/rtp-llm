@@ -10,6 +10,6 @@ public interface RequestTaskScheduler {
     /** Register a one-shot timeout; the handle can only cancel this task. */
     Cancellation scheduleTimeout(Runnable work, long delayMs);
 
-    /** Serialize work with the other continuations of this exact request. */
-    void executeContinuation(RequestContext context, Runnable work);
+    /** Offload work; it may overlap other work for the exact request. Owners enforce dependencies. */
+    void executeRequestWork(RequestContext context, Runnable work);
 }

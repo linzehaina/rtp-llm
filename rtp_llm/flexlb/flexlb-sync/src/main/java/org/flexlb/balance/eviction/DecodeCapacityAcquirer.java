@@ -274,14 +274,14 @@ public class DecodeCapacityAcquirer {
         CompletableFuture<Boolean> settlement = CompletableFuture.allOf(resolutions)
                 .handle((ignored, failure) -> capability.allVictimsResolved());
         // The timer only expires the wait. Endpoint/request settlement runs in the
-        // incoming request's serial continuation and remains part of shutdown drain.
+        // background request pool and remains part of shutdown drain.
         RequestTaskScheduler.Cancellation deadline = runtime.scheduleTimeout(() -> settlement.complete(false),
                 Math.max(1, command.preemptionTimeoutMs()));
         settlement.whenComplete((unused, failure) -> deadline.cancel());
         // First completion fixes eligibility, even if the deadline fires before
         // this continuation is registered. Late facts still settle victim resources.
         return settlement.thenApplyAsync(resolved -> capability.finish(ackNotFound, resolved),
-                work -> runtime.executeContinuation(context, work));
+                work -> runtime.executeRequestWork(context, work));
     }
 
     private CompletableFuture<EngineCancelChannel.CancelAck> cancel(

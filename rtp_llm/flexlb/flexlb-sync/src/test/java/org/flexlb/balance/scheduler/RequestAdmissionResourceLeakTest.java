@@ -216,7 +216,7 @@ class RequestAdmissionResourceLeakTest {
         org.junit.jupiter.api.Assertions.assertFalse(response.isSuccess());
         assertEquals(reason == CancelReason.DEADLINE_EXCEEDED ? StrategyErrorType.RESOURCE_EXHAUSTED.getErrorCode()
                 : StrategyErrorType.REQUEST_CANCELLED.getErrorCode(), response.getCode());
-        SchedulerTestSupport.continuations(lifecycle.runtime).awaitIdle();
+        SchedulerTestSupport.awaitRequestWork(lifecycle.runtime);
         assertEquals(0, lifecycle.requests.liveRequestCount());
         org.junit.jupiter.api.Assertions.assertFalse(lifecycle.isAdmissionOpen(71L, registered.future()));
         // A scheduling deadline is canceled by the published Prefill queue owner;

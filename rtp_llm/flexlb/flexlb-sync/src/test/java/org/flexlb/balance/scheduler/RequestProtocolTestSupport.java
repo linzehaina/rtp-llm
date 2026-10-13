@@ -252,7 +252,7 @@ final class RequestProtocolTestSupport {
     static void expireInactivity(AbstractRequestScheduler scheduler, RequestContext context,
             ExpirationTimer.InactivityDeadline deadline, long nowMs) {
         scheduler.enqueueInactivityDeadline(context, deadline, nowMs, () -> { });
-        SchedulerTestSupport.continuations(scheduler.runtime).awaitIdle();
+        SchedulerTestSupport.awaitRequestWork(scheduler.runtime);
     }
 
     private static void run(Runnable continuation) {

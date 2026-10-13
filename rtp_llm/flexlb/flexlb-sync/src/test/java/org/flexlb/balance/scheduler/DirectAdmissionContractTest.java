@@ -300,7 +300,7 @@ class DirectAdmissionContractTest {
                     PlacementResult.success(WorkerAssignment.prefill(prefill.tryPinGeneration(),
                             Fixture.metadata(prefill, 108L), 30_000L, prefill.placementVersion())));
             assertFalse(fixture.scheduler.submit(context).get(2, TimeUnit.SECONDS).isSuccess());
-            SchedulerTestSupport.continuations(fixture.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(fixture.runtime);
             assertNull(EndpointTestSupport.decodeReservation(fixture.decode, 108L));
             assertEquals(0, fixture.decode.resourceSnapshot().activeDispatchPermits());
             fixture.assertNoPrefillOwnership();
@@ -501,7 +501,7 @@ class DirectAdmissionContractTest {
                 worker.lock.unlock();
             }
             projection.run();
-            SchedulerTestSupport.continuations(requests.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(requests.runtime);
         }
 
         @Override

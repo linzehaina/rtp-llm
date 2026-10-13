@@ -69,7 +69,7 @@ class RequestAdmissionExpirationRaceTest {
             }
             assertTrue(RequestProtocolTestSupport.closeAdmissionAndAwaitMutations(registry));
             registry.closeOutstandingAndTerminalize();
-            SchedulerTestSupport.continuations(registry.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(registry.runtime);
             assertSame(cleanupFailure, SchedulerTestSupport.failure(registry));
             assertEquals(3, releases.get(), "one cleanup failure must not skip another claimed terminal owner");
             for (var future : futures) { assertFalse(future.get(2L, TimeUnit.SECONDS).isSuccess()); }

@@ -14,6 +14,8 @@ import org.springframework.stereotype.Component;
 import javax.annotation.PreDestroy;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
@@ -51,19 +53,139 @@ public final class SchedulerRuntime implements RequestTaskScheduler {
 
     void startDeliveryCleanup(RequestContext.DeliveryClaim claim) {
         new DeliveryCleanupTask(claim, cancelChannel, cleanupExecutor,
-                work -> continuations.submit(claim.item.ctx(), work)).start();
+                work -> executeRequestWork(claim.item.ctx(), work)).start();
     }
 
-    private final RequestContinuationExecutor continuations = new RequestContinuationExecutor();
+    private final ExecutorService requestWorkers = Executors.newFixedThreadPool(
+            Math.clamp(Runtime.getRuntime().availableProcessors(), 2, 8),
+            Thread.ofPlatform().daemon().name("request-work-", 1).factory());
+    private final ExecutorService requestRecovery = Executors.newSingleThreadExecutor(
+            Thread.ofPlatform().daemon().name("request-work-recovery-", 1).factory());
+    // Never run request code while holding this monitor. Context -> workLifecycle is the only edge.
+    private final Object workLifecycle = new Object();
+    private boolean acceptingWork = true;
+    private long pendingWork;
     private final ResponseCompletionExecutor responseCompletions;
     private final ExpirationTimer timer;
 
     RequestRepository requests() { return requests; }
 
-    /** Serializes accepted request work; admission owners drain before this executor closes. */
+    /** Offloads effects; Context and endpoint owners arbitrate concurrent work, not executor order. */
     @Override
-    public void executeContinuation(RequestContext context, Runnable work) {
-        continuations.submit(context, work);
+    public void executeRequestWork(RequestContext context, Runnable work) {
+        Objects.requireNonNull(work, "work");
+        try (var registration = registerRequestWork(context)) { registration.submit(work); }
+    }
+
+    /** Register before publishing state that obliges a later effect or local cleanup. */
+    WorkRegistration registerRequestWork(RequestContext context) {
+        WorkRegistration registration = tryRegisterRequestWork(context);
+        checkState(registration != null, "request work is closed");
+        return registration;
+    }
+
+    WorkRegistration tryRegisterRequestWork(RequestContext context) {
+        Objects.requireNonNull(context, "context");
+        synchronized (workLifecycle) {
+            if (!acceptingWork) { return null; }
+            pendingWork++;
+        }
+        return new WorkRegistration(context);
+    }
+
+    /** Counts both the submitting source and its optional task, including the handoff between them. */
+    final class WorkRegistration implements AutoCloseable {
+        private final RequestContext context;
+        private int owners = 1;
+        private boolean submitted;
+        private boolean sourceClosed;
+        private boolean started;
+
+        private WorkRegistration(RequestContext context) { this.context = context; }
+
+        void submit(Runnable work) {
+            Objects.requireNonNull(work, "work");
+            context.requireOutsideContextLock("request work submission");
+            synchronized (this) {
+                checkState(!sourceClosed && !submitted, "request work already handed off");
+                submitted = true;
+                owners++;
+            }
+            Runnable task = () -> run(work);
+            try { requestWorkers.execute(task); }
+            catch (RuntimeException rejected) {
+                try { requestRecovery.execute(task); }
+                catch (RuntimeException recoveryRejected) {
+                    // Accepted terminal/publication owners cannot be dropped or run on an RPC callback.
+                    recordFailure(Failures.append(rejected, recoveryRejected));
+                    try { Thread.ofPlatform().daemon().name("request-work-emergency").start(task); }
+                    catch (RuntimeException | Error failedToStart) {
+                        recordFailure(failedToStart);
+                        release();
+                        throw failedToStart;
+                    }
+                }
+            }
+        }
+
+        private void run(Runnable work) {
+            synchronized (this) {
+                if (started) { return; }
+                started = true;
+            }
+            try { work.run(); }
+            catch (Throwable failure) {
+                recordFailure(failure);
+                try { Logger.error("Request work failed: request_id={}", context.getRequestId(), failure); }
+                catch (Throwable ignored) { }
+            } finally { release(); }
+        }
+
+        private void release() {
+            synchronized (this) { if (--owners != 0) { return; } }
+            synchronized (workLifecycle) {
+                pendingWork--;
+                if (pendingWork == 0) { workLifecycle.notifyAll(); }
+            }
+        }
+
+        @Override
+        public void close() {
+            synchronized (this) {
+                if (sourceClosed) { return; }
+                sourceClosed = true;
+            }
+            release();
+        }
+    }
+
+    void awaitRequestWork() {
+        boolean interrupted = false;
+        synchronized (workLifecycle) {
+            while (pendingWork != 0) {
+                try { workLifecycle.wait(); }
+                catch (InterruptedException ignored) { interrupted = true; }
+            }
+        }
+        if (interrupted) { Thread.currentThread().interrupt(); }
+    }
+
+    void closeRequestWork() {
+        synchronized (workLifecycle) {
+            // Nested work remains admissible until every accepted source and task has left.
+            awaitRequestWork();
+            acceptingWork = false;
+        }
+        requestWorkers.shutdown();
+        requestRecovery.shutdown();
+        boolean interrupted = false;
+        while (!requestWorkers.isTerminated() || !requestRecovery.isTerminated()) {
+            try {
+                requestWorkers.awaitTermination(1, TimeUnit.DAYS);
+                requestRecovery.awaitTermination(1, TimeUnit.DAYS);
+            } catch (InterruptedException ignored) { interrupted = true; }
+        }
+        if (interrupted) { Thread.currentThread().interrupt(); }
     }
     ResponseCompletionExecutor.CompletionRegistration registerResponseCompletion() {
         return responseCompletions.tryRegister();
@@ -207,7 +329,7 @@ public final class SchedulerRuntime implements RequestTaskScheduler {
 
     private void closeRequestExecutors() {
         Throwable failure = null;
-        try { continuations.close(); } catch (Throwable cause) { failure = cause; }
+        try { closeRequestWork(); } catch (Throwable cause) { failure = cause; }
         try { responseCompletions.close(); } catch (Throwable cause) { failure = Failures.append(failure, cause); }
         cleanupExecutor.shutdown();
         boolean interrupted = false;
@@ -234,7 +356,7 @@ public final class SchedulerRuntime implements RequestTaskScheduler {
                 lifecycle::awaitDeliveryCleanup,
                 endpoints::close,
                 timer::close,
-                continuations::awaitIdle,
+                this::awaitRequestWork,
                 lifecycle::closeOutstandingAndTerminalize,
                 this::closeRequestExecutors
         };

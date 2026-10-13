@@ -294,7 +294,7 @@ class QueuedBatchDeliveryTest {
         releaseExecutor.countDown();
         awaitDispatchTasks();
         assertFalse(item.future().get(5, TimeUnit.SECONDS).isSuccess());
-        SchedulerTestSupport.continuations(registry.runtime).awaitIdle();
+        SchedulerTestSupport.awaitRequestWork(registry.runtime);
         assertOccupancy(0, 0);
         assertEquals(0, decode.routingView().engineCapacityUsed());
         assertEquals(0, decode.routingView().inflightHardKv());
@@ -325,7 +325,7 @@ class QueuedBatchDeliveryTest {
         }
         releaseExecutor.countDown();
         awaitDispatchTasks();
-        SchedulerTestSupport.continuations(registry.runtime).awaitIdle();
+        SchedulerTestSupport.awaitRequestWork(registry.runtime);
         for (int index = 0; index < items.size(); index++) {
             if ((invalidMask & (1 << index)) != 0) {
                 assertFalse(items.get(index).future().get(5, TimeUnit.SECONDS).isSuccess());
@@ -350,7 +350,7 @@ class QueuedBatchDeliveryTest {
                 DeliverySettlementTestSupport.decodeStatus(decode, item.requestId(), true);
             }
         }
-        SchedulerTestSupport.continuations(registry.runtime).awaitIdle();
+        SchedulerTestSupport.awaitRequestWork(registry.runtime);
         for (int index = 0; index < items.size(); index++) {
             if ((invalidMask & (1 << index)) != 0) { registry.cancel(items.get(index).requestId(), 0L, CancelReason.CLIENT_CANCELLED); }
         }

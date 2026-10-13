@@ -209,7 +209,7 @@ class RequestResourceAccountingTest {
             TaskInfo failed = task(ID);
             failed.setErrorCode(500L);
             applyStatus(f.prefill, status(RoleType.PREFILL, 2L, Map.of(), Map.of("101", failed), TOTAL_KV));
-            SchedulerTestSupport.continuations(f.requests.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(f.requests.runtime);
             assertEquals(RequestContext.RequestStage.FINALIZING, f.item.ctx().stage());
             assertEquals(1, f.decode.resourceSnapshot().runningCount());
             assertEquals(1, SchedulerTestSupport.repository(f.requests).liveRequestCount());
@@ -308,7 +308,7 @@ class RequestResourceAccountingTest {
             assertTrue(f.item.ctx().decodeAccepted());
             assertTrue(RequestProtocolTestSupport.<java.util.OptionalLong>field(f.item.ctx(), "decisionExpiresAtMs").isEmpty());
             applyStatus(f.prefill, status(RoleType.PREFILL, 2L, Map.of(), Map.of("101", task(ID)), TOTAL_KV));
-            SchedulerTestSupport.continuations(f.requests.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(f.requests.runtime);
             assertTrue(RequestProtocolTestSupport.<java.util.OptionalLong>field(f.item.ctx(), "decisionExpiresAtMs").isEmpty(),
                     "Prefill completion cannot rearm visibility checks after Decode acceptance");
             assertEquals(0, f.prefill.ownershipStats().locallyOwnedRequests());
@@ -467,7 +467,7 @@ class RequestResourceAccountingTest {
         }
 
         void assertEmpty() {
-            SchedulerTestSupport.continuations(requests.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(requests.runtime);
             assertEquals(0, org.flexlb.balance.scheduler.SchedulerTestSupport.repository(requests).liveRequestCount(), "request inflight");
             assertEquals(0, prefill.queuedRequestCount(), "Prefill queue membership");
             assertEquals(0, prefill.ownershipStats().locallyOwnedRequests(), "Prefill inflight");
@@ -510,7 +510,7 @@ class RequestResourceAccountingTest {
         void proveCleanup() throws Exception {
             cleanup.complete(org.flexlb.balance.eviction.EngineCancelChannel.CancelAck.REQUEST_CLEANED);
             item.ctx().delivery().settlement().toCompletableFuture().get(2, TimeUnit.SECONDS);
-            SchedulerTestSupport.continuations(requests.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(requests.runtime);
         }
         void expire() { RequestProtocolTestSupport.expireInactiveRequest(requests, requests.findRequestContext(ID), System.currentTimeMillis() + TTL + 1); }
         void decodeStatus(Map<String, TaskInfo> running, Map<String, TaskInfo> finished, long freeKv) {

@@ -376,7 +376,7 @@ class RequestCompletionPublicationRaceTest {
 
             resumeCleanup.countDown();
             expiry.get(2L, TimeUnit.SECONDS);
-            SchedulerTestSupport.continuations(registry.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(registry.runtime);
             Response expired = future.get(2L, TimeUnit.SECONDS);
             callback.get(2L, TimeUnit.SECONDS);
             assertFalse(expired.isSuccess());

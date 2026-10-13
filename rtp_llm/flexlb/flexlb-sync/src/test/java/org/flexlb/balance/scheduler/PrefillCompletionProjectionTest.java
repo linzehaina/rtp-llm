@@ -117,18 +117,18 @@ class PrefillCompletionProjectionTest {
             task.setInputLength(16L);
             task.setPhase(TaskPhase.RUNNING);
             applyStatus(prefill, status(2L, Map.of("101", task), Map.of()));
-            SchedulerTestSupport.continuations(requests.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(requests.runtime);
             RequestContext requestContext = requests.findRequestContext(101L);
             synchronized (requestContext) {
                 assertTrue(requestContext.decisionDeadlineAtMs().isEmpty(), "running Prefill is positive Engine evidence");
             }
             if (decodeAlreadyAccepted) {
                 applyStatus(decode, decodeStatus(2L, Map.of("101", task)));
-                SchedulerTestSupport.continuations(requests.runtime).awaitIdle();
+                SchedulerTestSupport.awaitRequestWork(requests.runtime);
             }
 
             applyStatus(prefill, status(3L, Map.of(), Map.of("101", task)));
-            SchedulerTestSupport.continuations(requests.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(requests.runtime);
             assertEquals(0L, prefill.admissionSummary(0).occupiedRequests());
             synchronized (requestContext) {
                 assertTrue(requestContext.isLiveGeneration(), "Prefill completion must retain the Decode lifecycle");
@@ -148,14 +148,14 @@ class PrefillCompletionProjectionTest {
             }
 
             applyStatus(prefill, status(4L, Map.of(), Map.of("101", task)));
-            SchedulerTestSupport.continuations(requests.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(requests.runtime);
             assertEquals(0L, prefill.admissionSummary(0).occupiedRequests());
 
             var decodeFinished = decodeStatus(3L, Map.of());
             decodeFinished.setFinishedTaskInfo(Map.of("101", task));
             decodeFinished.setLatestFinishedVersion(1L);
             applyStatus(decode, decodeFinished);
-            SchedulerTestSupport.continuations(requests.runtime).awaitIdle();
+            SchedulerTestSupport.awaitRequestWork(requests.runtime);
             assertEquals(0L, EndpointTestSupport.expectedReservedKv(decode.resourceSnapshot()));
             assertEquals(0, decode.routingView().engineCapacityUsed());
             org.junit.jupiter.api.Assertions.assertNull(requests.findRequestContext(101L),

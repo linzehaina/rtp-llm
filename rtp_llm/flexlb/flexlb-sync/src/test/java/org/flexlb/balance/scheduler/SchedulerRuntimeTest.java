@@ -19,6 +19,46 @@ import static org.mockito.Mockito.*;
 
 class SchedulerRuntimeTest {
     @Test
+    @org.junit.jupiter.api.Timeout(15)
+    void externalFutureCancellationRemainsSynchronousAndItsSourceBlocksWorkClose() throws Exception {
+        try (var f = new Fixture(false)) {
+            var scheduler = (AbstractRequestScheduler) SchedulerTestSupport.initializedScheduler(f.runtime);
+            var context = RequestProtocolTestSupport.context(f.config, 9103L);
+            var result = RequestProtocolTestSupport.register(scheduler, context);
+            var entered = new java.util.concurrent.CountDownLatch(1);
+            var release = new java.util.concurrent.CountDownLatch(1);
+            var cancelled = new java.util.concurrent.CompletableFuture<Boolean>();
+            var callback = result.whenComplete((response, failure) -> {
+                assertFalse(Thread.holdsLock(context));
+                entered.countDown();
+                RequestProtocolTestSupport.await(release);
+            });
+            var source = new Thread(() -> {
+                try { cancelled.complete(result.cancel(false)); }
+                catch (Throwable failure) { cancelled.completeExceptionally(failure); }
+            });
+            var closer = new Thread(f.runtime::closeRequestWork);
+            try {
+                source.start();
+                assertTrue(entered.await(5, java.util.concurrent.TimeUnit.SECONDS));
+                assertTrue(result.isCancelled(), "Future.cancel selects and publishes its result on the caller");
+                assertFalse(cancelled.isDone(), "synchronous dependent callbacks still belong to that caller");
+                closer.start();
+                RequestProtocolTestSupport.awaitCondition(() -> closer.getState() == Thread.State.WAITING);
+                assertTrue(closer.isAlive(), "drain includes the registered cancellation source");
+            } finally {
+                release.countDown();
+                source.join(5_000);
+                closer.join(5_000);
+            }
+            assertTrue(cancelled.get(5, java.util.concurrent.TimeUnit.SECONDS));
+            assertTrue(callback.isCompletedExceptionally());
+            assertFalse(closer.isAlive());
+            assertEquals(0, f.runtime.requests().liveRequestCount());
+        }
+    }
+
+    @Test
     void directStartupUsesOneSchedulerAndSharedConfiguration() {
         try (var f = new Fixture(false)) {
             var scheduler = (AbstractRequestScheduler) SchedulerTestSupport.initializedScheduler(f.runtime);
@@ -93,7 +133,7 @@ class SchedulerRuntimeTest {
             assertNull(rejected.scheduler());
 
             var continued = new java.util.concurrent.CompletableFuture<Void>();
-            f.runtime.executeContinuation(accepted, () -> continued.complete(null));
+            f.runtime.executeRequestWork(accepted, () -> continued.complete(null));
             continued.get(1, java.util.concurrent.TimeUnit.SECONDS);
             assertFalse(result.isDone());
         }

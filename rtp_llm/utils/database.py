@@ -188,6 +188,13 @@ class CkptDatabase(BaseDatabase):
             for f in files:
                 ckpt = CkptFileInfo(file_name=os.path.join(path, f))
                 self.pretrain_file_list.append(ckpt)
+            # Releases with a sharded backbone may ship additional
+            # safetensors beside the index (e.g. decision heads like clef's
+            # joint_head.safetensors); those tensors are part of the
+            # checkpoint too, so enumerate them alongside the indexed shards.
+            for extra in Path(path).glob("*.safetensors"):
+                if extra.name not in files:
+                    self.pretrain_file_list.append(CkptFileInfo(file_name=str(extra)))
             return
 
         # standard HF

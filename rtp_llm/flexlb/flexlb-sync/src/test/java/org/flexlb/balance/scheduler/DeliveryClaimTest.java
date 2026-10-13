@@ -749,7 +749,7 @@ class DeliveryClaimTest {
 
     @ParameterizedTest
     @EnumSource(value = EngineCancelChannel.CancelAck.class,
-            names = {"ACCEPTED", "NOT_FOUND", "UNSUPPORTED", "FAILED"})
+            names = {"ACCEPTED", "NOT_FOUND", "FAILED"})
     void retryExhaustionCannotInventResourceRelease(EngineCancelChannel.CancelAck ack) throws Exception {
         try (var f = new Fixture()) {
             ControlledCleanup timer = f.controlCleanup();
@@ -769,6 +769,129 @@ class DeliveryClaimTest {
             assertNull(f.claim.provenReleaseReason());
             verify(f.prefill, never()).releaseRequest(any());
             verify(f.decode, never()).release(any(), any());
+        }
+    }
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void unsupportedCancelStopsRetriesWithoutChangingCleanupTimeout(boolean timeout) throws Exception {
+        try (var logs = new CleanupLogs(); var f = new Fixture()) {
+            ControlledCleanup timer = f.controlCleanup();
+            assertTrue(f.owner.tryStartSend(f.claim));
+            f.owner.cancel(41L, 0L, CancelReason.CLIENT_CANCELLED);
+            f.owner.completeDelivery(f.claim, DeliveryResult.uncertain(new IllegalStateException("reply lost")));
+            f.cancel.complete(EngineCancelChannel.CancelAck.UNSUPPORTED);
+            SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
+
+            assertTrue(timer.retries.isEmpty(), "unsupported cancellation must not schedule another attempt");
+            verify(timer.deadline, never()).cancel(anyBoolean());
+            assertEquals(1, logs.count(ch.qos.logback.classic.Level.WARN));
+            assertNull(SchedulerTestSupport.failure(f.owner));
+            assertFalse(f.settlement().isDone());
+            assertTrue(f.prefillOwned.get());
+            assertTrue(f.decodeOwned.get());
+
+            if (timeout) {
+                timer.runDeadline();
+                timer.runDeadline();
+                assertNotNull(SchedulerTestSupport.failure(f.owner), "the existing overall timeout still records failure");
+                assertFalse(f.settlement().isDone());
+                assertTrue(f.prefillOwned.get());
+                assertTrue(f.decodeOwned.get());
+            }
+            f.owner.acceptDeliveryCleanup(f.claim, EngineCancelChannel.CancelAck.REQUEST_CLEANED);
+            f.assertArchivedAfterCleanup();
+            timer.runDeadline(); // A canceled callback already taken from the timer queue is harmless.
+            verify(f.channel, times(1)).cancel(any(), eq(41L), any(), anyLong());
+            if (timeout) { assertThrows(IllegalStateException.class, f.owner.runtime::shutdown); }
+            else { assertDoesNotThrow(f.owner.runtime::shutdown); }
+        }
+    }
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void lateUnsupportedStopsQueuedOrInFlightRetryAndStillAcceptsProof(boolean retryStarted) throws Exception {
+        try (var logs = new CleanupLogs(); var f = new Fixture()) {
+            ControlledCleanup timer = f.controlCleanup();
+            var replies = new java.util.ArrayList<CompletableFuture<EngineCancelChannel.CancelAck>>();
+            when(f.channel.cancel(any(), anyLong(), any(), anyLong())).thenAnswer(call -> {
+                var reply = new CompletableFuture<EngineCancelChannel.CancelAck>();
+                replies.add(reply);
+                return reply;
+            });
+            assertTrue(f.owner.tryStartSend(f.claim));
+            f.owner.cancel(41L, 0L, CancelReason.CLIENT_CANCELLED);
+            f.owner.completeDelivery(f.claim, DeliveryResult.uncertain(new IllegalStateException("reply lost")));
+            timer.runAckTimeout();
+            SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
+            if (retryStarted) { timer.runRetry(25L); }
+
+            replies.getFirst().complete(EngineCancelChannel.CancelAck.UNSUPPORTED);
+            SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
+            if (!retryStarted) { timer.runRetry(25L); }
+            else { timer.runAckTimeout(); }
+            SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
+            assertEquals(retryStarted ? 2 : 1, replies.size());
+            assertTrue(timer.retries.isEmpty(), "no new retries after late unsupported evidence");
+            assertEquals(1, logs.count(ch.qos.logback.classic.Level.WARN));
+            verify(timer.deadline, never()).cancel(anyBoolean());
+            assertNull(SchedulerTestSupport.failure(f.owner));
+            assertFalse(f.settlement().isDone());
+
+            if (retryStarted) {
+                replies.getLast().complete(EngineCancelChannel.CancelAck.REQUEST_CLEANED);
+            } else {
+                f.owner.acceptDeliveryCleanup(f.claim, EngineCancelChannel.CancelAck.REQUEST_CLEANED);
+            }
+            f.assertArchivedAfterCleanup();
+            assertNull(SchedulerTestSupport.failure(f.owner));
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = EngineCancelChannel.CancelAck.class, names = {"NOT_FOUND", "ACCEPTED", "FAILED"})
+    void lateReplyWithoutProofCannotScheduleDuplicateRetry(EngineCancelChannel.CancelAck ack) throws Exception {
+        try (var f = new Fixture()) {
+            ControlledCleanup timer = f.controlCleanup();
+            assertTrue(f.owner.tryStartSend(f.claim));
+            f.owner.cancel(41L, 0L, CancelReason.CLIENT_CANCELLED);
+            f.owner.completeDelivery(f.claim, DeliveryResult.uncertain(new IllegalStateException("reply lost")));
+            timer.runAckTimeout();
+            SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
+            assertEquals(1, timer.retries.size());
+
+            f.cancel.complete(ack);
+            SchedulerTestSupport.awaitRequestWork(f.owner.runtime);
+            assertEquals(1, timer.retries.size(), "timeout already scheduled this attempt's retry");
+            assertFalse(f.settlement().isDone());
+            assertNull(SchedulerTestSupport.failure(f.owner));
+            f.owner.acceptDeliveryCleanup(f.claim, EngineCancelChannel.CancelAck.REQUEST_CLEANED);
+            f.assertArchivedAfterCleanup();
+        }
+    }
+
+    private static final class CleanupLogs implements AutoCloseable {
+        private final ch.qos.logback.classic.Logger logger =
+                (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger("flexlbLogger");
+        private final ch.qos.logback.classic.Level previousLevel = logger.getLevel();
+        private final ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> appender =
+                new ch.qos.logback.core.read.ListAppender<>();
+
+        CleanupLogs() {
+            logger.setLevel(ch.qos.logback.classic.Level.WARN);
+            appender.start();
+            logger.addAppender(appender);
+        }
+
+        long count(ch.qos.logback.classic.Level level) {
+            return appender.list.stream().filter(event -> event.getLevel() == level
+                    && event.getFormattedMessage().contains("[delivery-cleanup]")).count();
+        }
+
+        public void close() {
+            logger.detachAppender(appender);
+            appender.stop();
+            logger.setLevel(previousLevel);
         }
     }
 

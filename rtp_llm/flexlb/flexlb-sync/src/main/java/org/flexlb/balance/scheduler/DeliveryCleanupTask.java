@@ -3,6 +3,7 @@ package org.flexlb.balance.scheduler;
 import org.flexlb.balance.eviction.EngineCancelChannel;
 import org.flexlb.balance.preemption.CancelTarget;
 import org.flexlb.balance.scheduler.RequestContext.DeliveryClaim;
+import org.flexlb.util.Logger;
 
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
@@ -27,6 +28,7 @@ final class DeliveryCleanupTask {
     private ScheduledFuture<?> retry;
     private ScheduledFuture<?> ackDeadline;
     private int attempt;
+    private boolean cancelUnsupported;
     private boolean stopped;
 
     DeliveryCleanupTask(DeliveryClaim claim, EngineCancelChannel channel,
@@ -51,7 +53,7 @@ final class DeliveryCleanupTask {
 
     private synchronized void attemptCancel() {
         var evidence = claim.cleanupEvidence();
-        if (stopped || settlement.isDone() || evidence.remoteSettled() || !evidence.needsRemoteCancel()) { return; }
+        if (stopped || cancelUnsupported || settlement.isDone() || evidence.remoteSettled() || !evidence.needsRemoteCancel()) { return; }
         int current = ++attempt;
         CompletableFuture<EngineCancelChannel.CancelAck> reply = new CompletableFuture<>();
         try {
@@ -69,7 +71,10 @@ final class DeliveryCleanupTask {
                 if (failure == null) {
                     if (!reply.complete(ack) && ack != null) {
                         // A timed-out attempt still carries exact cleanup proof when its RPC finishes later.
-                        try { facts.accept(() -> claim.item.ctx().scheduler().acceptDeliveryCleanup(claim, ack)); }
+                        try { facts.accept(() -> {
+                            claim.item.ctx().scheduler().acceptDeliveryCleanup(claim, ack);
+                            if (ack == EngineCancelChannel.CancelAck.UNSUPPORTED) { stopUnsupportedCancel(); }
+                        }); }
                         catch (RuntimeException rejected) { stop(rejected); }
                     }
                 }
@@ -82,8 +87,12 @@ final class DeliveryCleanupTask {
         // Exact proof remains valid after this attempt timed out, a retry started, or the task stopped.
         // Settlement may run dependent callbacks and enqueue local cleanup; never hold the task monitor.
         if (ack != null) { claim.item.ctx().scheduler().acceptDeliveryCleanup(claim, ack); }
+        if (ack == EngineCancelChannel.CancelAck.UNSUPPORTED) {
+            stopUnsupportedCancel();
+            return;
+        }
         synchronized (this) {
-            if (stopped || settlement.isDone() || current != attempt) { return; }
+            if (stopped || cancelUnsupported || settlement.isDone() || current != attempt) { return; }
             if (ackDeadline != null) { ackDeadline.cancel(false); }
             if (claim.cleanupEvidence().remoteSettled()) { return; }
             if (current >= MAX_CANCEL_ATTEMPTS) {
@@ -95,6 +104,19 @@ final class DeliveryCleanupTask {
                 retry = timer.schedule(this::attemptCancel, Math.min(400L, 25L << (current - 1)), TimeUnit.MILLISECONDS);
             } catch (RuntimeException rejected) { stop(rejected); }
         }
+    }
+
+    private void stopUnsupportedCancel() {
+        synchronized (this) {
+            if (stopped || cancelUnsupported || settlement.isDone()) { return; }
+            cancelUnsupported = true;
+            if (retry != null) { retry.cancel(false); }
+            if (ackDeadline != null) { ackDeadline.cancel(false); }
+        }
+        Logger.warn("[delivery-cleanup] remote cancellation unsupported: request_id={}, worker={}:{}, reason={}; "
+                        + "active cancellation retries stopped; waiting for Worker completion or retirement",
+                claim.item.requestId(), claim.item.prefillEp().getIp(), claim.item.prefillEp().getGrpcPort(),
+                claim.cleanupEvidence().reason());
     }
 
     private void stop(Throwable failure) {

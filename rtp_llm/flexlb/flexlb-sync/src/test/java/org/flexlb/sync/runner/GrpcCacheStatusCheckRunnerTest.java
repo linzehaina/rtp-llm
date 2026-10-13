@@ -82,7 +82,6 @@ class GrpcCacheStatusCheckRunnerTest {
         when(localKvCacheAwareManager.updateEngineBlockCache(workerStatus))
                 .thenReturn(WorkerCacheUpdateResult.builder()
                         .success(true)
-                        .cacheVersion(1)
                         .build());
 
         // Act
@@ -133,7 +132,6 @@ class GrpcCacheStatusCheckRunnerTest {
                 .thenReturn(
                         WorkerCacheUpdateResult.builder()
                                 .success(true)
-                                .cacheVersion(1)
                                 .build(),
                         WorkerCacheUpdateResult.builder()
                                 .success(false)
@@ -141,7 +139,6 @@ class GrpcCacheStatusCheckRunnerTest {
                                 .build(),
                         WorkerCacheUpdateResult.builder()
                                 .success(true)
-                                .cacheVersion(2)
                                 .build());
 
         runCachePoll(ipPort, workerStatus, directory, false);

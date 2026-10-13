@@ -61,7 +61,7 @@ class SchedulerRequestWorkTest {
             executor.executeRequestWork(independentContext, independentFinished::countDown);
             assertTrue(independentFinished.await(5, TimeUnit.SECONDS));
             assertTrue(sameRequestFinished.await(5, TimeUnit.SECONDS), "same-request effects do not share a FIFO");
-            closer = new Thread(executor::closeRequestWork);
+            closer = new Thread(() -> SchedulerTestSupport.closeRequestWork(executor));
             closer.start();
             assertTrue(closer.isAlive());
             release.countDown();
@@ -103,7 +103,7 @@ class SchedulerRequestWorkTest {
             executor.executeRequestWork(requestContext, () -> { throw new IllegalStateException("isolated fact"); });
             executor.executeRequestWork(requestContext, later::countDown);
             assertTrue(later.await(5, TimeUnit.SECONDS));
-            executor.closeRequestWork();
+            SchedulerTestSupport.closeRequestWork(executor);
             assertEquals("isolated fact", ((Throwable) ReflectionTestUtils.getField(executor, "failure")).getMessage());
         } finally {
             close(executor);
@@ -126,7 +126,8 @@ class SchedulerRequestWorkTest {
         var interruptsPreserved = new java.util.concurrent.atomic.AtomicInteger();
         Runnable waitForDrain = () -> {
             Thread.currentThread().interrupt();
-            if (close) { executor.closeRequestWork(); } else { executor.awaitRequestWork(); }
+            if (close) { SchedulerTestSupport.closeRequestWork(executor); }
+            else { SchedulerTestSupport.awaitRequestWork(executor); }
             if (Thread.currentThread().isInterrupted()) { interruptsPreserved.incrementAndGet(); }
         };
         Thread waiter = new Thread(waitForDrain);
@@ -205,7 +206,7 @@ class SchedulerRequestWorkTest {
             });
             release.countDown();
             assertTrue(nested.await(5, TimeUnit.SECONDS));
-            executor.awaitRequestWork();
+            SchedulerTestSupport.awaitRequestWork(executor);
             assertEquals(java.util.Set.of(1, 2, 3), new java.util.HashSet<>(observed));
         } finally {
             release.countDown();
@@ -219,7 +220,7 @@ class SchedulerRequestWorkTest {
         var context = requestContext(993007L);
         var registration = runtime.registerRequestWork(context);
         var ran = new CountDownLatch(1);
-        var closer = new Thread(runtime::closeRequestWork);
+        var closer = new Thread(() -> SchedulerTestSupport.closeRequestWork(runtime));
         try {
             closer.start();
             RequestProtocolTestSupport.awaitCondition(() -> closer.getState() == Thread.State.WAITING);
@@ -245,7 +246,7 @@ class SchedulerRequestWorkTest {
         var worker = new AtomicReference<Thread>();
         try {
             runtime.executeRequestWork(requestContext(993008L), () -> worker.set(Thread.currentThread()));
-            runtime.awaitRequestWork();
+            SchedulerTestSupport.awaitRequestWork(runtime);
             org.junit.jupiter.api.Assertions.assertNotNull(worker.get());
             org.junit.jupiter.api.Assertions.assertNotSame(Thread.currentThread(), worker.get());
             org.junit.jupiter.api.Assertions.assertNotNull(ReflectionTestUtils.getField(runtime, "failure"));

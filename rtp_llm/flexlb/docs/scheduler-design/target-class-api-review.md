@@ -107,7 +107,7 @@ classDiagram
 | --- | --- |
 | `submit` | 返回最终调度结果，不能返回入队确认。注册成功后始终返回原请求 Future；重复 ID、停收和输入错误不得伪装成已接管 |
 | `cancel` | 向原属调度器提出取消；不承诺调用返回时远端资源已经释放。保留当前 batchId 校验和未找到返回 null 的契约 |
-| `SchedulerRuntime.stopAccepting` | 幂等，只拒绝后续新接管；旧请求选路、内部重新入队、取消和结算继续推进 |
+| `RequestRepository.stopAccepting` | 内部入口，幂等，只拒绝后续新接管；旧请求选路、内部重新入队、取消和结算继续推进 |
 | `SchedulerRuntime.shutdown` | Spring 停服时同步执行停收、等待结算和设施关闭；完成后返回，未结清资源或内部清理异常必须抛出 |
 | `onCancellationRecorded` | 仅是模式专属队列控制事件。DIRECT 默认无需队列动作；QUEUE 清理/唤醒自己的队列。不再增加一串细碎模板流程钩子 |
 

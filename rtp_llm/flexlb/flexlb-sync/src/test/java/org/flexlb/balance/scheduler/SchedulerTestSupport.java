@@ -54,11 +54,15 @@ public final class SchedulerTestSupport {
     }
     static RequestScheduler initializedScheduler(SchedulerRuntime runtime) {
         synchronized (ReflectionTestUtils.getField(runtime, "schedulerLock")) {
-            var lifecycle = ReflectionTestUtils.getField(runtime, "schedulerLifecycle");
-            return lifecycle == null ? null : (RequestScheduler) ReflectionTestUtils.getField(lifecycle, "scheduler");
+            return (RequestScheduler) ReflectionTestUtils.getField(runtime, "scheduler");
         }
     }
-    public static void awaitRequestWork(SchedulerRuntime runtime) { runtime.awaitRequestWork(); }
+    public static void awaitRequestWork(SchedulerRuntime runtime) {
+        ReflectionTestUtils.invokeMethod(runtime, "awaitRequestWork");
+    }
+    static void closeRequestWork(SchedulerRuntime runtime) {
+        ReflectionTestUtils.invokeMethod(runtime, "closeRequestWork");
+    }
     static java.util.concurrent.ExecutorService requestWorkers(SchedulerRuntime runtime) {
         return (java.util.concurrent.ExecutorService) ReflectionTestUtils.getField(runtime, "requestWorkers");
     }
@@ -81,12 +85,6 @@ public final class SchedulerTestSupport {
     static Throwable failure(RequestScheduler owner) {
         return (Throwable) ReflectionTestUtils.getField(runtime(owner), "failure");
     }
-    public static FlexlbConfig config(AbstractRequestScheduler owner) { return owner.config; }
-    private static ConfigService configService(FlexlbConfig config) {
-        var service = mock(ConfigService.class);
-        when(service.loadBalanceConfig()).thenReturn(config);
-        return service;
-    }
     static RequestRepository.TerminalRecord terminalRecord(AbstractRequestScheduler owner, RequestState state) {
         var record = repository(owner).findTerminal(state.requestId());
         return record != null && record.state() == state ? record : new RequestRepository.TerminalRecord(state, owner);
@@ -106,7 +104,7 @@ public final class SchedulerTestSupport {
             })
                     .when(queue).signalControl(org.mockito.ArgumentMatchers.any());
         }
-        runtime.initializeScheduler(owner.shutdownLifecycle());
+        runtime.registerScheduler(owner);
         return owner;
     }
     public static RequestScheduler configure(AbstractRequestScheduler owner, FlexlbConfig config,

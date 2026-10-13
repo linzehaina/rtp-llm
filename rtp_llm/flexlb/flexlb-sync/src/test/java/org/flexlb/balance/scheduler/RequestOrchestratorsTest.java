@@ -54,7 +54,7 @@ class RequestOrchestratorsTest {
                 mock(RequestSchedulerReporter.class), dispatcher, configuration(),
                 mock(org.flexlb.balance.eviction.EngineCancelChannel.class));
         var owner = mock(AbstractRequestScheduler.class);
-        runtime.initializeScheduler(new SchedulerLifecycle(requests, owner));
+        runtime.registerScheduler(owner);
         var first = new IllegalStateException("placement close failed");
         var second = new IllegalStateException("dispatcher failed");
         doThrow(first).when(owner).closePlacement();
@@ -76,7 +76,7 @@ class RequestOrchestratorsTest {
                 mock(RequestSchedulerReporter.class), dispatcher, configuration(),
                 mock(org.flexlb.balance.eviction.EngineCancelChannel.class));
         var owner = mock(AbstractRequestScheduler.class);
-        runtime.initializeScheduler(new SchedulerLifecycle(requests, owner));
+        runtime.registerScheduler(owner);
         runtime.shutdown();
         InOrder order = inOrder(requests, owner, dispatcher, endpoints);
         order.verify(requests).closeRegistration();

@@ -65,7 +65,7 @@ public final class RequestSchedulerTestRuntime implements AutoCloseable {
         this.decodeCapacity = new DecodeCapacityAcquirer(cancelChannel, requests, runtime, requestReporter, configService, capacity);
         this.scheduler = PlacementConfiguration.create(runtime, configService.loadBalanceConfig(),
                 router, deliveryReporter, decodeCapacity, placementAvailability, capacity, new org.flexlb.service.RecentCacheKeyTraceReporter());
-        runtime.initializeScheduler(scheduler.shutdownLifecycle());
+        runtime.registerScheduler(scheduler);
     }
 
     public RequestRepository requestRegistry() {

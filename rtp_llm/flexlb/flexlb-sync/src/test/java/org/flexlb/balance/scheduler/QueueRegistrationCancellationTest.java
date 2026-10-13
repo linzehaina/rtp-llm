@@ -98,7 +98,7 @@ class QueueRegistrationCancellationTest {
             });
             assertFalse(result.get(2L, TimeUnit.SECONDS).isSuccess());
             verify(f.router, never()).select(any(), nullable(String.class));
-            SchedulerTestSupport.runtime(f.queue).stopAccepting();
+            SchedulerTestSupport.runtime(f.queue).requests().stopAccepting();
             AtomicBoolean called = new AtomicBoolean();
             assertFalse(f.queue.submit(f.context(905L), () -> called.set(true)).get().isSuccess());
             assertFalse(called.get());
@@ -120,7 +120,7 @@ class QueueRegistrationCancellationTest {
                     mock(RequestSchedulerReporter.class), mock(DefaultBatchDispatcher.class), service, mock(EngineCancelChannel.class));
             queue = new QueuedRequestScheduler(config, router, batches, mock(DecodeCapacityAcquirer.class),
                     runtime, new PlacementAvailability(), SchedulingTestConfig.capacity(config), org.mockito.Mockito.mock(org.flexlb.service.RecentCacheKeyTraceReporter.class));
-            runtime.initializeScheduler(queue.shutdownLifecycle());
+            runtime.registerScheduler(queue);
             queue.start();
         }
 

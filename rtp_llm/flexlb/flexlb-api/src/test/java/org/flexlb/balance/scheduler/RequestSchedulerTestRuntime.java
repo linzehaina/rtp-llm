@@ -94,7 +94,7 @@ public final class RequestSchedulerTestRuntime implements AutoCloseable {
         var eviction = new DecodeCapacityAcquirer(cancelChannel, requests, runtime, requestReporter, configService, capacity);
         this.scheduler = PlacementConfiguration.create(runtime, configService.loadBalanceConfig(),
                 router, deliveryReporter, eviction, placementAvailability, capacity, new org.flexlb.service.RecentCacheKeyTraceReporter());
-        runtime.initializeScheduler(scheduler.shutdownLifecycle());
+        runtime.registerScheduler(scheduler);
     }
 
     public RequestRepository requestRegistry() {

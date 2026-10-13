@@ -161,7 +161,7 @@ final class RequestProtocolTestSupport {
     }
 
     static void close(RequestScheduler scheduler) {
-        SchedulerTestSupport.runtime(scheduler).stopAccepting();
+        SchedulerTestSupport.runtime(scheduler).requests().stopAccepting();
         if (scheduler instanceof QueuedRequestScheduler queue) { queue.close(); }
     }
 

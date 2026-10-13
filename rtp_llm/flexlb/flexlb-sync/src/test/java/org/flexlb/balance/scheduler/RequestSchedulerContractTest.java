@@ -117,7 +117,7 @@ class RequestSchedulerContractTest {
                 f.scheduler.cancel(900, 0, CancelReason.CLIENT_CANCELLED);
             }
             future.get(3, TimeUnit.SECONDS);
-            SchedulerTestSupport.runtime(f.scheduler).stopAccepting();
+            SchedulerTestSupport.runtime(f.scheduler).requests().stopAccepting();
             SchedulerTestSupport.runtime(f.scheduler).shutdown();
 
         }
@@ -133,7 +133,7 @@ class RequestSchedulerContractTest {
             assertNotNull(deadline);
             f.scheduler.cancel(901, 0, CancelReason.CLIENT_CANCELLED);
             future.get(3, TimeUnit.SECONDS);
-            SchedulerTestSupport.runtime(f.scheduler).stopAccepting();
+            SchedulerTestSupport.runtime(f.scheduler).requests().stopAccepting();
             SchedulerTestSupport.runtime(f.scheduler).shutdown();
 
             f.requests.enqueueInactivityDeadline(request, deadline, Long.MAX_VALUE,
@@ -145,7 +145,7 @@ class RequestSchedulerContractTest {
     @Test
     void queuedTerminationIncludesItsOwnWorkers() throws Exception {
         try (Fixture f = new Fixture(true)) {
-            SchedulerTestSupport.runtime(f.scheduler).stopAccepting();
+            SchedulerTestSupport.runtime(f.scheduler).requests().stopAccepting();
             SchedulerTestSupport.runtime(f.scheduler).shutdown();
 
             var decision = (Thread) org.springframework.test.util.ReflectionTestUtils.getField(f.scheduler, "decisionThread");
@@ -165,7 +165,7 @@ class RequestSchedulerContractTest {
             var decision = (Thread) org.springframework.test.util.ReflectionTestUtils.getField(f.scheduler, "decisionThread");
             var failure = new IllegalStateException("delivery cleanup failed");
             runtime.recordFailure(failure);
-            runtime.stopAccepting();
+            runtime.requests().stopAccepting();
             assertFalse(planners.isShutdown(), "stopping intake does not execute shutdown");
             assertSame(failure, assertThrows(IllegalStateException.class, runtime::shutdown));
             assertTrue(planners.isTerminated());
@@ -179,8 +179,8 @@ class RequestSchedulerContractTest {
         try (Fixture f = new Fixture(queued); var executor = Executors.newVirtualThreadPerTaskExecutor()) {
             var request = f.context(98);
             when(f.router.select(request, null)).thenAnswer(call -> {
-                SchedulerTestSupport.runtime(f.scheduler).stopAccepting();
-                SchedulerTestSupport.runtime(f.scheduler).stopAccepting();
+                SchedulerTestSupport.runtime(f.scheduler).requests().stopAccepting();
+                SchedulerTestSupport.runtime(f.scheduler).requests().stopAccepting();
                 return rejection();
             });
             var submission = executor.submit(() -> f.scheduler.submit(request));
@@ -210,7 +210,7 @@ class RequestSchedulerContractTest {
                     ? f.scheduler.submit(f.context(97), pause) : f.scheduler.submit(f.context(97)));
             try {
                 assertTrue(entered.await(3, TimeUnit.SECONDS), "submissions must not serialize on an exclusive lock");
-                SchedulerTestSupport.runtime(f.scheduler).stopAccepting();
+                SchedulerTestSupport.runtime(f.scheduler).requests().stopAccepting();
 
                 assertFalse(f.scheduler.submit(f.context(95)).get(3, TimeUnit.SECONDS).isSuccess());
             } finally {
@@ -235,8 +235,8 @@ class RequestSchedulerContractTest {
                     reporter, mock(RequestSchedulerReporter.class), mock(DefaultBatchDispatcher.class),
                     service,
                     mock(org.flexlb.balance.eviction.EngineCancelChannel.class));
-            runtime.initializeScheduler(PlacementConfiguration.create(runtime, f.config,
-                    f.router, reporter, mock(DecodeCapacityAcquirer.class), new PlacementAvailability(), SchedulingTestConfig.capacity(f.config), org.mockito.Mockito.mock(org.flexlb.service.RecentCacheKeyTraceReporter.class)).shutdownLifecycle());
+            runtime.registerScheduler(PlacementConfiguration.create(runtime, f.config,
+                    f.router, reporter, mock(DecodeCapacityAcquirer.class), new PlacementAvailability(), SchedulingTestConfig.capacity(f.config), org.mockito.Mockito.mock(org.flexlb.service.RecentCacheKeyTraceReporter.class)));
             try {
                 var owner = (AbstractRequestScheduler) SchedulerTestSupport.initializedScheduler(runtime);
                 var request = f.context(100);
@@ -273,8 +273,8 @@ class RequestSchedulerContractTest {
             when(f.router.select(request, null)).thenReturn(rejection());
             assertEquals(StrategyErrorType.NO_PREFILL_WORKER.getErrorCode(),
                     api.submit(request).get(3, TimeUnit.SECONDS).getCode());
-            SchedulerTestSupport.runtime(api).stopAccepting();
-            SchedulerTestSupport.runtime(api).stopAccepting();
+            SchedulerTestSupport.runtime(api).requests().stopAccepting();
+            SchedulerTestSupport.runtime(api).requests().stopAccepting();
             SchedulerTestSupport.runtime(api).shutdown();
 
             assertEquals(StrategyErrorType.DISPATCH_FAILED.getErrorCode(),
@@ -299,7 +299,7 @@ class RequestSchedulerContractTest {
             var submission = executor.submit(() -> api.submit(request));
             try {
                 assertTrue(selecting.await(3, TimeUnit.SECONDS));
-                SchedulerTestSupport.runtime(api).stopAccepting();
+                SchedulerTestSupport.runtime(api).requests().stopAccepting();
 
                 assertFalse(org.flexlb.balance.scheduler.SchedulerTestSupport.repository(f.requests).isClosed(), "draining must not close accepted admission");
                 assertEquals(StrategyErrorType.DISPATCH_FAILED.getErrorCode(), api.submit(f.context(11)).join().getCode());
@@ -324,7 +324,7 @@ class RequestSchedulerContractTest {
             RequestScheduler api = f.scheduler;
             var request = f.context(20);
             var future = f.requests.register(request, StrategyErrorType.BATCH_SLO_EXPIRED);
-            SchedulerTestSupport.runtime(api).stopAccepting();
+            SchedulerTestSupport.runtime(api).requests().stopAccepting();
             try (var admission = f.requests.claimAdmissionHandle(20, future); var admissionCompletion3 = RequestProtocolTestSupport.finishOnExit(admission)) {
                 assertNotNull(admission);
                 assertNotNull(api.cancel(20, 0, CancelReason.CLIENT_CANCELLED));
@@ -347,7 +347,7 @@ class RequestSchedulerContractTest {
             try (var admission = f.requests.claimAdmissionHandle(30, future); var admissionCompletion4 = RequestProtocolTestSupport.finishOnExit(admission)) {
                 assertNotNull(admission);
                 assertTrue(future.cancel(true));
-                SchedulerTestSupport.runtime(api).stopAccepting();
+                SchedulerTestSupport.runtime(api).requests().stopAccepting();
                 assertTrue(future.isDone());
 
             }
@@ -366,7 +366,7 @@ class RequestSchedulerContractTest {
             var request = f.context(40);
             var future = f.requests.register(request, StrategyErrorType.BATCH_SLO_EXPIRED);
             CompletableFuture<Response> callback = future.whenComplete((result, failure) -> {
-                SchedulerTestSupport.runtime(api).stopAccepting();
+                SchedulerTestSupport.runtime(api).requests().stopAccepting();
                 publishing.countDown();
                 RequestProtocolTestSupport.await(release);
             });
@@ -413,7 +413,7 @@ class RequestSchedulerContractTest {
             }
             var failure = new IllegalStateException("endpoint release failed");
             doThrow(failure).when(endpoint).releaseRequest(route);
-            SchedulerTestSupport.runtime(api).stopAccepting();
+            SchedulerTestSupport.runtime(api).requests().stopAccepting();
             assertTrue(future.completeExceptionally(new IllegalStateException("request failed")));
             SchedulerTestSupport.awaitRequestWork(f.requests.runtime);
             assertSame(failure, SchedulerTestSupport.failure(api));

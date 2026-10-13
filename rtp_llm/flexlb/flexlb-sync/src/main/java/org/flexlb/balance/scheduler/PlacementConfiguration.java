@@ -59,7 +59,7 @@ public class PlacementConfiguration {
                                              ConfigService configService, AdmissionCapacity capacity, RecentCacheKeyTraceReporter traceReporter) {
         FlexlbConfig config = configService.loadBalanceConfig();
         AbstractRequestScheduler scheduler = create(runtime, config, router, reporter, decodeCapacity, availability, capacity, traceReporter);
-        runtime.initializeScheduler(scheduler.shutdownLifecycle());
+        runtime.registerScheduler(scheduler);
         return scheduler;
     }
 

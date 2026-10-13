@@ -80,7 +80,7 @@ class DeliveryClaimTest {
             assertTrue(f.prefillOwned.get(), "the sender still pins Prefill ownership");
             verify(f.prefill, never()).releaseRequest(any());
 
-            f.owner.runtime.stopAccepting();
+            f.owner.runtime.requests().stopAccepting();
             f.owner.completeDelivery(f.claim, DeliveryResult.delivered());
             f.owner.runtime.shutdown();
 
@@ -192,7 +192,7 @@ class DeliveryClaimTest {
                 return null;
             }).when(workers).execute(any(Runnable.class));
             var producer = new Thread(() -> f.owner.enqueueCleanup(f.context));
-            var closer = new Thread(f.owner.runtime::closeRequestWork);
+            var closer = new Thread(() -> SchedulerTestSupport.closeRequestWork(f.owner.runtime));
             try {
                 producer.start();
                 assertTrue(entered.await(5, TimeUnit.SECONDS));
@@ -240,7 +240,7 @@ class DeliveryClaimTest {
                 return null;
             }).when(workers).execute(any(Runnable.class));
             var source = new Thread(f::applyDecodeTerminal);
-            var closer = new Thread(f.owner.runtime::closeRequestWork);
+            var closer = new Thread(() -> SchedulerTestSupport.closeRequestWork(f.owner.runtime));
             try {
                 source.start();
                 assertTrue(entered.await(5, TimeUnit.SECONDS));
@@ -280,7 +280,7 @@ class DeliveryClaimTest {
             f.cancel.complete(EngineCancelChannel.CancelAck.REQUEST_CLEANED);
             assertFalse(f.settlement().isDone());
             assertTrue(f.owner.requests.isCurrent(f.context));
-            SchedulerTestSupport.runtime(f.owner).stopAccepting();
+            SchedulerTestSupport.runtime(f.owner).requests().stopAccepting();
 
             f.owner.completeDelivery(f.claim, DeliveryResult.delivered());
             f.settlement().get(2, TimeUnit.SECONDS);
@@ -917,7 +917,7 @@ class DeliveryClaimTest {
             assertDecodeOwnershipReleasedOnce();
         }
         public void close() {
-            SchedulerTestSupport.runtime(owner).stopAccepting();
+            SchedulerTestSupport.runtime(owner).requests().stopAccepting();
             ((QueuedRequestScheduler)owner).close();
             SchedulerTestSupport.timer(owner.runtime).close();
             SchedulerTestSupport.closeRequestExecutors(owner.runtime);

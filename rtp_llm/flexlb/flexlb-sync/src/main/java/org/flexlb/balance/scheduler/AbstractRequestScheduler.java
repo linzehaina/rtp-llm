@@ -82,10 +82,6 @@ public abstract class AbstractRequestScheduler implements RequestScheduler {
     /** Stop mode-specific placement before the runtime drains shared work. */
     void closePlacement() { }
 
-    final SchedulerLifecycle shutdownLifecycle() {
-        return new SchedulerLifecycle(requests, this);
-    }
-
     private boolean isCurrentContext(RequestContext exact) {
         return exact != null && exact.scheduler() == this && requests.isCurrent(exact);
     }

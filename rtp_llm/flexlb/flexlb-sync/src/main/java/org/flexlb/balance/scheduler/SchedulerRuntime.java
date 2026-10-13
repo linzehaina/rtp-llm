@@ -14,10 +14,13 @@ import org.springframework.stereotype.Component;
 import javax.annotation.PreDestroy;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.function.LongSupplier;
@@ -159,7 +162,7 @@ public final class SchedulerRuntime implements RequestTaskScheduler {
         }
     }
 
-    void awaitRequestWork() {
+    private void awaitRequestWork() {
         boolean interrupted = false;
         synchronized (workLifecycle) {
             while (pendingWork != 0) {
@@ -170,7 +173,7 @@ public final class SchedulerRuntime implements RequestTaskScheduler {
         if (interrupted) { Thread.currentThread().interrupt(); }
     }
 
-    void closeRequestWork() {
+    private void closeRequestWork() {
         synchronized (workLifecycle) {
             // Nested work remains admissible until every accepted source and task has left.
             awaitRequestWork();
@@ -195,26 +198,22 @@ public final class SchedulerRuntime implements RequestTaskScheduler {
     RequestSchedulerReporter requestReporter() { return requestReporter; }
 
     private final Object schedulerLock = new Object();
-    private SchedulerLifecycle schedulerLifecycle;
+    private AbstractRequestScheduler scheduler;
     private Throwable failure;
 
     boolean isAccepting() { return !requests.isStopping() && !requests.isClosed(); }
-
-    /** 只停收。已注册请求继续运行；shutdown 才执行整套关闭流程。 */
-    public void stopAccepting() {
-        requests.stopAccepting();
-    }
 
     /** 后台清理、准入或续接失败在此汇总；停服时统一报告，不执行 Future 监听或关闭流程。 */
     void recordFailure(Throwable cause) {
         synchronized (schedulerLock) { failure = Failures.append(failure, cause); }
     }
 
-    void initializeScheduler(SchedulerLifecycle schedulerLifecycle) {
+    /** Startup wiring: register the placement owner once for ordered shutdown. */
+    void registerScheduler(AbstractRequestScheduler scheduler) {
         synchronized (schedulerLock) {
             checkState(isAccepting(), "scheduler is closed");
-            checkState(this.schedulerLifecycle == null, "scheduler already initialized");
-            this.schedulerLifecycle = Objects.requireNonNull(schedulerLifecycle, "schedulerLifecycle");
+            checkState(this.scheduler == null, "scheduler already registered");
+            this.scheduler = Objects.requireNonNull(scheduler, "scheduler");
         }
     }
 
@@ -321,10 +320,44 @@ public final class SchedulerRuntime implements RequestTaskScheduler {
         }
     }
 
-    private SchedulerLifecycle initializedSchedulerLifecycle() {
-        synchronized (schedulerLock) {
-            return schedulerLifecycle;
+    private void cancelActiveRequestsForShutdown() {
+        Throwable failure = null;
+        for (var context : requests.snapshotActive()) {
+            failure = Failures.run(failure,
+                    () -> context.scheduler().cancelRequest(context, 0L, CancelReason.SHUTDOWN));
         }
+        Failures.rethrow(failure, "request shutdown cancellation failed");
+    }
+
+    private void awaitDeliveryCleanup() {
+        var active = requests.snapshotActive();
+        var pending = active.stream().map(RequestContext::delivery)
+                .filter(Objects::nonNull).map(delivery -> delivery.settlement().toCompletableFuture())
+                .toArray(CompletableFuture[]::new);
+        try {
+            CompletableFuture.allOf(pending).get(DeliveryCleanupTask.CLEANUP_TIMEOUT_MS + 1_000L,
+                    TimeUnit.MILLISECONDS);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted waiting for delivery cleanup", interrupted);
+        } catch (ExecutionException | TimeoutException failure) {
+            throw new IllegalStateException("Unsettled deliveries at shutdown: "
+                    + active.stream().map(RequestContext::getRequestId).toList(), failure);
+        }
+    }
+
+    /** Finalize every exact owner, including requests created before startup wiring completed. */
+    private void finalizeActiveRequests(AbstractRequestScheduler registeredScheduler) {
+        Throwable failure = null;
+        if (registeredScheduler != null) {
+            failure = Failures.run(failure, registeredScheduler::closeOutstandingAndTerminalize);
+        }
+        var otherOwners = requests.snapshotActive().stream().map(RequestContext::scheduler)
+                .filter(owner -> owner != registeredScheduler).distinct().toList();
+        for (var owner : otherOwners) {
+            failure = Failures.run(failure, owner::closeOutstandingAndTerminalize);
+        }
+        Failures.rethrow(failure, "request shutdown finalization failed");
     }
 
     private void closeRequestExecutors() {
@@ -344,30 +377,23 @@ public final class SchedulerRuntime implements RequestTaskScheduler {
     /** Spring 停服入口：停止接收、等待请求资源结算，再关闭共享执行设施。 */
     @PreDestroy
     void shutdown() {
-        stopAccepting();
+        requests.stopAccepting();
         if (!requests.closeRegistration()) { return; }
-        var lifecycle = initializedSchedulerLifecycle();
-        if (lifecycle == null) { lifecycle = new SchedulerLifecycle(requests, null); }
-        Runnable[] steps = {
-                lifecycle::closePlacement,
-                lifecycle::awaitAdmissionMutations,
-                lifecycle::abandonOutstandingDeliveries,
-                dispatcher::shutdownAndAwait,
-                lifecycle::awaitDeliveryCleanup,
-                endpoints::close,
-                timer::close,
-                this::awaitRequestWork,
-                lifecycle::closeOutstandingAndTerminalize,
-                this::closeRequestExecutors
-        };
+        AbstractRequestScheduler scheduler;
+        synchronized (schedulerLock) { scheduler = this.scheduler; }
         Throwable firstFailure = null;
-        for (Runnable step : steps) {
-            try { step.run(); }
-            catch (Throwable failure) {
-                if (firstFailure == null) { firstFailure = failure; }
-                else if (failure != firstFailure) { firstFailure.addSuppressed(failure); }
-            }
+        if (scheduler != null) {
+            firstFailure = Failures.run(firstFailure, scheduler::closePlacement);
+            firstFailure = Failures.run(firstFailure, scheduler::awaitAdmissionMutations);
         }
+        firstFailure = Failures.run(firstFailure, this::cancelActiveRequestsForShutdown);
+        firstFailure = Failures.run(firstFailure, dispatcher::shutdownAndAwait);
+        firstFailure = Failures.run(firstFailure, this::awaitDeliveryCleanup);
+        firstFailure = Failures.run(firstFailure, endpoints::close);
+        firstFailure = Failures.run(firstFailure, timer::close);
+        firstFailure = Failures.run(firstFailure, this::awaitRequestWork);
+        firstFailure = Failures.run(firstFailure, () -> finalizeActiveRequests(scheduler));
+        firstFailure = Failures.run(firstFailure, this::closeRequestExecutors);
         if (requests.liveRequestCount() != 0) {
             firstFailure = Failures.append(firstFailure,
                     new IllegalStateException("Unsettled requests at shutdown: " + requests.liveRequestCount()));

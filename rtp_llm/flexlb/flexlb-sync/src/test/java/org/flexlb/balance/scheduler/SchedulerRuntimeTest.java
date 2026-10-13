@@ -37,7 +37,7 @@ class SchedulerRuntimeTest {
                 try { cancelled.complete(result.cancel(false)); }
                 catch (Throwable failure) { cancelled.completeExceptionally(failure); }
             });
-            var closer = new Thread(f.runtime::closeRequestWork);
+            var closer = new Thread(() -> SchedulerTestSupport.closeRequestWork(f.runtime));
             try {
                 source.start();
                 assertTrue(entered.await(5, java.util.concurrent.TimeUnit.SECONDS));
@@ -67,7 +67,7 @@ class SchedulerRuntimeTest {
             assertSame(f.config, scheduler.config);
             assertSame(f.config, new RequestContext(f.config).getConfig());
             assertThrows(IllegalStateException.class,
-                    () -> f.runtime.initializeScheduler(mock(SchedulerLifecycle.class)));
+                    () -> f.runtime.registerScheduler(mock(AbstractRequestScheduler.class)));
         }
     }
 
@@ -77,20 +77,20 @@ class SchedulerRuntimeTest {
             assertInstanceOf(QueuedRequestScheduler.class, SchedulerTestSupport.initializedScheduler(f.runtime));
             assertSame(SchedulerTestSupport.initializedScheduler(f.runtime), SchedulerTestSupport.initializedScheduler(f.runtime));
             assertThrows(IllegalStateException.class,
-                    () -> f.runtime.initializeScheduler(mock(SchedulerLifecycle.class)));
+                    () -> f.runtime.registerScheduler(mock(AbstractRequestScheduler.class)));
         }
     }
 
     @Test
-    void stoppedRuntimeCannotBeInitializedAgain() {
+    void schedulerCannotBeRegisteredAfterShutdown() {
         var f = new Fixture(false);
         f.close();
         assertThrows(IllegalStateException.class,
-                () -> f.runtime.initializeScheduler(mock(SchedulerLifecycle.class)));
+                () -> f.runtime.registerScheduler(mock(AbstractRequestScheduler.class)));
     }
 
     @Test
-    void shutdownUsesTheSchedulerLifecycleHookAndContinuesAfterItsFailure() {
+    void shutdownInvokesSchedulerHooksAndContinuesAfterFailure() {
         var config = SchedulingTestConfig.newConfig();
         var service = mock(ConfigService.class);
         when(service.loadBalanceConfig()).thenReturn(config);
@@ -102,7 +102,7 @@ class SchedulerRuntimeTest {
         var scheduler = mock(AbstractRequestScheduler.class);
         var expected = new IllegalStateException("placement close failed");
         doThrow(expected).when(scheduler).closePlacement();
-        runtime.initializeScheduler(new SchedulerLifecycle(runtime.requests(), scheduler));
+        runtime.registerScheduler(scheduler);
 
         assertSame(expected, assertThrows(IllegalStateException.class, runtime::shutdown));
 
@@ -122,7 +122,7 @@ class SchedulerRuntimeTest {
             var result = RequestProtocolTestSupport.register(scheduler, accepted);
             assertFalse(result.isDone());
 
-            f.runtime.stopAccepting();
+            f.runtime.requests().stopAccepting();
 
             assertFalse(f.runtime.isAccepting());
             assertFalse(f.runtime.requests().isClosed());
@@ -194,6 +194,34 @@ class SchedulerRuntimeTest {
         }
     }
 
+    @Test
+    void shutdownFinalizesAnUnregisteredOwnerAfterCancellationFailure() {
+        var config = SchedulingTestConfig.newConfig();
+        config.setScheduler(ConfigTestSupport.direct());
+        var service = mock(ConfigService.class);
+        when(service.loadBalanceConfig()).thenReturn(config);
+        var endpoints = mock(EndpointRegistry.class);
+        var runtime = new SchedulerRuntime(new RequestRepository(), endpoints, mock(DeliveryMetricsReporter.class),
+                mock(RequestSchedulerReporter.class), mock(DefaultBatchDispatcher.class), service, mock(EngineCancelChannel.class));
+        try {
+            var owner = spy(new DirectRequestScheduler(mock(RequestWorkerSelector.class), runtime, config,
+                    SchedulingTestConfig.capacity(config), mock(RecentCacheKeyTraceReporter.class)));
+            var context = RequestProtocolTestSupport.context(config, 9107L);
+            var result = RequestProtocolTestSupport.register(owner, context);
+            var expected = new IllegalStateException("cancellation failed before scheduler registration");
+            doThrow(expected).when(owner).cancelRequest(context, 0L, CancelReason.SHUTDOWN);
+
+            assertSame(expected, assertThrows(IllegalStateException.class, runtime::shutdown));
+
+            assertFalse(result.join().isSuccess());
+            assertEquals(0, runtime.requests().liveRequestCount());
+            verify(endpoints).close();
+            assertTrue(SchedulerTestSupport.cleanupExecutor(runtime).isTerminated());
+        } finally {
+            runtime.shutdown();
+        }
+    }
+
     private static final class Fixture implements AutoCloseable {
         final FlexlbConfig config = SchedulingTestConfig.newConfig();
         final EndpointRegistry endpoints = mock(EndpointRegistry.class);
@@ -207,8 +235,8 @@ class SchedulerRuntimeTest {
             var reporter = mock(DeliveryMetricsReporter.class);
             runtime = new SchedulerRuntime(new RequestRepository(), endpoints, reporter,
                     mock(RequestSchedulerReporter.class), mock(DefaultBatchDispatcher.class), service, mock(EngineCancelChannel.class));
-            runtime.initializeScheduler(PlacementConfiguration.create(runtime, config,
-                    mock(RequestWorkerSelector.class), reporter, mock(DecodeCapacityAcquirer.class), new PlacementAvailability(), SchedulingTestConfig.capacity(config), org.mockito.Mockito.mock(org.flexlb.service.RecentCacheKeyTraceReporter.class)).shutdownLifecycle());
+            runtime.registerScheduler(PlacementConfiguration.create(runtime, config,
+                    mock(RequestWorkerSelector.class), reporter, mock(DecodeCapacityAcquirer.class), new PlacementAvailability(), SchedulingTestConfig.capacity(config), org.mockito.Mockito.mock(org.flexlb.service.RecentCacheKeyTraceReporter.class)));
         }
         public void close() { runtime.shutdown(); }
     }

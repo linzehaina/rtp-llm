@@ -99,7 +99,7 @@ class SubmissionShutdownDeadlockTest {
                 assertTrue(beforeAcceptingReturn.await(3, TimeUnit.SECONDS));
                 assertNull(lateContext.scheduler(), "late submission has not registered yet");
 
-                f.runtime.stopAccepting();
+                f.runtime.requests().stopAccepting();
                 shutdown.start();
                 RequestProtocolTestSupport.awaitCondition(() -> f.runtime.requests().isClosed());
                 if (!queued) {
@@ -150,7 +150,7 @@ class SubmissionShutdownDeadlockTest {
                     mock(RequestSchedulerReporter.class), mock(DefaultBatchDispatcher.class), service, mock(EngineCancelChannel.class)));
             scheduler = (AbstractRequestScheduler) PlacementConfiguration.create(runtime, config, router,
                     reporter, mock(DecodeCapacityAcquirer.class), new PlacementAvailability(), SchedulingTestConfig.capacity(config), org.mockito.Mockito.mock(org.flexlb.service.RecentCacheKeyTraceReporter.class));
-            runtime.initializeScheduler(scheduler.shutdownLifecycle());
+            runtime.registerScheduler(scheduler);
         }
         RequestContext context(long id) { return RequestProtocolTestSupport.context(config, id); }
         @Override public void close() { runtime.shutdown(); }

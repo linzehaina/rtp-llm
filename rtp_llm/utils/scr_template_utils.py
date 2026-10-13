@@ -1192,6 +1192,8 @@ def arrive_scr_template_barrier(
 ) -> int | None:
     """Run lifecycle hooks and Epsilon arrival as one template barrier."""
 
+    # Never capture an earlier release marker in the next checkpoint.
+    os.environ.pop("_RTP_LLM_SCR_POST_BARRIER_PID", None)
     if not is_scr_template_phase_active():
         return arrive_scr_checkpoint_barrier(
             worker_id=worker_id,
@@ -1220,10 +1222,12 @@ def arrive_scr_template_barrier(
             # the arrival boundary instead of interpreting None here.
             fail_closed=True,
         )
+        os.environ["_RTP_LLM_SCR_POST_BARRIER_PID"] = str(os.getpid())
         fixup_runtime_after_restore(actual_generation, lifecycle)
         lifecycle.release_template(actual_generation)
         return result
     except BaseException:
+        os.environ.pop("_RTP_LLM_SCR_POST_BARRIER_PID", None)
         lifecycle.abort_template(actual_generation)
         raise
 

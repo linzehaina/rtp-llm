@@ -91,6 +91,7 @@ public:
     }
 
 private:
+    static bool shouldPrefaultBeforeRegisterAfterScr();
     void initFreeBlocks();
     void tryFreeBlocks(const BlockIndicesType& block_indices);
     // global_layer_id -> {layout_index, local_layer_id}

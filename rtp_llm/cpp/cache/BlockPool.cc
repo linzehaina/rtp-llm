@@ -198,8 +198,8 @@ public:
             worker.join();
         }
         workers_.clear();
-        // prefault_ms is when the arena became fully resident; window_ms also
-        // contains the cudaHostRegister that ran concurrently with it.
+        // window_ms ends at join: before registration in serial mode, after
+        // registration in parallel mode. prefault_ms is worker completion.
         RTP_LLM_LOG_INFO("host block pool prefaulted: threads=%zu chunk_bytes=%zu total_size=%zu "
                          "madvise_fallbacks=%zu prefault_ms=%.3f window_ms=%.3f",
                          thread_num_,
@@ -246,10 +246,11 @@ private:
     std::vector<std::thread> workers_;
 };
 
-torch::Tensor allocateRegisteredCpuTensor(size_t size_bytes,
-                                          bool interleave_numa_nodes,
-                                          size_t prefault_threads,
-                                          std::shared_ptr<bool> registered = nullptr) {
+torch::Tensor allocateRegisteredCpuTensor(size_t                size_bytes,
+                                          bool                  interleave_numa_nodes,
+                                          size_t                prefault_threads,
+                                          std::shared_ptr<bool> registered               = nullptr,
+                                          bool                  prefault_before_register = false) {
 #if USING_CUDA
     void* ptr = mmap(nullptr, size_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (ptr == MAP_FAILED) {
@@ -285,15 +286,25 @@ torch::Tensor allocateRegisteredCpuTensor(size_t size_bytes,
     }
     cudaError_t err = cudaSuccess;
     {
-        // Prefaulting runs concurrently with the registration below; the scope
-        // guarantees the threads are joined before any munmap of the arena.
+        const auto prepare_begin_us = currentTimeUs();
+        // Keep the original overlap unless SCR release explicitly opts in.
+        // The scope also joins on registration failure before munmap.
         HostArenaPrefaulter prefaulter(ptr, size_bytes, prefault_threads);
+        if (prefault_before_register) {
+            prefaulter.join();
+        }
         const auto          register_begin_us = currentTimeUs();
         err = cudaHostRegister(ptr, size_bytes, cudaHostRegisterDefault);
-        RTP_LLM_LOG_INFO("host pool cudaHostRegister: bytes=%zu cost_ms=%.3f status=%d",
+        RTP_LLM_LOG_INFO("host pool cudaHostRegister: bytes=%zu cost_ms=%.3f status=%d prefault_mode=%s",
                          size_bytes,
                          (currentTimeUs() - register_begin_us) / 1000.0,
-                         static_cast<int>(err));
+                         static_cast<int>(err),
+                         prefault_before_register ? "serial" : "parallel");
+        prefaulter.join();
+        RTP_LLM_LOG_INFO("host pool prefault and register complete: bytes=%zu total_ms=%.3f prefault_mode=%s",
+                         size_bytes,
+                         (currentTimeUs() - prepare_begin_us) / 1000.0,
+                         prefault_before_register ? "serial" : "parallel");
     }
     if (err != cudaSuccess) {
         (void)munmap(ptr, size_bytes);
@@ -390,6 +401,15 @@ void BlockPool::validateConfig() const {
     }
 }
 
+bool BlockPool::shouldPrefaultBeforeRegisterAfterScr() {
+    const char* enabled      = std::getenv("RTP_LLM_SCR_HOST_CACHE_SERIAL_REGISTER");
+    const char* released_pid = std::getenv("_RTP_LLM_SCR_POST_BARRIER_PID");
+    // Set by successful Python barrier return, never by SCR_PHASE (which can
+    // retain "checkpoint" after restore). A spawned child must not inherit it.
+    return enabled && std::string(enabled) == "1" && released_pid
+           && std::string(released_pid) == std::to_string(getpid());
+}
+
 void BlockPool::initializeCacheBuffer() {
     gpu_cache_tensors_.clear();
     cache_buffer_registered_host_ = false;
@@ -416,8 +436,11 @@ void BlockPool::initializeCacheBuffer() {
             const size_t prefault_threads    = use_registered_host ? hostBlockPoolPrefaultThreads() : 1;
             try {
                 if (use_registered_host) {
-                    cache_aligned_buffer_ =
-                        allocateRegisteredCpuTensor(config_.total_size_bytes, interleave_numa_nodes, prefault_threads);
+                    cache_aligned_buffer_         = allocateRegisteredCpuTensor(config_.total_size_bytes,
+                                                                        interleave_numa_nodes,
+                                                                        prefault_threads,
+                                                                        nullptr,
+                                                                        shouldPrefaultBeforeRegisterAfterScr());
                     cache_buffer_registered_host_ = true;
                 } else {
                     cache_aligned_buffer_ =
@@ -448,9 +471,11 @@ void BlockPool::initializeCacheBuffer() {
         // Register the exact budget instead, using the existing NUMA policy.
         mla_host_registered_ = std::make_shared<bool>(false);
         mla_host_discarded_  = false;
-        cache_aligned_buffer_ = allocateRegisteredCpuTensor(
-            config_.total_size_bytes, shouldInterleaveRegisteredHostBlockPool(), hostBlockPoolPrefaultThreads(),
-            mla_host_registered_);
+        cache_aligned_buffer_         = allocateRegisteredCpuTensor(config_.total_size_bytes,
+                                                            shouldInterleaveRegisteredHostBlockPool(),
+                                                            hostBlockPoolPrefaultThreads(),
+                                                            mla_host_registered_,
+                                                            shouldPrefaultBeforeRegisterAfterScr());
         cache_buffer_registered_host_ = true;
         markHostBlockPoolDontDump(cache_aligned_buffer_.data_ptr(), config_.total_size_bytes);
     } else if (use_pinned_cpu_backing_) {
@@ -766,9 +791,18 @@ void BlockPool::restoreMlaHostCacheAfterCheckpoint() {
     }
     {
         HostArenaPrefaulter prefaulter(cache_base_ptr_, config_.total_size_bytes, hostBlockPoolPrefaultThreads());
+        const bool          serial = shouldPrefaultBeforeRegisterAfterScr();
+        if (serial) {
+            prefaulter.join();
+        }
+        const auto register_begin_us = currentTimeUs();
         RTP_LLM_CHECK_WITH_INFO(cudaHostRegister(cache_base_ptr_, config_.total_size_bytes, cudaHostRegisterDefault)
                                    == cudaSuccess,
                                "restore MLA host KV registration");
+        RTP_LLM_LOG_INFO("SCR MLA host KV cudaHostRegister: bytes=%zu cost_ms=%.3f prefault_mode=%s",
+                         config_.total_size_bytes,
+                         (currentTimeUs() - register_begin_us) / 1000.0,
+                         serial ? "serial" : "parallel");
     }
     *mla_host_registered_ = true;
     void* device_ptr = nullptr;

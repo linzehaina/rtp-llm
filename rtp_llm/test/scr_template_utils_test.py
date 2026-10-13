@@ -190,6 +190,9 @@ class ScrTemplateUtilsTest(unittest.TestCase):
 
         def fixup(*args):
             self.assertEqual(scr.get_scr_barrier_return_time(), 10.0)
+            self.assertEqual(
+                os.environ["_RTP_LLM_SCR_POST_BARRIER_PID"], str(os.getpid())
+            )
             clock[0] = 20.0
 
         with mock.patch.dict(
@@ -208,6 +211,49 @@ class ScrTemplateUtilsTest(unittest.TestCase):
             scr.arrive_scr_template_barrier(worker_id=0, worker_num=1)
             self.assertEqual(scr.get_scr_barrier_return_time(), 10.0)
         lifecycle.release_template.assert_called_once()
+
+    def test_post_barrier_marker_cleared_before_capture_and_on_failure(self):
+        marker = "_RTP_LLM_SCR_POST_BARRIER_PID"
+        for fail in (False, True):
+            lifecycle = mock.Mock()
+            lifecycle.prepare_for_template.side_effect = lambda *args: self.assertNotIn(
+                marker, os.environ
+            )
+
+            def arrive(**kwargs):
+                self.assertNotIn(marker, os.environ)
+                if fail:
+                    raise scr.ScrArrivalError("timeout")
+                return 0
+
+            with self.subTest(fail=fail), mock.patch.dict(
+                os.environ,
+                {
+                    "RTPLLM_ENABLE_SCR": "1",
+                    "SCR_PHASE": "checkpoint",
+                    marker: "old-pid",
+                },
+                clear=True,
+            ), mock.patch.object(
+                scr, "get_template_lifecycle", return_value=lifecycle
+            ), mock.patch.object(
+                scr, "arrive_scr_checkpoint_barrier", side_effect=arrive
+            ), mock.patch.object(
+                scr, "fixup_runtime_after_restore"
+            ):
+                if fail:
+                    with self.assertRaises(scr.ScrArrivalError):
+                        scr.arrive_scr_template_barrier(worker_id=0, worker_num=1)
+                    self.assertNotIn(marker, os.environ)
+                else:
+                    scr.arrive_scr_template_barrier(worker_id=0, worker_num=1)
+                    self.assertEqual(os.environ[marker], str(os.getpid()))
+
+    def test_normal_barrier_does_not_mark_scr_release(self):
+        marker = "_RTP_LLM_SCR_POST_BARRIER_PID"
+        with mock.patch.dict(os.environ, {marker: "stale"}, clear=True):
+            scr.arrive_scr_template_barrier(worker_id=0, worker_num=1)
+            self.assertNotIn(marker, os.environ)
 
     def test_timeout_budget_accepts_controller_values_and_rejects_invalid_values(self):
         with mock.patch.dict(

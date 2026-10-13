@@ -25,7 +25,8 @@ if TYPE_CHECKING:
 
 LOGGER = logging.getLogger(__name__)
 RESTORE_ENV_FILE = "/etc/scr/envs.json"
-# Identity/metrics inputs only. GPU topology, model config, SCR control state,
+# Identity/metrics and the opt-in host-cache restore policy only.
+# GPU topology, model config, SCR control state,
 # credentials and filesystem paths require their own explicit repair contracts.
 RESTORE_ENV_KEYS = frozenset(
     {
@@ -37,6 +38,7 @@ RESTORE_ENV_KEYS = frozenset(
         "HIPPO_SERVICE_NAME",
         "kmonitorSinkAddress",
         "kmonitorPort",
+        "RTP_LLM_SCR_HOST_CACHE_SERIAL_REGISTER",
     }
 )
 RestoreEnvProvider = Callable[[str], Mapping[str, str | None]]

@@ -345,6 +345,35 @@ TEST_F(BlockPoolTest, PinnedMlaKeepsIndexerOnGpuAndVersionsRecycledBlocks) {
     EXPECT_TRUE(tree_cache.empty());
 }
 
+TEST_F(BlockPoolTest, SerialHostRegistrationRequiresCurrentProcessScrRelease) {
+    autil::EnvGuard option("RTP_LLM_SCR_HOST_CACHE_SERIAL_REGISTER", "1");
+    {
+        autil::EnvGuard before_barrier("_RTP_LLM_SCR_POST_BARRIER_PID", "");
+        EXPECT_FALSE(BlockPool::shouldPrefaultBeforeRegisterAfterScr());
+    }
+    {
+        autil::EnvGuard inherited("_RTP_LLM_SCR_POST_BARRIER_PID", "0");
+        EXPECT_FALSE(BlockPool::shouldPrefaultBeforeRegisterAfterScr());
+    }
+    autil::EnvGuard released("_RTP_LLM_SCR_POST_BARRIER_PID", std::to_string(getpid()));
+    EXPECT_TRUE(BlockPool::shouldPrefaultBeforeRegisterAfterScr());
+    for (const auto* value : {"", "0", "false"}) {
+        autil::EnvGuard disabled("RTP_LLM_SCR_HOST_CACHE_SERIAL_REGISTER", value);
+        EXPECT_FALSE(BlockPool::shouldPrefaultBeforeRegisterAfterScr());
+    }
+#if USING_CUDA
+    autil::EnvGuard numa("RTP_LLM_HOST_BLOCK_POOL_NUMA_POLICY", "none");
+    autil::EnvGuard prefault("RTP_LLM_HOST_BLOCK_POOL_PREFAULT_THREADS", "2");
+    auto            config = BlockPoolConfigHelper::createConfig(makeMtpCacheConfigByCreateSpConfig(1, 0, 4));
+    for (const auto* value : {"0", "1"}) {
+        autil::EnvGuard mode("RTP_LLM_SCR_HOST_CACHE_SERIAL_REGISTER", value);
+        BlockPool       pool(config, AllocationType::HOST);
+        ASSERT_TRUE(pool.init());
+        EXPECT_TRUE(pool.allLayerCacheBase()[0].is_pinned());
+    }
+#endif
+}
+
 TEST_F(BlockPoolTest, PinnedMlaCheckpointKeepsGraphAddressAndDiscardsPages) {
 #if USING_CUDA
     autil::EnvGuard numa("RTP_LLM_HOST_BLOCK_POOL_NUMA_POLICY", "none");
@@ -407,6 +436,8 @@ TEST_F(BlockPoolTest, PinnedMlaCheckpointKeepsGraphAddressAndDiscardsPages) {
     ASSERT_EQ(cudaStreamEndCapture(stream, &graph), cudaSuccess);
     ASSERT_EQ(cudaGraphInstantiateWithFlags(&executable, graph, 0), cudaSuccess);
     for (int iteration = 0; iteration < 2; ++iteration) {
+        autil::EnvGuard serial("RTP_LLM_SCR_HOST_CACHE_SERIAL_REGISTER", iteration == 0 ? "0" : "1");
+        autil::EnvGuard released("_RTP_LLM_SCR_POST_BARRIER_PID", std::to_string(getpid()));
         std::memset(ptr, 0x5a, bytes);
         pool.releaseMlaHostCacheForCheckpoint();
         pool.releaseMlaHostCacheForCheckpoint();

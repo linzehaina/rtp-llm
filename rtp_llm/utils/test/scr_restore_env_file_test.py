@@ -81,6 +81,16 @@ class ScrRestoreEnvFileTest(unittest.TestCase):
         self.assertEqual(os.environ["HIPPO_SLAVE_IP"], "192.0.2.100")
         self.assertEqual(runtime.get_restore_runtime_identity().environment_keys, ())
 
+    def test_restore_file_can_override_serial_host_cache_option(self):
+        option = "RTP_LLM_SCR_HOST_CACHE_SERIAL_REGISTER"
+        for value in ("1", "0"):
+            self.publish({"RequestedIP": "192.0.2.20", option: value})
+            self.barrier([])
+            self.assertEqual(os.environ[option], value)
+            self.assertEqual(
+                os.environ["_RTP_LLM_SCR_POST_BARRIER_PID"], str(os.getpid())
+            )
+
     def test_file_is_read_after_barrier_and_before_components(self):
         # The seed-side bytes are invalid; only the newly published input may be read.
         self.path.write_text("not-json", encoding="utf-8")

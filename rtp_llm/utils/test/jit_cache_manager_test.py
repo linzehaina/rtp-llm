@@ -639,7 +639,9 @@ class ScopeTest(JitCacheTestBase):
             scope = jit.resolve_scope(self.root)
         names = {item.name for item in scope.components}
         self.assertLessEqual({"aiter", "flydsl", "triton"}, names)
-        self.assertFalse(names & {"flashinfer", "deep_gemm", "tvm_ffi", "cute_dsl"})
+        self.assertFalse(
+            names & {"flashinfer", "deep_gemm", "tvm_ffi", "cute_dsl", "rtp_kernel"}
+        )
 
     def test_rocm_scope_recognizes_amd_aiter_distribution(self):
         def version(name):

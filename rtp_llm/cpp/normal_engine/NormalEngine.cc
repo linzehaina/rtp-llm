@@ -445,6 +445,8 @@ int64_t NormalEngine::getLastScheduleTime() {
 
 WarmUpResult NormalEngine::warmUp(const EngineInitParams& params) {
     if (runtime_config.use_batch_decode_scheduler) {
+        RTP_LLM_CHECK_WITH_INFO(parallelism_config.pp_size == 1,
+                                "batch decode scheduler warmup does not support pipeline parallelism");
         if (runtime_config.batch_decode_scheduler_config.batch_decode_scheduler_warmup_type == 0) {
             return decodeWarmUp(params);
         } else {

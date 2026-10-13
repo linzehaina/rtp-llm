@@ -892,31 +892,37 @@ TEST_F(PPExecutorTest, CommonBuildsOnlyTheFirstConfiguredDraftModule) {
     EXPECT_EQ(constructed_models, (std::vector<size_t>{0, 1}));
 }
 
-TEST_F(PPExecutorTest, CommonActiveCpRequiresPrefillButImportedCpAllowsDecode) {
-    for (const auto type : {SP_TYPE_NONE, SP_TYPE_MTP, SP_TYPE_DSPARK}) {
+TEST_F(PPExecutorTest, CommonActiveCpAllowsOrdinaryDecodeWithReplicatedKv) {
+    for (const auto type : {SP_TYPE_NONE, SP_TYPE_MTP, SP_TYPE_EAGLE, SP_TYPE_DSPARK}) {
         for (const auto role : {RoleType::PREFILL, RoleType::DECODE, RoleType::PDFUSION}) {
-            SCOPED_TRACE(::testing::Message() << "type=" << type << ", role=" << role);
-            auto params = makeMtpParams(3);
-            params.sp_config.type = type;
-            params.sp_config.sp_dspark_mask_token_id = 63;
-            params.pd_sep_config.role_type = role;
-            params.parallelism_config.tp_size = 2;
-            params.parallelism_config.world_size = 4;
-            params.parallelism_config.prefill_cp_config.method = CPRotateMethod::ALL_GATHER;
-            if (role == RoleType::PREFILL) {
-                EXPECT_NO_THROW({ PPExecutor executor(params, nullptr, true); });
-            } else {
-                try {
-                    PPExecutor executor(params, nullptr, true);
-                    FAIL() << "active CP accepted a role that runs verify/decode";
-                } catch (const std::runtime_error& error) {
-                    EXPECT_NE(std::string(error.what()).find("PP context parallel execution requires the PREFILL role"),
-                              std::string::npos);
+            for (const bool kv_sharded : {false, true}) {
+                SCOPED_TRACE(::testing::Message() << "type=" << type << ", role=" << role
+                                                  << ", kv_sharded=" << kv_sharded);
+                auto params = makeMtpParams(3);
+                params.sp_config.type = type;
+                params.sp_config.sp_dspark_mask_token_id = 63;
+                params.pd_sep_config.role_type = role;
+                params.parallelism_config.role_type = role;
+                params.parallelism_config.tp_size = 2;
+                params.parallelism_config.world_size = 4;
+                params.parallelism_config.prefill_cp_config.method = CPRotateMethod::ALL_GATHER;
+                params.parallelism_config.prefill_cp_config.kv_cache_sharded = kv_sharded;
+                if (role == RoleType::PREFILL || (type == SP_TYPE_NONE && !kv_sharded)) {
+                    EXPECT_NO_THROW({ PPExecutor executor(params, nullptr, true); });
+                } else {
+                    try {
+                        PPExecutor executor(params, nullptr, true);
+                        FAIL() << "active CP accepted speculative or KV-sharded decode";
+                    } catch (const std::runtime_error& error) {
+                        EXPECT_NE(std::string(error.what()).find(
+                                      "PP speculative or KV-sharded context parallel execution requires the PREFILL role"),
+                                  std::string::npos);
+                    }
                 }
-            }
-            if (role == RoleType::DECODE) {
-                params.parallelism_config.prefill_cp_config.method = CPRotateMethod::PREFILL_CP;
-                EXPECT_NO_THROW({ PPExecutor executor(params, nullptr, true); });
+                if (role == RoleType::DECODE) {
+                    params.parallelism_config.prefill_cp_config.method = CPRotateMethod::PREFILL_CP;
+                    EXPECT_NO_THROW({ PPExecutor executor(params, nullptr, true); });
+                }
             }
         }
     }

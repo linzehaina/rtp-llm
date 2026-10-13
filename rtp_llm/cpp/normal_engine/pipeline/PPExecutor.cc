@@ -285,41 +285,31 @@ PPExecutor::PPExecutor(const EngineInitParams&                params,
     const char* stream_async = std::getenv("RTP_LLM_STREAM_ASYNC");
     RTP_LLM_CHECK_WITH_INFO(stream_async == nullptr || std::strcmp(stream_async, "1") != 0,
                             "pipeline parallelism does not support async runner (RTP_LLM_STREAM_ASYNC)");
-    RTP_LLM_CHECK_WITH_INFO(params.sp_config.type == SP_TYPE_NONE || params.sp_config.type == SP_TYPE_MTP
-                                || params.sp_config.type == SP_TYPE_EAGLE || params.sp_config.type == SP_TYPE_DSPARK,
-                            "pipeline parallelism only supports MTP, EAGLE and DSpARK speculative decoding");
-    RTP_LLM_CHECK_WITH_INFO(!params.ffn_disaggregate_config.enable_ffn_disaggregate,
-                            "pipeline parallelism does not support FFN disaggregation");
-    RTP_LLM_CHECK_WITH_INFO(!parallelism_config_.enable_sp && parallelism_config_.ffn_sp_size == 1,
-                            "pipeline parallelism does not support sequence parallelism");
-    RTP_LLM_CHECK_WITH_INFO(!parallelism_config_.use_ub_comm,
-                            "pipeline parallelism does not support user-buffer communication");
-    RTP_LLM_CHECK_WITH_INFO(role_type_ == RoleType::PDFUSION || role_type_ == RoleType::PREFILL
-                                || role_type_ == RoleType::DECODE,
-                            "pipeline parallelism requires the PDFUSION, PREFILL, or DECODE role");
-    /**
-     * Active CP is a P-side execution mode. D-side PREFILL_CP only describes
-     * imported KV; PDFUSION would also send verify/decode through this model.
-     */
-    RTP_LLM_CHECK_WITH_INFO(!parallelism_config_.prefill_cp_config.is_enabled() || role_type_ == RoleType::PREFILL,
-                            "PP context parallel execution requires the PREFILL role; "
-                            "DECODE imports CP KV with cp_rotate_method=PREFILL_CP");
-    RTP_LLM_CHECK_WITH_INFO(!params.runtime_config.use_batch_decode_scheduler,
-                            "pipeline parallelism does not support BatchDecodeScheduler");
     const char* device_input = std::getenv("RTP_LLM_DEVICE_INPUT");
     RTP_LLM_CHECK_WITH_INFO(device_input == nullptr || std::strcmp(device_input, "1") != 0,
                             "pipeline parallelism does not support device-input mode (RTP_LLM_DEVICE_INPUT)");
+    RTP_LLM_CHECK_WITH_INFO(params.device_resource_config.enable_layer_micro_batch == 0,
+                            "pipeline parallelism does not support layer micro-batching");
 
+    RTP_LLM_CHECK_WITH_INFO(!params.ffn_disaggregate_config.enable_ffn_disaggregate,
+                            "pipeline parallelism does not support FFN disaggregation");
+    RTP_LLM_CHECK_WITH_INFO(parallelism_config_.get_ffn_tp_size() == 1
+                                || parallelism_config_.get_ffn_tp_size() == parallelism_config_.tp_size,
+                            "pipeline parallelism requires replicated FFNs or full-TP FFN sharding");
+    RTP_LLM_CHECK_WITH_INFO(!parallelism_config_.use_ub_comm,
+                            "pipeline parallelism does not support user-buffer communication");
+    const auto& cp_config = parallelism_config_.prefill_cp_config;
+    RTP_LLM_CHECK_WITH_INFO(!cp_config.is_enabled() || role_type_ == RoleType::PREFILL
+                                || (!sp_enabled_ && !(cp_config.kv_cache_sharded && parallelism_config_.tp_size > 1)),
+                            "PP speculative or KV-sharded context parallel execution requires the PREFILL role; "
+                            "DECODE imports CP KV with cp_rotate_method=PREFILL_CP");
+
+    RTP_LLM_CHECK_WITH_INFO(params.sp_config.type == SP_TYPE_NONE || params.sp_config.type == SP_TYPE_MTP
+                                || params.sp_config.type == SP_TYPE_EAGLE || params.sp_config.type == SP_TYPE_DSPARK,
+                            "pipeline parallelism only supports MTP, EAGLE and DSpARK speculative decoding");
     RTP_LLM_CHECK_WITH_INFO(!sp_enabled_ || params.sp_config.gen_num_per_cycle > 0,
                             "PP speculative decoding requires a positive gen_num_per_cycle, got %ld",
                             params.sp_config.gen_num_per_cycle);
-    RTP_LLM_CHECK_WITH_INFO(!is_dspark_ || dspark_mask_token_id_ >= 0,
-                            "PP DSpARK requires sp_dspark_mask_token_id, got %d",
-                            dspark_mask_token_id_);
-    /** forwardMicroBatched bypasses the CP input/output processing in forward(). */
-    RTP_LLM_CHECK_WITH_INFO((!is_dspark_ && !parallelism_config_.prefill_cp_config.is_enabled())
-                                || params.device_resource_config.enable_layer_micro_batch == 0,
-                            "PP CP and DSpARK do not support layer micro-batching");
 
     if (track_dspark_cache_store_ && parallelism_config_.tp_size > 1) {
         dspark_cache_store_status_ =

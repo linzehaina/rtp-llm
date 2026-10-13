@@ -14,11 +14,18 @@
 namespace rtp_llm {
 
 #if USING_CUDA
-size_t dsparkSoftmaxWorkspaceBytes(const float* logits, const float* output, int64_t rows, int64_t vocab,
-                                  int major, int minor);
-cudaError_t invokeDSparkSoftmax(float* logits, float* output, int64_t rows, int64_t vocab,
-                               int major, int minor, int sm_count, void* workspace, size_t workspace_bytes,
-                               cudaStream_t stream);
+size_t dsparkSoftmaxWorkspaceBytes(
+    const float* logits, const float* output, int64_t rows, int64_t vocab, int major, int minor);
+cudaError_t invokeDSparkSoftmax(float*       logits,
+                                float*       output,
+                                int64_t      rows,
+                                int64_t      vocab,
+                                int          major,
+                                int          minor,
+                                int          sm_count,
+                                void*        workspace,
+                                size_t       workspace_bytes,
+                                cudaStream_t stream);
 #endif
 
 constexpr int kRejectionValidationTileSize = 8192;
@@ -38,6 +45,18 @@ cudaError_t invokeDSparkCombineLogits(const float* base,
                                       int64_t      vocab,
                                       int64_t      base_row_stride,
                                       cudaStream_t stream);
+
+// Map a sampled draft ID and fetch the next Markov W1 row in one launch.
+cudaError_t invokeDSparkMapGather(const int32_t*       draft_ids,
+                                  const int64_t*       d2t_map,
+                                  const __nv_bfloat16* w1,
+                                  int32_t*             target_ids,
+                                  __nv_bfloat16*       embeddings,
+                                  int64_t              batch,
+                                  int64_t              map_size,
+                                  int64_t              target_vocab,
+                                  int64_t              rank,
+                                  cudaStream_t         stream);
 
 // Compute sigmoid(float(BF16(W_h * hidden + W_m * markov(prev_token) + bias)))
 // without materializing the [hidden, markov] feature concatenation. The raw

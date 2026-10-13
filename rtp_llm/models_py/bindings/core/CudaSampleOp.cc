@@ -91,7 +91,6 @@ void pyTopPRenormProbs(const torch::Tensor& probs, torch::Tensor& renorm_probs, 
     renorm_probs.copy_(result, /*non_blocking=*/true);
 }
 
-
 void processLogits(const GreedyParams&  params,
                    const torch::Tensor& device_tokens,
                    const torch::Tensor& transposed_tokens) {
@@ -442,24 +441,34 @@ torch::Tensor dsparkSoftmax(const torch::Tensor& logits, torch::Tensor& workspac
                     && logits.size(1) <= std::numeric_limits<uint32_t>::max(),
                 "DSpark softmax dimensions exceed FlashInfer uint32 ABI");
     c10::cuda::CUDAGuard device_guard(logits.device());
-    auto input = logits.contiguous();
+    auto                 input = logits.contiguous();
     // OnlineSoftmax uses up to 16-byte vector loads; contiguous offset views
     // need aligned storage before entering its compatibility route.
-    if (reinterpret_cast<uintptr_t>(input.data_ptr<float>()) % 16 != 0) input = input.clone();
-    auto output = torch::empty_like(input);
-    const auto* properties = at::cuda::getDeviceProperties(logits.get_device());
-    const size_t bytes = dsparkSoftmaxWorkspaceBytes(input.data_ptr<float>(), output.data_ptr<float>(),
-                                                     input.size(0), input.size(1), properties->major, properties->minor);
-    if (bytes > 0 && (!workspace.defined() || workspace.device() != logits.device()
-                     || workspace.scalar_type() != torch::kUInt8 || !workspace.is_contiguous()
-                     || workspace.numel() < static_cast<int64_t>(bytes))) {
+    if (reinterpret_cast<uintptr_t>(input.data_ptr<float>()) % 16 != 0)
+        input = input.clone();
+    auto         output     = torch::empty_like(input);
+    const auto*  properties = at::cuda::getDeviceProperties(logits.get_device());
+    const size_t bytes      = dsparkSoftmaxWorkspaceBytes(input.data_ptr<float>(),
+                                                     output.data_ptr<float>(),
+                                                     input.size(0),
+                                                     input.size(1),
+                                                     properties->major,
+                                                     properties->minor);
+    if (bytes > 0
+        && (!workspace.defined() || workspace.device() != logits.device() || workspace.scalar_type() != torch::kUInt8
+            || !workspace.is_contiguous() || workspace.numel() < static_cast<int64_t>(bytes))) {
         workspace = torch::empty({static_cast<int64_t>(bytes)}, logits.options().dtype(torch::kUInt8));
     }
-    const auto status = invokeDSparkSoftmax(input.data_ptr<float>(), output.data_ptr<float>(),
-                                           input.size(0), input.size(1), properties->major, properties->minor,
-                                           properties->multiProcessorCount,
-                                           bytes > 0 ? workspace.data_ptr() : nullptr, bytes,
-                                           at::cuda::getCurrentCUDAStream().stream());
+    const auto status = invokeDSparkSoftmax(input.data_ptr<float>(),
+                                            output.data_ptr<float>(),
+                                            input.size(0),
+                                            input.size(1),
+                                            properties->major,
+                                            properties->minor,
+                                            properties->multiProcessorCount,
+                                            bytes > 0 ? workspace.data_ptr() : nullptr,
+                                            bytes,
+                                            at::cuda::getCurrentCUDAStream().stream());
     TORCH_CHECK(status == cudaSuccess, "DSpark softmax kernel: ", cudaGetErrorString(status));
     return output;
 }
@@ -503,6 +512,34 @@ combineDSparkLogits(const torch::Tensor& base, const torch::Tensor& bias, const 
     }
     TORCH_CHECK(status == cudaSuccess, "DSpark logits kernel: ", cudaGetErrorString(status));
     return output;
+}
+
+std::pair<torch::Tensor, torch::Tensor>
+dsparkMapGather(const torch::Tensor& draft_ids, const torch::Tensor& d2t_map, const torch::Tensor& markov_w1) {
+    TORCH_CHECK(draft_ids.is_cuda() && draft_ids.is_contiguous() && draft_ids.dim() == 1
+                    && draft_ids.scalar_type() == torch::kInt32,
+                "DSpark sampled draft IDs must be contiguous CUDA INT32 [B]");
+    TORCH_CHECK(d2t_map.device() == draft_ids.device() && d2t_map.is_contiguous() && d2t_map.dim() == 1
+                    && d2t_map.scalar_type() == torch::kInt64,
+                "DSpark d2t_map must be contiguous CUDA INT64");
+    TORCH_CHECK(markov_w1.device() == draft_ids.device() && markov_w1.is_contiguous() && markov_w1.dim() == 2
+                    && markov_w1.scalar_type() == torch::kBFloat16,
+                "DSpark Markov W1 must be contiguous CUDA BF16 [vocab,rank]");
+    auto                 target    = torch::empty_like(draft_ids);
+    auto                 embedding = torch::empty({draft_ids.numel(), markov_w1.size(1)}, markov_w1.options());
+    c10::cuda::CUDAGuard device_guard(draft_ids.device());
+    auto                 status = invokeDSparkMapGather(draft_ids.data_ptr<int32_t>(),
+                                        d2t_map.data_ptr<int64_t>(),
+                                        reinterpret_cast<const __nv_bfloat16*>(markov_w1.data_ptr<at::BFloat16>()),
+                                        target.data_ptr<int32_t>(),
+                                        reinterpret_cast<__nv_bfloat16*>(embedding.data_ptr<at::BFloat16>()),
+                                        draft_ids.numel(),
+                                        d2t_map.numel(),
+                                        markov_w1.size(0),
+                                        markov_w1.size(1),
+                                        at::cuda::getCurrentCUDAStream().stream());
+    TORCH_CHECK(status == cudaSuccess, "DSpark map/gather kernel: ", cudaGetErrorString(status));
+    return {target, embedding};
 }
 
 torch::Tensor dsparkConfidence(const torch::Tensor& hidden,

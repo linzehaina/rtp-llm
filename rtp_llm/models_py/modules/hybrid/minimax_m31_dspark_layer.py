@@ -64,6 +64,68 @@ def _add_and_mask_proposals(
     return output.view(query_lens.shape[0], width, dim)
 
 
+@triton.jit
+def _add_post_norm(
+    HIDDEN,
+    OUTPUT,
+    WEIGHT,
+    RESIDUAL,
+    NORM,
+    DIM: tl.constexpr,
+    EPS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    col = tl.arange(0, BLOCK)
+    offset = row * DIM + col
+    lhs = tl.load(HIDDEN + offset, col < DIM, other=0).to(tl.float32)
+    rhs = tl.load(OUTPUT + offset, col < DIM, other=0).to(tl.float32)
+    # Match torch.add's BF16 output before the existing FP32 RMS reduction.
+    residual = (lhs + rhs).to(tl.bfloat16)
+    tl.store(RESIDUAL + offset, residual, col < DIM)
+    x = residual.to(tl.float32)
+    weight = tl.load(WEIGHT + col, col < DIM, other=0).to(tl.float32)
+    inv = tl.rsqrt(tl.sum(x * x, axis=0) / DIM + EPS)
+    tl.store(NORM + offset, (x * inv) * (1.0 + weight), col < DIM)
+
+
+def _fused_add_post_norm(hidden, output, post_norm):
+    rows, dim = hidden.shape
+    if (
+        not hidden.is_cuda
+        or hidden.dtype != torch.bfloat16
+        or output.shape != hidden.shape
+        or output.dtype != torch.bfloat16
+        or output.device != hidden.device
+        or not hidden.is_contiguous()
+        or not output.is_contiguous()
+        or dim <= 0
+        or dim > 16384
+        or post_norm.weight.dtype != torch.bfloat16
+        or post_norm.weight.device != hidden.device
+        or not post_norm.weight.is_contiguous()
+    ):
+        residual = hidden + output
+        return residual, post_norm(residual)
+    residual = torch.empty_like(hidden)
+    norm = torch.empty_like(hidden)
+    if rows:
+        block = triton.next_power_of_2(dim)
+        _add_post_norm[(rows,)](
+            hidden,
+            output,
+            post_norm.weight,
+            residual,
+            norm,
+            dim,
+            post_norm.eps,
+            block,
+            num_warps=4 if block <= 1024 else 8,
+            enable_fp_fusion=False,
+        )
+    return residual, norm
+
+
 class MiniMaxM31DSparkLayer(nn.Module):
     """One loaded MXFP8 projection + BF16 GQA SWA + dense SwiGLU-OAI layer."""
 
@@ -224,7 +286,5 @@ class MiniMaxM31DSparkLayer(nn.Module):
         output = self.o_proj(output.reshape(batch * width, self.q_size))
         if self.tp_size > 1:
             output = all_reduce(output, group=Group.TP)
-        hidden = residual + output
-        return _add_and_mask_proposals(
-            hidden, self.mlp(self.post_norm(hidden)), query_lens, width
-        )
+        hidden, post_norm = _fused_add_post_norm(residual, output, self.post_norm)
+        return _add_and_mask_proposals(hidden, self.mlp(post_norm), query_lens, width)

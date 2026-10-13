@@ -59,6 +59,46 @@ template cudaError_t invokeDSparkCombineLogits<float>(
 template cudaError_t invokeDSparkCombineLogits<__nv_bfloat16>(
     const float*, const __nv_bfloat16*, const float*, float*, int64_t, int64_t, int64_t, cudaStream_t);
 
+__global__ void dsparkMapGatherKernel(const int32_t*       draft_ids,
+                                      const int64_t*       d2t_map,
+                                      const __nv_bfloat16* w1,
+                                      int32_t*             target_ids,
+                                      __nv_bfloat16*       embeddings,
+                                      int64_t              map_size,
+                                      int64_t              target_vocab,
+                                      int64_t              rank) {
+    const int64_t row         = blockIdx.x;
+    const int64_t col         = threadIdx.x;
+    const int64_t draft       = draft_ids[row];
+    const bool    draft_valid = draft >= 0 && draft < map_size;
+    const int64_t target      = draft_valid ? d2t_map[draft] : -1;
+    const bool    valid       = target >= 0 && target < target_vocab && target <= 2147483647LL;
+    if (col == 0) {
+        target_ids[row] = valid ? static_cast<int32_t>(target) : -1;
+    }
+    for (int64_t i = col; i < rank; i += blockDim.x) {
+        embeddings[row * rank + i] = valid ? w1[target * rank + i] : __float2bfloat16(0.0f);
+    }
+}
+
+cudaError_t invokeDSparkMapGather(const int32_t*       draft_ids,
+                                  const int64_t*       d2t_map,
+                                  const __nv_bfloat16* w1,
+                                  int32_t*             target_ids,
+                                  __nv_bfloat16*       embeddings,
+                                  int64_t              batch,
+                                  int64_t              map_size,
+                                  int64_t              target_vocab,
+                                  int64_t              rank,
+                                  cudaStream_t         stream) {
+    if (batch == 0) {
+        return cudaSuccess;
+    }
+    dsparkMapGatherKernel<<<batch, 256, 0, stream>>>(
+        draft_ids, d2t_map, w1, target_ids, embeddings, map_size, target_vocab, rank);
+    return cudaGetLastError();
+}
+
 template<int BLOCK_THREADS>
 __global__ void dsparkConfidenceKernel(const __nv_bfloat16* hidden,
                                        const int32_t*       anchors,
@@ -534,7 +574,7 @@ __global__ void rejection_sampling_kernel(DType*     draft_probs,
                 pos                                                          = i;
                 output_token_ids[row_idx * (num_speculative_tokens + 1) + i] = target_id;
                 for (int j = i + 1; j < num_speculative_tokens + 1; ++j) {
-                    output_token_ids[row_idx * (num_speculative_tokens + 1) + j] = -1;
+                    output_token_ids[row_idx * (num_speculative_tokens + 1) + j] = 0;
                 }
                 all_same_token    = false;
                 greedy_exact_done = true;
@@ -652,9 +692,10 @@ __global__ void rejection_sampling_kernel(DType*     draft_probs,
         } else {
             output_token_ids[row_idx * (num_speculative_tokens + 1) + pos] = temp_storage.sampled_id;
         }
-        // pad remaining tokens with -1
+        // The sampled-draft caller consumes zero padding; write it here so
+        // batchSample does not need a separate full-output cleanup pass.
         for (int p = pos + 1; p < num_speculative_tokens + 1; ++p) {
-            output_token_ids[row_idx * (num_speculative_tokens + 1) + p] = -1;
+            output_token_ids[row_idx * (num_speculative_tokens + 1) + p] = 0;
         }
     }
 }

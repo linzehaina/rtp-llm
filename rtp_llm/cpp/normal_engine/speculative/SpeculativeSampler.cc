@@ -1,5 +1,6 @@
 #include "rtp_llm/cpp/normal_engine/speculative/SpeculativeSampler.h"
 #include <algorithm>
+#include <tuple>
 #include "rtp_llm/models_py/bindings/core/ExecOps.h"
 #include "rtp_llm/cpp/utils/DebugUtils.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
@@ -45,7 +46,7 @@ SamplerOutput SpeculativeSampler::sampleDSparkDraft(const torch::Tensor& base_lo
                                                     size_t               base_logit_steps) const {
     RTP_LLM_PROFILE_SCOPE("speculative_sampler.sample_dspark_draft");
     const size_t prefix_steps = sampled_prefix_steps == 0 ? propose_step_ : sampled_prefix_steps;
-    const size_t head_steps = base_logit_steps == 0 ? propose_step_ : base_logit_steps;
+    const size_t head_steps   = base_logit_steps == 0 ? propose_step_ : base_logit_steps;
     RTP_LLM_CHECK_WITH_INFO(prefix_steps <= head_steps && head_steps <= propose_step_,
                             "DSpARK LM-head width must contain the sampled prefix and not exceed gamma");
 #if !USING_CUDA
@@ -97,19 +98,32 @@ SamplerOutput SpeculativeSampler::sampleDSparkDraft(const torch::Tensor& base_lo
     // Private per invocation: no cross-stream scratch or capture-bucket cache.
     // Cached Blackwell softmax needs no workspace; fallback reuses this buffer.
     torch::Tensor softmax_workspace;
+    torch::Tensor next_markov_embedding;
     for (int64_t step = 0; step < static_cast<int64_t>(sampling_steps); ++step) {
-        auto markov_embedding = markov_w1.index_select(0, previous_tokens);
-        auto markov_bias      = torch::mm(markov_embedding, markov_w2.transpose(0, 1));
-        auto logits           = execDSparkCombineLogits(proposal_logits.select(1, step), markov_bias, temperature);
+        auto markov_embedding =
+            next_markov_embedding.defined() ? next_markov_embedding : markov_w1.index_select(0, previous_tokens);
+        auto markov_bias = torch::mm(markov_embedding, markov_w2.transpose(0, 1));
+        auto logits      = execDSparkCombineLogits(proposal_logits.select(1, step), markov_bias, temperature);
         auto sampling_probabilities = execDSparkSoftmax(logits, softmax_workspace);
         auto sampled_draft_tokens   = execSampleFromProbs(sampling_probabilities).to(torch::kInt32);
         auto sampled_target_tokens  = sampled_draft_tokens;
+        next_markov_embedding       = torch::Tensor();
         if (d2t_map_.defined()) {
-            sampled_target_tokens = d2t_map_.index_select(0, sampled_draft_tokens.to(torch::kLong)).to(torch::kInt32);
+            if (step + 1 < static_cast<int64_t>(sampling_steps) && d2t_map_.is_cuda()
+                && d2t_map_.scalar_type() == torch::kInt64 && d2t_map_.is_contiguous()
+                && markov_w1.scalar_type() == torch::kBFloat16 && markov_w1.is_contiguous()) {
+                std::tie(sampled_target_tokens, next_markov_embedding) =
+                    execDSparkMapGather(sampled_draft_tokens, d2t_map_, markov_w1);
+            } else {
+                sampled_target_tokens =
+                    d2t_map_.index_select(0, sampled_draft_tokens.to(torch::kLong)).to(torch::kInt32);
+            }
         }
         all_probabilities.select(1, step).copy_(sampling_probabilities);
         token_columns.push_back(sampled_target_tokens);
-        previous_tokens = sampled_target_tokens.to(torch::kLong);
+        if (step + 1 < static_cast<int64_t>(sampling_steps) && !next_markov_embedding.defined()) {
+            previous_tokens = sampled_target_tokens.to(torch::kLong);
+        }
     }
 
     if (sampling_steps < propose_step_) {
@@ -300,9 +314,10 @@ void SpeculativeSampler::batchSample(SpeculativeSamplerOutput&           sample_
             // indexing here used to issue one fill kernel per forced request.
             // Torch's pinned caching allocator records the async copy lifetime.
             auto force_mask_cpu = torch::empty(
-                {(long)batch_size}, torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU).pinned_memory(target_device.is_cuda()));
-            auto* flags = force_mask_cpu.data_ptr<bool>();
-            int64_t idx = 0;
+                {(long)batch_size},
+                torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU).pinned_memory(target_device.is_cuda()));
+            auto*   flags = force_mask_cpu.data_ptr<bool>();
+            int64_t idx   = 0;
             for (const auto& stream : streams) {
                 flags[idx++] = stream->forceSpAccept();
             }
@@ -332,9 +347,14 @@ void SpeculativeSampler::batchSample(SpeculativeSamplerOutput&           sample_
         }
     }
 
-    // use async sample here, we assume accept all tokens
-    // so we need to reset -1 to 0 in output_token_ids_d
-    output_token_ids_d.index_put_({output_token_ids_d == -1}, 0);
+    // CUDA sampled-draft rejection writes zero padding directly. Legacy MTP,
+    // deterministic draft and HIP still use the historical -1 padding.
+#if USING_CUDA
+    if (proposal_mode_ != DraftProposalMode::SAMPLED)
+#endif
+    {
+        output_token_ids_d.index_put_({output_token_ids_d == -1}, 0);
+    }
     sample_output.accept_tokens = output_token_ids_d;
     sample_output.accept_len    = output_accepted_token_num_d;
 

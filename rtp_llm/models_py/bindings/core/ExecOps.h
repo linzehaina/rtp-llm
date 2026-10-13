@@ -96,6 +96,8 @@ torch::Tensor execSampleFromProbs(const torch::Tensor& probabilities);
 torch::Tensor execDSparkSoftmax(const torch::Tensor& logits, torch::Tensor& workspace);
 torch::Tensor
 execDSparkCombineLogits(const torch::Tensor& base, const torch::Tensor& bias, const torch::Tensor& temperature);
+std::pair<torch::Tensor, torch::Tensor>
+execDSparkMapGather(const torch::Tensor& draft_ids, const torch::Tensor& d2t_map, const torch::Tensor& markov_w1);
 torch::Tensor                           execDSparkConfidence(const torch::Tensor& hidden,
                                                              const torch::Tensor& anchors,
                                                              const torch::Tensor& sampled_tokens,

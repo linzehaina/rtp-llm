@@ -68,6 +68,16 @@ py_test(
 )
 
 py_test(
+    name = "test_dspark_commit_slots",
+    srcs = ["test_dspark_commit_slots.py"],
+    main = "test_dspark_commit_slots.py",
+    deps = ["//rtp_llm/models_py/standalone:py_standalone_testlib"],
+    env = {"GPU_COUNT": "1"},
+    tags = ["SM100_X86"],
+    exec_properties = {"gpu": "SM100_X86", "gpu_count": "1"},
+)
+
+py_test(
     name = "test_dspark_swa",
     srcs = ["test_dspark_swa.py"],
     main = "test_dspark_swa.py",

@@ -280,6 +280,30 @@ protected:
     }
 };
 
+TEST_F(CudaSamplerTest, testDSparkMapGather) {
+    auto ids_options = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+    auto w1_options  = torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA);
+    auto mapping     = torch::randperm(1024, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA));
+    auto w1          = torch::randn({1024, 256}, w1_options);
+    for (int64_t batch = 1; batch <= 50; ++batch) {
+        auto draft        = torch::randint(1024, {batch}, ids_options);
+        auto actual       = execDSparkMapGather(draft, mapping, w1);
+        auto expected_ids = mapping.index_select(0, draft.to(torch::kInt64)).to(torch::kInt32);
+        auto expected_w1  = w1.index_select(0, expected_ids.to(torch::kInt64));
+        EXPECT_TRUE(torch::equal(actual.first, expected_ids)) << batch;
+        EXPECT_TRUE(torch::equal(actual.second, expected_w1)) << batch;
+    }
+    auto invalid = torch::full({4}, -1, ids_options);
+    invalid[1].fill_(1024);
+    invalid[2].fill_(1025);
+    invalid[3].fill_(0);
+    auto bad_map = mapping.clone();
+    bad_map[0].fill_(1024);
+    auto actual = execDSparkMapGather(invalid, bad_map, w1);
+    EXPECT_TRUE(actual.first.eq(-1).all().item<bool>());
+    EXPECT_TRUE(actual.second.eq(0).all().item<bool>());
+}
+
 TEST_F(CudaSamplerTest, CompactVerifyRowsPreserveLiveSamplesAndDenseRng) {
     constexpr int64_t width = 8;
     for (int64_t vocab : {256, 200064}) {
@@ -366,7 +390,6 @@ TEST_F(CudaSamplerTest, CompactVerifyRowsPreserveLiveSamplesAndDenseRng) {
                         const auto delta = (live_full - live_compact).abs();
                         EXPECT_TRUE(torch::equal(live_full > 0, live_compact > 0));
                         EXPECT_LE(delta.sum(-1).max().item<float>(), 1e-6f);
-
                     }
                     EXPECT_TRUE(torch::equal(full.logits.index_select(0, rows), compact.logits.index_select(0, rows)));
                     EXPECT_TRUE(torch::allclose(compact_probs.sum(-1), torch::ones({dense_rows}, logits.options())));
@@ -491,6 +514,10 @@ TEST_F(CudaSamplerTest, CompactVerifyRowsPreserveCappedRejectionPrefix) {
                     const auto prefix = tokens[1][request].narrow(0, 0, count);
                     EXPECT_TRUE(torch::equal(tokens[0][request].narrow(0, 0, count), prefix));
                     EXPECT_TRUE(prefix.ge(0).logical_and(prefix.lt(vocab)).all().item<bool>());
+                    // CUDA sampled-draft rejection now writes final zero
+                    // padding itself, including early greedy mismatches.
+                    EXPECT_TRUE(tokens[0][request].ge(0).all().item<bool>());
+                    EXPECT_TRUE(tokens[1][request].ge(0).all().item<bool>());
                 }
             }
         }
@@ -976,10 +1003,10 @@ TEST_F(CudaSamplerTest, CompactHistoryRealVocab200064MixedDoSampleLong81920B80Pr
 TEST_F(CudaSamplerTest, LargeVocabTopKRenormMatchesIndependentThresholdReference) {
     constexpr int64_t vocab = 200064;
     for (int64_t batch : {int64_t{3}, int64_t{15}, int64_t{80}}) {
-        auto rows = torch::arange(batch, torch::kInt64).unsqueeze(1);
-        auto cols = torch::arange(vocab, torch::kInt64).unsqueeze(0);
-        auto logits = ((cols * 7 + rows * 3).remainder(31).to(torch::kFloat32) / 9.0f).cuda();
-        auto probs = torch::softmax(logits, -1);
+        auto       rows   = torch::arange(batch, torch::kInt64).unsqueeze(1);
+        auto       cols   = torch::arange(vocab, torch::kInt64).unsqueeze(0);
+        auto       logits = ((cols * 7 + rows * 3).remainder(31).to(torch::kFloat32) / 9.0f).cuda();
+        auto       probs  = torch::softmax(logits, -1);
         const auto stream = at::cuda::getCurrentCUDAStream().stream();
         for (int64_t top_k : {int64_t{1}, int64_t{8}, int64_t{1 << 30}}) {
             SCOPED_TRACE(::testing::Message() << "batch=" << batch << " top_k=" << top_k);
@@ -988,8 +1015,8 @@ TEST_F(CudaSamplerTest, LargeVocabTopKRenormMatchesIndependentThresholdReference
             auto filtered = probs;
             if (top_k < vocab) {
                 auto values = std::get<0>(torch::topk(probs, top_k, -1));
-                auto pivot = values.select(1, top_k - 1).unsqueeze(1);
-                filtered = torch::where(probs.ge(pivot), probs, torch::zeros_like(probs));
+                auto pivot  = values.select(1, top_k - 1).unsqueeze(1);
+                filtered    = torch::where(probs.ge(pivot), probs, torch::zeros_like(probs));
             }
             auto expected = filtered / filtered.sum(-1, true);
             for (int repeat = 0; repeat < 12; ++repeat) {

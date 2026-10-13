@@ -46,6 +46,8 @@ torch::Tensor sampleFromProbs(const torch::Tensor& probabilities);
 torch::Tensor dsparkSoftmax(const torch::Tensor& logits, torch::Tensor& workspace);
 torch::Tensor
 combineDSparkLogits(const torch::Tensor& base, const torch::Tensor& bias, const torch::Tensor& temperature);
+std::pair<torch::Tensor, torch::Tensor>
+dsparkMapGather(const torch::Tensor& draft_ids, const torch::Tensor& d2t_map, const torch::Tensor& markov_w1);
 torch::Tensor                           dsparkConfidence(const torch::Tensor& hidden,
                                                          const torch::Tensor& anchors,
                                                          const torch::Tensor& sampled_tokens,
@@ -817,6 +819,16 @@ execDSparkCombineLogits(const torch::Tensor& base, const torch::Tensor& bias, co
 #else
     auto result = base + bias.to(torch::kFloat32);
     return result.div_(temperature.unsqueeze(1));
+#endif
+}
+
+std::pair<torch::Tensor, torch::Tensor>
+execDSparkMapGather(const torch::Tensor& draft_ids, const torch::Tensor& d2t_map, const torch::Tensor& markov_w1) {
+#if USING_CUDA
+    return dsparkMapGather(draft_ids, d2t_map, markov_w1);
+#else
+    auto target = d2t_map.index_select(0, draft_ids.to(torch::kLong)).to(torch::kInt32);
+    return {target, markov_w1.index_select(0, target.to(torch::kLong))};
 #endif
 }
 

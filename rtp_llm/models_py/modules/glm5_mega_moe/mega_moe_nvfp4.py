@@ -331,7 +331,6 @@ class GLM5MegaMoENVFP4(GLM5MegaMoE):
                     "_shared_l1_sf",
                     "_shared_l2_w",
                     "_shared_l2_sf",
-                    "_shared_input_sf",
                 )
                 if (tensor := getattr(self, name, None)) is not None
             )

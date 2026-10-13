@@ -55,14 +55,16 @@ class NVFP4InputPackerTest(unittest.TestCase):
                 model.cfg = SimpleNamespace(
                     n_routed_experts=128, n_activated_experts=topk
                 )
-                # Isolate shared packing; routed NVFP4 numerics are checked below.
-                model._input_packer = SimpleNamespace(pack=Mock())
-                model._shared_input_sf = torch.empty(
-                    (capacity, hidden // 128), dtype=torch.int32, device="cuda"
-                )
                 buf = SimpleNamespace(
                     group=SimpleNamespace(size=lambda: 2),
                     num_max_tokens_per_rank=capacity,
+                    x=torch.empty(
+                        (capacity, hidden // 2), dtype=torch.int8, device="cuda"
+                    ),
+                    x_sf=torch.empty(
+                        (capacity, hidden // 64), dtype=torch.int32, device="cuda"
+                    ),
+                    x_gsf=torch.empty((capacity,), dtype=torch.float32, device="cuda"),
                     shared_l1_acts=torch.empty(
                         (capacity, hidden), dtype=torch.float8_e4m3fn, device="cuda"
                     ),

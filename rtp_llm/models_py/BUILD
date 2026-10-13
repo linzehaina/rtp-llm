@@ -81,6 +81,20 @@ py_test(
     exec_properties = {"gpu": "SM100_X86", "gpu_count": "1"},
 )
 
+py_test(
+    name = "test_nvfp4_se_input_packer",
+    srcs = ["modules/glm5_mega_moe/test_nvfp4_se_input_packer.py"],
+    main = "modules/glm5_mega_moe/test_nvfp4_se_input_packer.py",
+    deps = [
+        ":modules",
+        "//rtp_llm/models_py/standalone:py_standalone_testlib",
+        "//rtp_llm:deep_gemm",
+    ],
+    env = {"GPU_COUNT": "1"},
+    tags = ["SM100_X86"],
+    exec_properties = {"gpu": "SM100_X86", "gpu_count": "1"},
+)
+
 filegroup(
     name = "cutlass_moe_config",
     srcs = glob(["kernels/cuda/fp8_kernel/cutlass_groupgemm/*"]),

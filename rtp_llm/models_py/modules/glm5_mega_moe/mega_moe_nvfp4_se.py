@@ -7,11 +7,6 @@ from typing import Any, Dict, Optional
 
 import torch
 
-from .input_packer_triton import (
-    fused_pack_mega_moe_inputs,
-    stage_shared_expert_input_scales,
-)
-from .mega_buf import get_or_create_mega_output
 from .mega_moe import GLM5MegaMoeCfg
 from .mega_moe_nvfp4 import GLM5MegaMoENVFP4
 from .quant_layouts import MXFP8_BLOCK, prepare_fp8_weight_scale_for_deepgemm
@@ -29,7 +24,6 @@ class GLM5MegaMoENVFP4SE(GLM5MegaMoENVFP4):
         self._shared_l1_sf: Optional[torch.Tensor] = None
         self._shared_l2_w: Optional[torch.Tensor] = None
         self._shared_l2_sf: Optional[torch.Tensor] = None
-        self._shared_input_sf: Optional[torch.Tensor] = None
 
     def _setup_buffer_and_warmup(self) -> None:
         # The wrapper installs routed weights first. Rendezvous only after the
@@ -37,15 +31,6 @@ class GLM5MegaMoENVFP4SE(GLM5MegaMoENVFP4):
         if self._num_shared_experts == 0:
             return
         super()._setup_buffer_and_warmup()
-
-    def _maybe_warmup_jit_once(self) -> None:
-        self._shared_input_sf = get_or_create_mega_output(
-            self._mega_buf.num_max_tokens_per_rank,
-            self.cfg.dim // (4 * MXFP8_BLOCK),
-            torch.int32,
-            self._mega_l1_w.device,
-        )
-        super()._maybe_warmup_jit_once()
 
     def setup_shared_expert_from_fp8(
         self,
@@ -115,19 +100,9 @@ class GLM5MegaMoENVFP4SE(GLM5MegaMoENVFP4):
     def _pack_inputs(self, x, weights, indices, tokens: int) -> None:
         import deep_gemm
 
-        super()._pack_inputs(x, weights, indices, tokens)
+        from .mega_nvfp4_se_input_packer_triton import fused_pack_mega_nvfp4_se_inputs
+
         buf = self._mega_buf
-        # Quantize the original BF16 input a second time, to MXFP8 K32. Routed
-        # buf.x_sf contains UE4M3 K16 and cannot serve as the shared input SF.
-        fused_pack_mega_moe_inputs(
-            x,
-            weights,
-            indices,
-            buf.shared_l1_acts[:tokens],
-            self._shared_input_sf[:tokens],
-            buf.topk_idx[:tokens],
-            buf.topk_weights[:tokens],
-        )
         block_m = deep_gemm.get_block_m_for_mega_moe_nvfp4(
             int(buf.group.size()),
             self.cfg.n_routed_experts,
@@ -135,11 +110,9 @@ class GLM5MegaMoENVFP4SE(GLM5MegaMoENVFP4):
             tokens,
             self.cfg.n_activated_experts,
         )
-        # Clear scale padding only; the kernel owns its communication signals.
-        buf.shared_l1_acts_sf.zero_()
-        stage_shared_expert_input_scales(
-            self._shared_input_sf[:tokens], buf.shared_l1_acts_sf, tokens, block_m
-        )
+        # One launch writes NVFP4 K16, MXFP8 K32, routes and the final shared SF
+        # layout. It also clears inactive SF rows in every consumed block, without touching signals.
+        fused_pack_mega_nvfp4_se_inputs(x, weights, indices, buf, tokens, block_m)
 
     def _fused_shared_expert_kwargs(self, tokens: int) -> Dict[str, Any]:
         if self._num_shared_experts != 1 or any(
@@ -164,7 +137,4 @@ class GLM5MegaMoENVFP4SE(GLM5MegaMoENVFP4):
         clone._shared_l1_sf = self._shared_l1_sf
         clone._shared_l2_w = self._shared_l2_w
         clone._shared_l2_sf = self._shared_l2_sf
-        # Like the symmetric workspace, staging scratch is reused serially by
-        # layers and graph clones. No new collective allocation during cloning.
-        clone._shared_input_sf = self._shared_input_sf
         return clone

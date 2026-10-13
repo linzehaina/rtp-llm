@@ -91,6 +91,11 @@ private:
         int64_t                       schedule_time_us = 0;
         RtpLLMExecutorMetricsCollector executor_collector;
 
+        /** Keep both reporters active across process calls until this batch's result is handled. */
+        MetricsLoopReporter<RtpLLMTokenPSMetrics, RtpLLMTokenPSMetricsCollector>::ActiveGuard tps_active_guard;
+        WallClockMetricsLoopReporter<RtpLLMWallClockTokenPSMetrics, RtpLLMTokenPSMetricsCollector>::ActiveGuard
+            wall_tps_active_guard;
+
         PPTickets plan_sends;
         PPTickets activation_sends;
         PPTickets execution_result_sends;

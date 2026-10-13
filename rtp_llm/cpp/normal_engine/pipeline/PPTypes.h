@@ -95,6 +95,9 @@ struct PPExecutionPlan {
 
 /** Final outputs produced by the lm-head stage TP root. */
 struct PPExecutionResult {
+    /** Last-stage ordinary sampler input preparation and forward call, excluding result packing. */
+    int64_t sample_input_us = 0;
+
     torch::Tensor request_ids;  // [stream_count]
     /** New tokens to append: CPU int32 [B, 1], or [B, K+1] for verify. */
     torch::Tensor new_token_ids;

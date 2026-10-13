@@ -145,11 +145,13 @@ TEST_F(PPSerializationTest, ResultRoundTripPreservesMixedRequestErrors) {
 
 TEST_F(PPSerializationTest, ResultWireLayoutOmitsSourceDevice) {
     PPExecutionResult result;
+    result.sample_input_us = 1234567890123;
     result.request_ids = torch::tensor({101, 202}, torch::kInt64);
 
     /** Fix the protocol layout independently of the shared read/write field traversal. */
     std::vector<uint8_t> expected;
-    appendWireValue<uint32_t>(expected, 20);
+    appendWireValue<uint32_t>(expected, 21);
+    appendWireValue<int64_t>(expected, 1234567890123);
     appendWireValue<uint8_t>(expected, 1);
     appendWireValue<uint8_t>(expected, 1);
     appendWireValue<int64_t>(expected, 2);
@@ -165,6 +167,7 @@ TEST_F(PPSerializationTest, ResultWireLayoutOmitsSourceDevice) {
 
     EXPECT_TRUE(torch::equal(pp_serialization::serializeExecutionResult(result), payload));
     const auto received = pp_serialization::deserializeExecutionResult(payload);
+    EXPECT_EQ(received.sample_input_us, result.sample_input_us);
     EXPECT_TRUE(torch::equal(received.request_ids, result.request_ids));
     EXPECT_FALSE(received.new_token_ids.defined());
     EXPECT_TRUE(received.prompt_logits.empty());
@@ -181,7 +184,7 @@ TEST_F(PPSerializationTest, MetadataOnlyPlanWireLayoutKeepsShutdownInHeader) {
     plan.finished_request_ids = {101};
 
     std::vector<uint8_t> expected;
-    appendWireValue<uint32_t>(expected, 20);
+    appendWireValue<uint32_t>(expected, 21);
     appendWireValue<uint8_t>(expected, 1);
     appendWireValue<uint8_t>(expected, 1);
     appendWireValue<uint64_t>(expected, 2);
@@ -199,7 +202,7 @@ TEST_F(PPSerializationTest, MetadataOnlyPlanWireLayoutKeepsShutdownInHeader) {
 }
 
 TEST_F(PPSerializationTest, PreviousProtocolVersionIsRejectedForEveryMessageType) {
-    const uint32_t old_version = 19;
+    const uint32_t old_version = 20;
     for (bool metadata_only : {false, true}) {
         auto payload = pp_serialization::serializePlan(PPExecutionPlan{}, metadata_only);
         std::memcpy(payload.data_ptr(), &old_version, sizeof(old_version));
@@ -328,6 +331,7 @@ TEST_F(PPSerializationTest, MixedReturnSequencesPlanAndResultRoundTrip) {
     EXPECT_EQ(received_config.cross_seq_diverge_start_combo, processor_config.cross_seq_diverge_start_combo);
 
     PPExecutionResult result;
+    result.sample_input_us = 1234567890123;
     result.request_ids = sampling_plan.request_ids;
     result.new_token_ids     = torch::tensor({{10}, {11}, {12}}, torch::kInt32);
     result.new_token_lengths = torch::ones({3}, torch::kInt32);
@@ -339,6 +343,7 @@ TEST_F(PPSerializationTest, MixedReturnSequencesPlanAndResultRoundTrip) {
 
     const auto round_trip_result =
         pp_serialization::deserializeExecutionResult(pp_serialization::serializeExecutionResult(result));
+    EXPECT_EQ(round_trip_result.sample_input_us, result.sample_input_us);
     EXPECT_TRUE(torch::equal(round_trip_result.request_ids, result.request_ids));
     EXPECT_TRUE(torch::equal(round_trip_result.new_token_ids, result.new_token_ids));
     EXPECT_TRUE(torch::equal(round_trip_result.new_token_lengths, result.new_token_lengths));
@@ -401,6 +406,7 @@ TEST_F(PPSerializationTest, ResultRoundTripPreservesPromptLogitsAndHiddenStates)
 
     const auto round_trip =
         pp_serialization::deserializeExecutionResult(pp_serialization::serializeExecutionResult(result));
+    EXPECT_EQ(round_trip.sample_input_us, 0);
     EXPECT_TRUE(torch::equal(round_trip.request_ids, result.request_ids));
     EXPECT_TRUE(torch::equal(round_trip.new_token_ids, result.new_token_ids));
     EXPECT_TRUE(torch::equal(round_trip.hidden_states, result.hidden_states));

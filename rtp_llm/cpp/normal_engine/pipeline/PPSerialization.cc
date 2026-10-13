@@ -10,7 +10,7 @@ namespace rtp_llm::pp_serialization {
 namespace {
 
 /** Bump when any payload layout changes; all PP peers must use the same version. */
-constexpr uint32_t kVersion = 20;
+constexpr uint32_t kVersion = 21;
 
 struct ByteWriter {
     std::vector<uint8_t> buf;
@@ -331,6 +331,7 @@ void promptLogitsOutputFields(IO& io, Output& output) {
 
 template<typename IO, typename Result>
 void executionResultFields(IO& io, Result& result) {
+    io.template scalar<int64_t>(result.sample_input_us);
     io.tensor(result.request_ids);
     io.tensor(result.new_token_ids);
     io.tensor(result.new_token_lengths);

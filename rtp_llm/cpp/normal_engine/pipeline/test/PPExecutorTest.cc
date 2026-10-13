@@ -22,6 +22,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -32,6 +33,8 @@
 #include <torch/extension.h>
 #include "torch/all.h"
 #include "autil/TimeUtility.h"
+#include "kmonitor/client/common/MinMaxCalculator.h"
+#include "kmonitor/client/core/MetricsCollector.h"
 
 #define private public
 #define protected public
@@ -1253,6 +1256,7 @@ TEST_F(PPExecutorTest, FirstEmptyPlansDrainEachBatchOnceAcrossSlotWraparound) {
             params.parallelism_config.world_size = pp_size;
             params.parallelism_config.pp_stage_layer_counts.assign(pp_size, 1);
             PPExecutor executor(params, nullptr, false);
+            enableMetrics(executor);
             auto* wire = attachTransport(executor);
             auto* recorded = installModel<RecordingDraftModel>(executor);
             std::vector<GenerateStreamPtr> streams;
@@ -1288,6 +1292,9 @@ TEST_F(PPExecutorTest, FirstEmptyPlansDrainEachBatchOnceAcrossSlotWraparound) {
                 }
                 EXPECT_EQ(recorded->inputs.size(), std::min(round + 1, batches));
                 const int returned = std::clamp(round - pp_size + 1, 0, batches);
+                const int pending  = std::min(round + 1, batches) - returned;
+                EXPECT_EQ(executor.tps_reporter_.active_count_, pending);
+                EXPECT_EQ(executor.wall_tps_reporter_.active_count_, pending);
                 EXPECT_EQ(wire->receive_index, 2u * returned);
                 for (int index = 0; index < std::min(round + 1, batches); ++index) {
                     EXPECT_EQ(streams[index]->isPPInflight(), index >= returned);
@@ -1504,16 +1511,23 @@ TEST_F(PPExecutorTest, FirstExplicitDrainPreservesOrderAcrossWrapsAndServingOver
 TEST_F(PPExecutorTest, FirstConsumedInvalidResultIsNotReceivedAgain) {
     auto params = makeStageParams(0);
     PPExecutor executor(params, nullptr, false);
+    enableMetrics(executor);
     auto* wire = attachTransport(executor);
     auto stream = makeStream(ResourceContext{}, params.model_config_, 101, {1, 2}, 1);
     auto& batch = executor.slots_[0];
-    batch.result_pending = true;
-    batch.stream_groups = StreamGroups({stream});
+    batch.result_pending        = true;
+    batch.stream_groups         = StreamGroups({stream});
+    batch.tps_active_guard      = executor.tps_reporter_.makeActiveGuard();
+    batch.wall_tps_active_guard = executor.wall_tps_reporter_.makeActiveGuard();
+    ASSERT_EQ(executor.tps_reporter_.active_count_, 1);
+    ASSERT_EQ(executor.wall_tps_reporter_.active_count_, 1);
     stream.reset();
     /** A deserialized but invalid result has already consumed its wire message. */
     wire->enqueueObject(pp_serialization::serializeExecutionResult(PPExecutionResult{}));
     EXPECT_THROW((void)executor.drainPendingResults(), std::exception);
     EXPECT_FALSE(batch.result_pending);
+    EXPECT_EQ(executor.tps_reporter_.active_count_, 0);
+    EXPECT_EQ(executor.wall_tps_reporter_.active_count_, 0);
     EXPECT_EQ(wire->receive_index, 2u);
     EXPECT_TRUE(executor.drainPendingResults().ok());
     EXPECT_EQ(wire->receive_index, 2u);
@@ -1923,6 +1937,56 @@ TEST_F(PPExecutorTest, MiddleStageDecodesCacheUpdateMappingByGroup) {
 }
 
 /** First-stage result metrics: preserve batch ownership and the existing counting semantics. */
+TEST_F(PPExecutorTest, FirstPendingBatchKeepsTpsActiveAcrossEmptyRoundsAndExplicitDrain) {
+    for (int pp_size : {2, 3, 4}) {
+        SCOPED_TRACE(pp_size);
+        auto params                          = makeStageParams(0);
+        params.model_config_.num_layers      = pp_size;
+        params.parallelism_config.pp_size    = pp_size;
+        params.parallelism_config.world_size = pp_size;
+        params.parallelism_config.pp_stage_layer_counts.assign(pp_size, 1);
+        PPExecutor executor(params, nullptr, false);
+        enableMetrics(executor);
+        auto* wire = attachTransport(executor);
+        installModel<RecordingDraftModel>(executor);
+
+        auto stream = makeStream(ResourceContext{}, params.model_config_, 101, {1, 2}, 1);
+        stream->setPPInflight();
+        wire->enqueueObject(pp_serialization::serializeExecutionResult(makeSingleTokenResult(101, 20)));
+        ScheduleOutput schedule;
+        schedule.streams = {stream};
+        ASSERT_TRUE(executor.process(schedule).ok());
+
+        /** The reporters have no completed sample yet. Zero active count here would emit an idle zero. */
+        auto expect_pending_active = [&]() {
+            EXPECT_TRUE(stream->isPPInflight());
+            EXPECT_FALSE(executor.tps_reporter_.collector_.hasMetrics());
+            EXPECT_FALSE(executor.wall_tps_reporter_.collector_.hasMetrics());
+            EXPECT_GT(executor.tps_reporter_.active_count_, 0);
+            EXPECT_GT(executor.wall_tps_reporter_.active_count_, 0);
+        };
+        expect_pending_active();
+        for (int round = 1; round < pp_size; ++round) {
+            ASSERT_TRUE(executor.process(ScheduleOutput{}).ok());
+            expect_pending_active();
+        }
+
+        ASSERT_TRUE(executor.drainPendingResults().ok());
+        EXPECT_FALSE(stream->isPPInflight());
+        EXPECT_EQ(stream->completeTokenIdsVec(0).back(), 20);
+        EXPECT_EQ(executor.tps_reporter_.active_count_, 0);
+        EXPECT_EQ(executor.wall_tps_reporter_.active_count_, 0);
+        EXPECT_TRUE(executor.tps_reporter_.collector_.hasMetrics());
+        EXPECT_TRUE(executor.wall_tps_reporter_.collector_.hasMetrics());
+
+        /** Repeated drain and slot reuse must neither reactivate a completed batch nor underflow the count. */
+        ASSERT_TRUE(executor.drainPendingResults().ok());
+        ASSERT_TRUE(executor.process(ScheduleOutput{}).ok());
+        EXPECT_EQ(executor.tps_reporter_.active_count_, 0);
+        EXPECT_EQ(executor.wall_tps_reporter_.active_count_, 0);
+    }
+}
+
 TEST_F(PPExecutorTest, FirstFakeResultIsConsumedWithoutDispatchOrMetrics) {
     auto params = makeMtpParams(3);
     PPExecutor executor(params, nullptr, false);
@@ -2078,6 +2142,79 @@ TEST_F(PPExecutorTest, FirstReturnedAcceptanceSurvivesBudgetClippingAndCancellat
     }
 }
 
+TEST_F(PPExecutorTest, GrammarMetricsUseLegacySeriesOnlyOnFirstStageTpRoot) {
+    std::vector<std::string> vocab;
+    for (int i = 0; i < 128; ++i) {
+        vocab.emplace_back(1, static_cast<char>(i));
+    }
+    const auto tokenizer_json =
+        xgrammar::TokenizerInfo(vocab, xgrammar::VocabType::RAW, 128, std::vector<int32_t>{0}).SerializeJSON();
+    struct TestCase {
+        int  world_rank;
+        bool warmup;
+        bool reports;
+    };
+    // PP=3, TP=2, DP=2: both first-stage DP roots, a TP peer, middle/tail roots and warmup.
+    for (const auto& test_case : {TestCase{0, false, true}, TestCase{2, false, true}, TestCase{1, false, false},
+                                 TestCase{4, false, false}, TestCase{8, false, false}, TestCase{0, true, false}}) {
+        SCOPED_TRACE(testing::Message() << "world_rank=" << test_case.world_rank << ", warmup=" << test_case.warmup);
+        auto params                               = makeStageParams(test_case.world_rank / 4);
+        params.parallelism_config.tp_size         = 2;
+        params.parallelism_config.dp_size         = 2;
+        params.parallelism_config.world_size      = 12;
+        params.parallelism_config.world_rank      = test_case.world_rank;
+        params.parallelism_config.dp_rank         = (test_case.world_rank % 4) / 2;
+        params.parallelism_config.tp_rank         = test_case.world_rank % 2;
+        params.grammar_config.tokenizer_info_json = tokenizer_json;
+        params.grammar_config.num_workers         = 1;
+        params.grammar_config.compile_timeout_ms  = 30000;
+        auto monitor = std::make_shared<kmonitor::KMonitor>("pp_grammar_metrics_test");
+        monitor->SetServiceName("");
+        const kmonitor::MetricsTags tags("dp_rank", std::to_string(params.parallelism_config.dp_rank));
+        params.metrics_reporter = std::make_shared<kmonitor::MetricsReporter>(monitor, "", tags);
+        PPExecutor executor(params, nullptr, test_case.warmup);
+        auto backend = LogitsProcessorFactory::grammarBackend();
+        ASSERT_NE(backend, nullptr);
+
+        std::set<std::string> suffixes = {"overload_qps", "compile_inflight", "verdict_cache_bytes",
+                                         "total_cache_budget_bytes", "compiler_cache_budget_bytes",
+                                         "verdict_cache_budget_bytes"};
+        if (test_case.world_rank == 0 && !test_case.warmup) {
+            // Exercise the full event chain once; other configurations only check reporter routing.
+            for (int attempt = 0; attempt < 2; ++attempt) {
+                ASSERT_TRUE(backend->createMatcherFromKey({"regex", "[ab]+"}).ok());
+                ASSERT_FALSE(backend->createMatcherFromKey({"json", "{"}).ok());
+            }
+            EXPECT_EQ(backend->stats().compile_total, 2);
+            EXPECT_EQ(backend->stats().cache_hit, 1);
+            EXPECT_EQ(backend->stats().invalid_hit, 1);
+            suffixes.insert({"compile_qps", "compile_invalid_qps", "cache_hit_qps", "compile_latency_us"});
+        }
+        backend->reportOverload();
+
+        std::set<std::string> expected;
+        if (test_case.reports) {
+            for (const auto& suffix : suffixes) {
+                expected.insert("rtp_llm_grammar_" + suffix);
+            }
+        }
+        kmonitor::MetricsCollector snapshot;
+        monitor->GetMetrics(&snapshot, {kmonitor::NORMAL}, 10000);
+        std::set<std::string> seen;
+        for (const auto* record : snapshot.GetRecords().getRecords()) {
+            for (const auto* value : record->Values()) {
+                if (value->Name().find("grammar_") == std::string::npos) {
+                    continue;
+                }
+                EXPECT_TRUE(seen.insert(value->Name()).second);
+                EXPECT_EQ(record->Tags()->FindTag("pp_rank"), "");
+                EXPECT_EQ(record->Tags()->FindTag("dp_rank"), tags.FindTag("dp_rank"));
+            }
+        }
+        EXPECT_EQ(seen, expected);
+    }
+}
+
 TEST_F(PPExecutorTest, FirstResultMetricsAreRestrictedToItsTpRootInEachDpReplica) {
     for (int world_rank = 0; world_rank < 12; ++world_rank) {
         SCOPED_TRACE(world_rank);
@@ -2196,7 +2333,30 @@ TEST_F(PPExecutorTest, FirstInflightMetricsStayWithTheirBatchThroughExecutionAnd
     auto cache = std::make_shared<KVCacheManager>(test::makeSimpleMhaCacheConfig(2, 16, 4, DataType::TYPE_FP16));
     ASSERT_TRUE(cache->init());
     PPExecutor executor(params, cache, false);
-    enableMetrics(executor);
+    auto monitor = std::make_shared<kmonitor::KMonitor>("pp_sampling_metrics_test");
+    monitor->SetServiceName("");
+    kmonitor::MetricsTags base_tags("dp_rank", "0");
+    executor.metrics_reporter_ = std::make_shared<kmonitor::MetricsReporter>(monitor, "", base_tags);
+    int64_t snapshot_time_ms = 0;
+    auto expect_sampling_metric = [&](int64_t duration) {
+        kmonitor::MetricsCollector snapshot;
+        monitor->GetMetrics(&snapshot, {kmonitor::NORMAL}, snapshot_time_ms += 10000);
+        size_t samples = 0;
+        for (const auto* record : snapshot.GetRecords().getRecords()) {
+            for (const auto* value : record->Values()) {
+                if (value->Name() != "rtp_llm_sample_input_us") {
+                    continue;
+                }
+                ++samples;
+                EXPECT_EQ(record->Tags()->FindTag("dp_rank"), "0");
+                EXPECT_EQ(record->Tags()->FindTag("pp_rank"), "");
+                kmonitor::MinMaxCalculator expected;
+                expected.Add(duration);
+                EXPECT_EQ(value->Value(), expected.ToString());
+            }
+        }
+        EXPECT_EQ(samples, duration > 0 ? 1u : 0u);
+    };
     executor.setModel(std::make_unique<RecordingDraftModel>());
     auto transport = std::make_unique<InMemoryPPTransport>();
     ResourceContext resources;
@@ -2225,6 +2385,7 @@ TEST_F(PPExecutorTest, FirstInflightMetricsStayWithTheirBatchThroughExecutionAnd
     prefill_result.request_ids       = torch::tensor({202}, torch::kInt64);
     prefill_result.new_token_ids     = intTensor({14}).reshape({1, 1});
     prefill_result.new_token_lengths = intTensor({1});
+    prefill_result.sample_input_us   = 456;
     for (const auto& result : {decode_result, prefill_result}) {
         transport->enqueueObject(pp_serialization::serializeExecutionResult(result));
     }
@@ -2246,10 +2407,13 @@ TEST_F(PPExecutorTest, FirstInflightMetricsStayWithTheirBatchThroughExecutionAnd
     EXPECT_EQ(prefill->seqLength(), 3);
     EXPECT_EQ(retired.executor_collector.generate_batch_size, 1);
     EXPECT_EQ(retired.executor_collector.model_forward_us, 123);
+    EXPECT_EQ(retired.executor_collector.sample_input_us, 0);
+    expect_sampling_metric(0);
     const auto& admitted = executor.slots_[0];
     EXPECT_EQ(admitted.schedule_time_us, schedule_time);
     EXPECT_EQ(admitted.executor_collector.context_batch_size, 1);
     EXPECT_EQ(admitted.executor_collector.generate_batch_size, 0);
+    EXPECT_EQ(admitted.executor_collector.sample_input_us, 0);
     EXPECT_EQ(admitted.executor_collector.execute_token_size, 3);
     EXPECT_EQ(admitted.executor_collector.context_batch_size_when_has_context, 1);
     EXPECT_EQ(admitted.executor_collector.execute_token_size_when_has_context, 3);
@@ -2262,10 +2426,14 @@ TEST_F(PPExecutorTest, FirstInflightMetricsStayWithTheirBatchThroughExecutionAnd
     EXPECT_EQ(retired.executor_collector.generate_batch_size, 0);
     EXPECT_EQ(retired.executor_collector.model_forward_us, 0);
     EXPECT_EQ(retired.executor_collector.dispatch_output_us, 0);
+    EXPECT_EQ(retired.executor_collector.sample_input_us, 0);
+    expect_sampling_metric(0);
     EXPECT_EQ(executor.tps_reporter_.collector_.generateTPS(), 4);
     EXPECT_EQ(executor.tps_reporter_.collector_.totalTPS(), 4);
     ASSERT_TRUE(executor.process(ScheduleOutput{}).ok());
     EXPECT_EQ(prefill->seqLength(), 4);
+    EXPECT_EQ(admitted.executor_collector.sample_input_us, 456);
+    expect_sampling_metric(456);
     EXPECT_EQ(admitted.executor_collector.context_batch_size, 1);
     EXPECT_EQ(admitted.executor_collector.execute_token_size, 3);
     EXPECT_EQ(executor.tps_reporter_.collector_.generateTPS(), 4);
@@ -2277,6 +2445,8 @@ TEST_F(PPExecutorTest, FirstInflightMetricsStayWithTheirBatchThroughExecutionAnd
     EXPECT_EQ(admitted.executor_collector.context_batch_size, 0);
     EXPECT_EQ(admitted.executor_collector.execute_token_size, 0);
     EXPECT_EQ(admitted.executor_collector.context_batch_size_when_has_context, 0);
+    EXPECT_EQ(admitted.executor_collector.sample_input_us, 0);
+    expect_sampling_metric(0);
     EXPECT_EQ(executor.tps_reporter_.collector_.totalTPS(), 7);
     EXPECT_EQ(executor.wall_tps_reporter_.collector_.totalTPS(), 7);
 }
@@ -2428,6 +2598,7 @@ TEST_F(PPExecutorTest, LastSamplesAcrossRoundsWithoutReinitializingRequestState)
     ASSERT_TRUE(executor.process(ScheduleOutput{}).ok());
     ASSERT_EQ(wire->sent_tensors.size(), 2u);
     auto first = lastResult(*wire);
+    EXPECT_GT(first.sample_input_us, 0);
     EXPECT_EQ(tensorToVector<int32_t>(first.new_token_ids), (std::vector<int32_t>{7, 8}));
     EXPECT_TRUE(torch::equal(first.all_hidden_states, recorded->hidden_buffer.narrow(1, 0, 2).cpu()));
     EXPECT_TRUE(recorded->hidden_requests.empty());
@@ -2447,6 +2618,7 @@ TEST_F(PPExecutorTest, LastSamplesAcrossRoundsWithoutReinitializingRequestState)
     ASSERT_TRUE(executor.process(ScheduleOutput{}).ok());
     ASSERT_EQ(wire->sent_tensors.size(), 4u);
     const auto result = lastResult(*wire);
+    EXPECT_GT(result.sample_input_us, 0);
     EXPECT_EQ(tensorToVector<int32_t>(result.new_token_ids), (std::vector<int32_t>{11, 21}));
     EXPECT_EQ(executor.sampling_states_.at(101).generator, generator);
     EXPECT_EQ(generator.current_seed(), 123);
@@ -2632,6 +2804,7 @@ TEST_F(PPExecutorTest, LastOrdinaryAllFailedRequestsStillSendTheirErrors) {
     ASSERT_EQ(wire->sent_tensors.size(), 2u);
     const auto result = lastResult(*wire);
     ASSERT_EQ(result.request_errors.size(), 2u);
+    EXPECT_GT(result.sample_input_us, 0);
     for (const auto& returned : result.request_errors) {
         EXPECT_EQ(returned.ToString(), error.ToString());
     }
@@ -3173,6 +3346,7 @@ TEST_F(PPExecutorTest, LastVerifyKeepsAcceptanceForDraftWhileCappingStateUpdates
             first->on_update = [&] { EXPECT_EQ(draft_inputs->size(), forwards); };
             ASSERT_TRUE(executor.process(ScheduleOutput{}).ok());
             const auto result = lastResult(*wire);
+            EXPECT_EQ(result.sample_input_us, 0);
             EXPECT_EQ(tensorToVector<int32_t>(result.new_token_lengths), (std::vector<int32_t>{1, width + 1}));
             const auto accepted = torch::arange(21, 22 + width, torch::kInt32);
             EXPECT_TRUE(torch::equal(result.new_token_ids[1], accepted));
@@ -3297,6 +3471,7 @@ TEST_F(PPExecutorTest, LastOrdinaryFakeReturnsAResultButShutdownSkipsTargetAndDr
             ASSERT_EQ(wire->sent_tensors.size(), 2u);
             EXPECT_TRUE(executor.sampling_states_.empty());
             const auto result = lastResult(*wire);
+            EXPECT_EQ(result.sample_input_us, 0);
             const int token_count = draft_inputs && decode ? 4 : 1;
             EXPECT_EQ(result.new_token_ids.sizes().vec(), (std::vector<int64_t>{1, token_count}));
             EXPECT_EQ(result.new_token_lengths.item<int32_t>(), token_count);

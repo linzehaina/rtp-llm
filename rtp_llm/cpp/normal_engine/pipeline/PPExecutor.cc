@@ -121,6 +121,8 @@ GenerateStreamPtr PPExecutor::createMinFakeDecodeStream(const ModelConfig&      
 }
 
 void PPExecutor::InflightBatch::reset() {
+    tps_active_guard      = {};
+    wall_tps_active_guard = {};
     result_pending     = false;
     stream_groups      = StreamGroups();
     schedule_time_us   = 0;
@@ -224,6 +226,9 @@ void PPExecutor::waitAll(PPTickets& tickets) {
 }
 
 absl::Status PPExecutor::processExecutionResult(InflightBatch& batch) {
+    /** Release activity after reporting, including dispatch failures and receive exceptions. */
+    auto tps_active_guard      = std::move(batch.tps_active_guard);
+    auto wall_tps_active_guard = std::move(batch.wall_tps_active_guard);
     /** Fake batches still complete the PP round trip before their result is discarded. */
     PPExecutionResult result;
     {
@@ -248,6 +253,7 @@ absl::Status PPExecutor::processExecutionResult(InflightBatch& batch) {
         batch.executor_collector.dispatch_output_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
     }
 
+    batch.executor_collector.sample_input_us = result.sample_input_us;
     reportResultMetrics(batch, token_counts_by_priority, sp_collector);
     return absl::OkStatus();
 }
@@ -509,13 +515,21 @@ PPExecutor::PPExecutor(const EngineInitParams&                params,
                                                                        cache_config,
                                                                        warm_up_,
                                                                        params.sp_config.type);
-    LogitsProcessorFactory::init(params.model_config_, params.grammar_config, params.sp_config.tree_decode_config);
+    LogitsProcessorFactory::init(params.model_config_,
+                                 params.grammar_config,
+                                 params.sp_config.tree_decode_config,
+                                 isFirstStage() && isStageRoot() && !warm_up_ ? metrics_reporter_ : nullptr);
     cudaProfilerBegin();
 }
 
 PPExecutor::~PPExecutor() {
     /** Finish local model-buffer consumers before destroying the models. */
     last_compute_done_.synchronize();
+    /** Reporters are destroyed before slots_; release guards while their reporters are still alive. */
+    for (auto& slot : slots_) {
+        slot.tps_active_guard      = {};
+        slot.wall_tps_active_guard = {};
+    }
     cudaProfilerEnd();
 }
 
@@ -869,9 +883,11 @@ void PPExecutor::sampleTokens(const PPExecutionPlan& plan,
         verifyDraftTokens(plan, model_output.logits, target_sampler_output, sp_output);
         batch_stream_processor_->fillExecutionResult(plan, model_output, target_sampler_output, sp_output, result);
     } else {
+        const auto start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
         auto inputs = batch_stream_processor_->gatherSamplerInputs(
             plan.sampling_plan, plan.output_config, model_output.logits, sampling_states_);
         const auto sampler_output = sampler_->forward(inputs);
+        result.sample_input_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
         batch_stream_processor_->fillExecutionResult(plan, model_output, sampler_output, result);
     }
 }
@@ -1351,6 +1367,12 @@ absl::Status PPExecutor::processImpl(const ScheduleOutput& schedule_output, int6
         }
     }
 
+    /** A submitted real batch remains active even when later rounds contain only empty or fake plans. */
+    if (report_active && inflight.result_pending && !inflight.stream_groups.isFakeStream()) {
+        inflight.tps_active_guard      = std::move(tps_active_guard);
+        inflight.wall_tps_active_guard = std::move(wall_tps_active_guard);
+    }
+
     current_slot_ = (current_slot_ + 1) % slots_.size();
 
     /** 6. recv the execution result of next batch and process it. */
@@ -1442,8 +1464,9 @@ void PPExecutor::reportResultMetrics(InflightBatch&                             
         return;
     }
 
-    /** Executor timings cover only first-stage local work and result dispatch; last-stage sampling is omitted.
-     * TODO: Aggregate costs for the same batch across PP stages, including target and draft forward work. */
+    /** Executor timings cover first-stage local work, returned last-stage sampling and result dispatch.
+     * TODO: Add stage-local forward (including tail draft), TP sync, EPLB and grammar metrics in a
+     * separate change. Keep legacy metrics on the first stage without cross-stage aggregation. */
     metrics_reporter_->report<RtpLLMExecutorMetrics, RtpLLMExecutorMetricsCollector>(nullptr, &batch.executor_collector);
 
     int64_t generate_tokens = 0;

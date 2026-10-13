@@ -51,6 +51,8 @@ private:
 
     std::list<GenerateStreamPtr> evaluateRunningStreams();
 
+    void resetAdmissionMetrics();
+
     void admitWaitingStreams(std::list<GenerateStreamPtr>& scheduled_streams);
 
     void initScheduleRuntime(const std::list<GenerateStreamPtr>& scheduled_streams,

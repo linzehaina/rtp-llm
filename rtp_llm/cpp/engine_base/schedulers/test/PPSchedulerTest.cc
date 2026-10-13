@@ -2,6 +2,7 @@
 #include <functional>
 #include <future>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <stdexcept>
 
@@ -9,6 +10,10 @@
 #include "gmock/gmock-actions.h"
 #include "gmock/gmock-function-mocker.h"
 #include "gtest/gtest.h"
+#include "autil/TimeUtility.h"
+#include "kmonitor/client/common/MinMaxCalculator.h"
+#include "kmonitor/client/core/MetricsCollector.h"
+#include "rtp_llm/cpp/metrics/RtpLLMMetrics.h"
 
 #define private public
 #define protected public
@@ -214,6 +219,73 @@ TEST_F(PPSchedulerTest, StopWakesSingleDpScheduleWithNoOutstandingRequests) {
     ASSERT_TRUE(output.ok()) << output.status().ToString();
     EXPECT_TRUE(output->streams.empty());
     EXPECT_TRUE(output->finished_request_ids.empty());
+}
+
+TEST_F(PPSchedulerTest, AdmissionMetricsResetWhenReadyDecodeSkipsAdmission) {
+    for (const auto role : {RoleType::PDFUSION, RoleType::PREFILL}) {
+        SCOPED_TRACE(static_cast<int>(role));
+        auto monitor = std::make_shared<kmonitor::KMonitor>("pp_scheduler_metrics_test");
+        monitor->SetServiceName("");
+        auto scheduler = createScheduler(1, role);
+        scheduler->metrics_reporter_ =
+            std::make_shared<kmonitor::MetricsReporter>(monitor, "", kmonitor::MetricsTags("dp_rank", "1"));
+        int64_t snapshot_time_ms = 0;
+        auto    expect_metrics   = [&](int admitted, int tokens, int running, int waiting, bool has_wait_age) {
+            kmonitor::MetricsCollector snapshot;
+            monitor->GetMetrics(&snapshot, {kmonitor::NORMAL}, snapshot_time_ms += 10000);
+            std::map<std::string, std::string> values;
+            for (const auto* record : snapshot.GetRecords().getRecords()) {
+                EXPECT_EQ(record->Tags()->FindTag("dp_rank"), "1");
+                for (const auto* value : record->Values()) {
+                    EXPECT_TRUE(values.emplace(value->Name(), value->Value()).second);
+                }
+            }
+            const std::map<std::string, int> expected{{"rtp_llm_scheduler_admitted_context_batch_size", admitted},
+                                                      {"rtp_llm_scheduler_admitted_context_token_size", tokens},
+                                                      {"rtp_llm_running_stream_size", running},
+                                                      {"rtp_llm_wait_stream_size", waiting}};
+            for (const auto& [name, value] : expected) {
+                kmonitor::MinMaxCalculator gauge;
+                gauge.Add(value);
+                EXPECT_EQ(values.at(name), gauge.ToString()) << name;
+            }
+            kmonitor::MinMaxCalculator zero;
+            zero.Add(0);
+            EXPECT_EQ(values.at("rtp_llm_scheduler_waiting_oldest_age_us") != zero.ToString(), has_wait_age);
+        };
+
+        auto first = createStream({1, 2, 3}, false, false, 4);
+        first->recordSchedulerEnqueueTime(autil::TimeUtility::currentTimeInMicroSeconds() - 10000);
+        ASSERT_TRUE(scheduler->enqueue(first).ok());
+        ASSERT_EQ(scheduler->schedule()->streams.size(), 1u);
+        expect_metrics(1, 3, 1, 0, true);
+
+        auto second = createStream({5, 6}, false, false, 4);
+        second->recordSchedulerEnqueueTime(autil::TimeUtility::currentTimeInMicroSeconds() - 10000);
+        ASSERT_TRUE(scheduler->enqueue(second).ok());
+        first->updateFromPP({torch::tensor({{4}}, torch::kInt32), 1});
+        first->clearPPInflight();
+        const auto decode = scheduler->schedule();
+        ASSERT_TRUE(decode.ok());
+        ASSERT_EQ(decode->streams.size(), 1u);
+        EXPECT_EQ(decode->streams.front(), first);
+        EXPECT_EQ(second->getStatus(), StreamState::WAITING);
+        expect_metrics(0, 0, 1, 1, false);
+
+        // While A is in flight, B may enter a separate batch. A stays in the running count.
+        const auto prefill = scheduler->schedule();
+        ASSERT_TRUE(prefill.ok());
+        ASSERT_EQ(prefill->streams.size(), 1u);
+        EXPECT_EQ(prefill->streams.front(), second);
+        EXPECT_TRUE(first->isPPInflight());
+        EXPECT_TRUE(second->isPPInflight());
+        expect_metrics(1, 2, 2, 0, true);
+
+        const auto empty = scheduler->schedule();
+        ASSERT_TRUE(empty.ok());
+        EXPECT_TRUE(empty->streams.empty());
+        expect_metrics(0, 0, 2, 0, false);
+    }
 }
 
 TEST_F(PPSchedulerTest, SingleDpInflightKeepsProducingEmptySchedulesUntilResultCommit) {

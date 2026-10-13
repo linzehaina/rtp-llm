@@ -105,11 +105,13 @@ list<GenerateStreamPtr> PPScheduler::evaluateRunningStreams() {
     return scheduled_streams;
 }
 
-void PPScheduler::admitWaitingStreams(list<GenerateStreamPtr>& scheduled_streams) {
+void PPScheduler::resetAdmissionMetrics() {
     last_admitted_context_batch_size_ = 0;
     last_admitted_context_token_size_ = 0;
     last_waiting_oldest_age_us_       = 0;
+}
 
+void PPScheduler::admitWaitingStreams(list<GenerateStreamPtr>& scheduled_streams) {
     if (!waiting_streams_.empty()) {
         auto oldest_enqueue_time_us = waiting_streams_.front()->schedulerEnqueueTimeUs();
         for (const auto& stream : waiting_streams_) {
@@ -295,6 +297,8 @@ absl::StatusOr<ScheduleOutput> PPScheduler::schedule() {
 
     schedule_trigger_ = false;
     finished_request_ids_.clear();
+    // Ready decode can skip admission. Metrics still describe this scheduling round.
+    resetAdmissionMetrics();
 
     /** 1. Handle all running streams, skip the in-flight streams. */
     auto scheduled_streams = evaluateRunningStreams();

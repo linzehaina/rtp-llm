@@ -8,13 +8,16 @@ struct EpilogueArgs {
     uint32_t* sfd;
     uint32_t  stride, m, n;
     float     legacy;
+    float     clamp_value = 0.0f;
+    uint32_t* clamped_count = nullptr;
+    uint32_t* clamp_count_ready = nullptr;
 };
 
 struct V41Module {
     CUmodule   module       = nullptr;
-    CUfunction functions[2] = {};
+    CUfunction functions[3] = {};
     CUcontext  context      = nullptr;
-    unsigned   metadata[5]  = {};
+    unsigned   metadata[6]  = {};
 };
 
 #define V41_CHECK(expr)                                                                                                \
@@ -40,20 +43,21 @@ extern "C" int v41_wo_a_init(const char* cubin, int device, void** output) {
         if (bytes != sizeof(module->metadata))
             return CUDA_ERROR_INVALID_VALUE;
         V41_CHECK(cuMemcpyDtoH(module->metadata, metadata, bytes));
-        if (module->metadata[3] != sizeof(EpilogueArgs) || module->metadata[4] != offsetof(EpilogueArgs, legacy))
+        if (module->metadata[4] != sizeof(EpilogueArgs) || module->metadata[5] != offsetof(EpilogueArgs, legacy))
             return CUDA_ERROR_INVALID_VALUE;
         unsigned count;
         V41_CHECK(cuModuleGetFunctionCount(&count, module->module));
-        if (count != 2)
+        if (count != 3)
             return CUDA_ERROR_INVALID_VALUE;
-        CUfunction functions[2];
-        V41_CHECK(cuModuleEnumerateFunctions(functions, 2, module->module));
+        CUfunction functions[3];
+        V41_CHECK(cuModuleEnumerateFunctions(functions, 3, module->module));
         for (auto function : functions) {
             const char* name;
             V41_CHECK(cuFuncGetName(&name, function));
-            // Identify the two fixed instantiations, independent of dynamic M/SMS.
+            // Identify fixed instantiations, independent of dynamic M/SMS.
             int index = std::strstr(name, "ELj1024ELj4096ELj32ELj128ELj128ELj8")  ? 0 :
                         std::strstr(name, "ELj1024ELj4096ELj128ELj256ELj128ELj8") ? 1 :
+                        std::strstr(name, "ELj1024ELj4096ELj192ELj128ELj128ELj8") ? 2 :
                                                                                     -1;
             if (index < 0 || module->functions[index])
                 return CUDA_ERROR_INVALID_VALUE;
@@ -132,20 +136,23 @@ extern "C" int v41_wo_a_launch(void*    handle,
     if (context != module.context)
         return CUDA_ERROR_INVALID_CONTEXT;
     // Two-CTA M pairing requires an even number of M tiles.
-    const bool  small = ((m + 127) / 128) % 2 != 0;
-    const int   index = small ? 0 : 1;
+    const bool  swapped = ((m + 127) / 128) % 2 != 0;
+    // A wider swapped tile avoids the many waves of the tiny-M schedule
+    // when the unswapped two-CTA schedule cannot pair an odd M tile count.
+    const int   index = !swapped ? 1 : m <= 128 ? 0 : 2;
+    const unsigned load_m = index == 0 ? 16 : index == 1 ? 128 : 96;
     CUtensorMap ma, mb, msa, msb, md;
-    V41_CHECK(make3(ma, a, m, 4096, stride_m, stride_g, small ? 16 : 128));
+    V41_CHECK(make3(ma, a, m, 4096, stride_m, stride_g, load_m));
     V41_CHECK(make3(mb, b, 1024, 4096, 4096, 1024ull * 4096, 128));
-    V41_CHECK(make3(md, q, m, 1024, 8192, 1024, small ? 16 : 128));
-    V41_CHECK(make_sf(msa, sa, (m + 3) / 4 * 4, 128));
-    V41_CHECK(make_sf(msb, sb, 1024, small ? 128 : 256));
+    V41_CHECK(make3(md, q, m, 1024, 8192, 1024, swapped ? 16 : 128));
+    V41_CHECK(make_sf(msa, sa, (m + 3) / 4 * 4, index == 2 ? 256 : 128));
+    V41_CHECK(make_sf(msb, sb, 1024, swapped ? 128 : 256));
     EpilogueArgs      epilogue{static_cast<uint32_t*>(sq), (m + 3) / 4 * 4, m, 1024, legacy ? 1.0f : 0.0f};
     CUlaunchAttribute attr{};
     attr.id               = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
     attr.value.clusterDim = {2, 1, 1};
     CUlaunchConfig config{};
-    config.gridDimX = module.metadata[2];
+    config.gridDimX = module.metadata[3];
     config.gridDimY = config.gridDimZ = 1;
     config.blockDimX                  = 256;
     config.blockDimY = config.blockDimZ = 1;

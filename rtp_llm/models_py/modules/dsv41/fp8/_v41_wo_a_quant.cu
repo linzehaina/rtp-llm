@@ -6,97 +6,34 @@
 
 using namespace deep_gemm;
 
+// Keep the vendor mainloop and storage definition; only specialize fixed
+// schedules for the O-A geometry (8 groups, N=1024, K=4096).
+template<unsigned M, unsigned N, unsigned Stages, bool Swap>
 static void instantiate_v41_wo_a() {
-    auto small = reinterpret_cast<void*>(&v41_wo_a_group32_epilogue<cute::UMMA::Major::K,
-                                                                    cute::UMMA::Major::K,
-                                                                    32,
-                                                                    32,
-                                                                    32,
-                                                                    0,
-                                                                    1024,
-                                                                    4096,
-                                                                    32,
-                                                                    128,
-                                                                    128,
-                                                                    8,
-                                                                    128,
-                                                                    128,
-                                                                    128,
-                                                                    11,
-                                                                    2,
-                                                                    128,
-                                                                    128,
-                                                                    2,
-                                                                    true,
-                                                                    V41_NUM_SMS,
-                                                                    true,
-                                                                    true,
-                                                                    GemmType::Batched,
-                                                                    false,
-                                                                    cutlass::float_e4m3_t,
-                                                                    cutlass::float_e4m3_t,
-                                                                    cutlass::float_e4m3_t,
-                                                                    epilogue::transform::EpilogueDynamicScaledFP8>);
-    auto large = reinterpret_cast<void*>(&v41_wo_a_group32_epilogue<cute::UMMA::Major::K,
-                                                                    cute::UMMA::Major::K,
-                                                                    32,
-                                                                    32,
-                                                                    32,
-                                                                    0,
-                                                                    1024,
-                                                                    4096,
-                                                                    128,
-                                                                    256,
-                                                                    128,
-                                                                    8,
-                                                                    128,
-                                                                    128,
-                                                                    128,
-                                                                    5,
-                                                                    2,
-                                                                    128,
-                                                                    128,
-                                                                    2,
-                                                                    false,
-                                                                    V41_NUM_SMS,
-                                                                    false,
-                                                                    true,
-                                                                    GemmType::Batched,
-                                                                    false,
-                                                                    cutlass::float_e4m3_t,
-                                                                    cutlass::float_e4m3_t,
-                                                                    cutlass::float_e4m3_t,
-                                                                    epilogue::transform::EpilogueDynamicScaledFP8>);
+    auto kernel = reinterpret_cast<void*>(&v41_wo_a_group32_epilogue<
+        cute::UMMA::Major::K, cute::UMMA::Major::K,
+        32, 32, 32, 0, 1024, 4096, M, N, 128, 8,
+        128, 128, 128, Stages, 2, 128, 128, 2, Swap,
+        V41_NUM_SMS, Swap, true, GemmType::Batched, false,
+        cutlass::float_e4m3_t, cutlass::float_e4m3_t, cutlass::float_e4m3_t,
+        epilogue::operators::V41CastToFP8>);
 }
 
-using SmallStorage = layout::SM100FP8FP4GemmSharedStorage<11,
-                                                          2,
-                                                          2,
-                                                          16,
-                                                          128,
-                                                          128,
-                                                          16,
-                                                          128,
-                                                          128,
-                                                          128,
-                                                          1,
-                                                          cutlass::float_e4m3_t,
-                                                          cutlass::float_e4m3_t,
-                                                          cutlass::float_e4m3_t>;
-using LargeStorage = layout::SM100FP8FP4GemmSharedStorage<5,
-                                                          2,
-                                                          2,
-                                                          128,
-                                                          128,
-                                                          128,
-                                                          128,
-                                                          128,
-                                                          128,
-                                                          256,
-                                                          1,
-                                                          cutlass::float_e4m3_t,
-                                                          cutlass::float_e4m3_t,
-                                                          cutlass::float_e4m3_t>;
+static void instantiate_schedules() {
+    instantiate_v41_wo_a<32, 128, 11, true>();
+    instantiate_v41_wo_a<128, 256, 5, false>();
+    instantiate_v41_wo_a<192, 128, 7, true>();
+}
 
-extern "C" __device__ __constant__ unsigned v41_wo_a_metadata[5] = {
-    sizeof(SmallStorage), sizeof(LargeStorage), V41_NUM_SMS, sizeof(EpilogueArgs), offsetof(EpilogueArgs, alpha)};
+template<unsigned M, unsigned N, unsigned Stages, bool Swap>
+using Storage = layout::SM100FP8FP4GemmSharedStorage<
+    Stages, 2, 2, Swap ? M / 2 : M, Swap ? N : N / 2,
+    128, Swap ? 16 : M, 128, (M + 127) / 128 * 128,
+    (N + 127) / 128 * 128, 1,
+    cutlass::float_e4m3_t, cutlass::float_e4m3_t, cutlass::float_e4m3_t>;
+
+extern "C" __device__ __constant__ unsigned v41_wo_a_metadata[6] = {
+    sizeof(Storage<32, 128, 11, true>),
+    sizeof(Storage<128, 256, 5, false>),
+    sizeof(Storage<192, 128, 7, true>),
+    V41_NUM_SMS, sizeof(EpilogueOperatorArgs), offsetof(EpilogueOperatorArgs, alpha)};

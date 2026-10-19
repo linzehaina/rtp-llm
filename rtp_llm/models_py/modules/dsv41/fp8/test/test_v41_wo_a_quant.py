@@ -307,6 +307,10 @@ class WoAQuantCPUContractTest(unittest.TestCase):
             root = Path(directory)
             include = root / "include"
             include.mkdir()
+            for name in ("sm100_store_cd.cuh", "sm100_store_cd_swap_ab.cuh"):
+                path = include / "deep_gemm/epilogue" / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("nv_bfloat162 values_bf16x2[8];")
             dependencies = (include, root, "nvcc", "c++")
             with mock.patch.dict(
                 os.environ, {"DG_JIT_CACHE_DIR": directory}
@@ -328,6 +332,24 @@ class WoAQuantCPUContractTest(unittest.TestCase):
                 machine.return_value = "aarch64"
                 self.assertEqual(op._build_library(152, dependencies), arm)
                 self.assertEqual(compile_.call_count, 4)
+
+    def test_fp32_shadow_headers_preserve_vendor_and_reject_layout_drift(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            include, output = root / "include", root / "output"
+            names = ("sm100_store_cd.cuh", "sm100_store_cd_swap_ab.cuh")
+            for name in names:
+                path = include / "deep_gemm/epilogue" / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("nv_bfloat162 values_bf16x2[8];")
+            op._prepare_headers(include, output)
+            for name in names:
+                relative = Path("deep_gemm/epilogue") / name
+                self.assertEqual((include / relative).read_text(), "nv_bfloat162 values_bf16x2[8];")
+                self.assertEqual((output / relative).read_text(), "float2 values_bf16x2[8];")
+            (include / relative).write_text("unsupported layout")
+            with self.assertRaisesRegex(RuntimeError, "Unexpected DeepGEMM"):
+                op._prepare_headers(include, output)
 
     def test_vendor_contract_rejects_changed_or_missing_private_headers(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -793,17 +815,26 @@ class WoAQuantCudaTest(unittest.TestCase):
         return q, self.pack(raw_s).transpose(0, 1)
 
     def baseline(self, a, mode):
-        d = torch.empty(a[0].shape[0], 8, 1024, device="cuda", dtype=torch.bfloat16)
+        # Independent FP32 GEMM + explicit group32 quantization reference.
+        d = torch.empty(a[0].shape[0], 8, 1024, device="cuda", dtype=torch.float32)
         self.dg.fp8_einsum("bhr,hdr->bhd", a, (self.w, self.sw), d, recipe=(1, 1, 32))
-        with mock.patch.dict(os.environ, {"DSV4_FP8_QUANT_KERNEL": mode}):
-            return self.native_quant(
-                d.flatten(1),
-                group_size=32,
-                eps=torch.finfo(torch.float32).tiny,
-                column_major_scales=True,
-                scale_tma_aligned=True,
-                scale_ue8m0=True,
-            )
+        grouped = d.flatten(1).reshape(d.shape[0], -1, 32)
+        tiny = torch.finfo(torch.float32).tiny
+        raw = grouped.abs().amax(-1).clamp_min(tiny) * (1.0 / 448.0)
+        raw = raw.clamp_min(1e-10) if mode in ("legacy", "auto") else torch.where(raw < tiny, 0.0, raw)
+        bits = raw.view(torch.int32)
+        exponents = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).int()
+        inverse = ((254 - exponents) << 23).view(torch.float32)
+        # Match CUDA mul.ftz.f32, including signed-zero/subnormal operands.
+        values = torch.where(grouped.abs() < tiny, torch.copysign(torch.zeros_like(grouped), grouped), grouped)
+        scaled = values * inverse.unsqueeze(-1)
+        scaled = torch.where(scaled.abs() < tiny, torch.copysign(torch.zeros_like(scaled), scaled), scaled)
+        q = scaled.clamp(-448, 448).to(torch.float8_e4m3fn).flatten(1)
+        words = exponents.reshape(d.shape[0], -1, 4)
+        packed = words[..., 0] | (words[..., 1] << 8) | (words[..., 2] << 16) | (words[..., 3] << 24)
+        aligned = torch.empty((64, (d.shape[0] + 3) // 4 * 4), dtype=torch.int32, device=d.device).T[:d.shape[0]]
+        aligned.copy_(packed)
+        return q, aligned
 
     def assert_pair(self, actual, expected):
         self.assertIsNotNone(actual)
@@ -811,6 +842,16 @@ class WoAQuantCudaTest(unittest.TestCase):
             torch.equal(actual[0].view(torch.uint8), expected[0].view(torch.uint8))
         )
         self.assertTrue(torch.equal(actual[1], expected[1]))
+
+    @torch.inference_mode()
+    def test_legacy_exponent_ceiling_for_all_finite_bf16_amax(self):
+        amax = torch.arange(0x7F80, device="cuda", dtype=torch.int16).view(torch.bfloat16).float()
+        raw = torch.clamp(amax, min=torch.finfo(torch.float32).tiny) * (1.0 / 448.0)
+        raw = torch.clamp(raw, min=1.0e-10)
+        bits = raw.view(torch.int32)
+        direct = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0)
+        reference = torch.ceil(torch.log2(raw)).to(torch.int32) + 127
+        self.assertTrue(torch.equal(direct, reference))
 
     @torch.inference_mode()
     def test_bitexact_layout_policy_and_ftz_boundaries(self):
@@ -883,7 +924,7 @@ class WoAQuantCudaTest(unittest.TestCase):
 
     @torch.inference_mode()
     def test_token_major_graph_replay_reads_updated_data_and_scales(self):
-        for m in (4, 24):
+        for m in (4, 24, 384):
             with self.subTest(m=m):
                 pair = self.pair(m)
                 pair = (pair[0].contiguous(), pair[1])
@@ -909,6 +950,28 @@ class WoAQuantCudaTest(unittest.TestCase):
                     pair[1],
                 )
                 self.assert_pair(captured, self.baseline(group_major, "v2"))
+
+    @torch.inference_mode()
+    def test_graph_replay_reads_reloaded_weights_and_scales(self):
+        a = self.pair(384)
+        a = (a[0].contiguous(), a[1])
+        original = (self.w.clone(), self.sw.clone())
+        try:
+            for mode in ("legacy", "v2", "auto"):
+                with self.subTest(mode=mode):
+                    op.try_grouped_quant(a, (self.w, self.sw), quant_kernel=mode)
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        result = op.try_grouped_quant(
+                            a, (self.w, self.sw), quant_kernel=mode
+                        )
+                    self.w.copy_((torch.randn_like(self.w.float()) * 0.1).to(self.w.dtype))
+                    self.sw.copy_(self.pack(torch.ones(8, 1024, 128, device="cuda")))
+                    graph.replay()
+                    self.assert_pair(result, self.baseline(a, mode))
+        finally:
+            self.w.copy_(original[0])
+            self.sw.copy_(original[1])
 
     @torch.inference_mode()
     def test_nondefault_stream_and_graph_replay(self):
@@ -1020,9 +1083,16 @@ class WoAQuantCudaTest(unittest.TestCase):
                         pair = projection.try_grouped_output_quant(
                             x, freqs, self.w, self.sw
                         )
-                        expected = linear(bf16)
+                        a = projection._quantize_projection_input(x, freqs, self.w)
+                        reference = self.baseline(a, mode)
+                        self.assert_pair(pair, reference)
+                        expected = linear.forward_quantized(*reference)
                         actual = linear.forward_quantized(*pair)
                         self.assertTrue(torch.equal(expected, actual))
+                        # Direct FP32 quantization deliberately changes BF16 rounding.
+                        old = linear(bf16)
+                        relative_l2 = (actual.float() - old.float()).norm() / old.float().norm()
+                        self.assertLess(relative_l2.item(), 0.04)
                 self.assertTrue(torch.equal(x, original))
             with mock.patch.dict(op._READY, {}, clear=True), mock.patch.object(
                 projection, "_quantize_projection_input"

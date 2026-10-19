@@ -1,4 +1,4 @@
-"""Startup-only CUDA JIT for wo_a BF16-round/group32 FP8 output on Blackwell SM10x.
+"""Startup-only CUDA JIT for wo_a FP32-accumulator/group32 FP8 output on Blackwell SM10x.
 
 No compilation, CUDA initialization, or vendor-library import occurs at import.
 Unsupported or unprepared calls return None so the caller retains its BF16 path.
@@ -26,17 +26,17 @@ _READY = {}
 _LIBRARIES = {}
 _LOCK = threading.Lock()
 _SOURCES = ("_v41_wo_a_quant.cu", "_v41_wo_a_quant.cuh", "_v41_wo_a_driver.cc")
-# The shim and two schedules are qualified against DeepGEMM 2.8.0+122e18b.
-# Its EpilogueDynamicScaledFP8 receives EpilogueArgs directly; pin the behavior
+# The shim and fixed schedules target DeepGEMM 2.8.2+ad62a90.
+# CastToFP8WithClamp receives EpilogueOperatorArgs; pin the behavior
 # and host-visible layout as well as the mainloop. Other revisions fall back
 # until their epilogue/layout has been verified.
 _VENDOR_HASHES = {
-    "impls/sm100_fp8_fp4_gemm_1d1d.cuh": "0b42d290fbcaea544a7b1c2c786429e52453fc60a74a939c20fa73ce960abf69",
-    "epilogue/sm100_store_cd.cuh": "34264511eadb165477cfd92059e03f7cc7dbb5b694298f7e4e9f1074294dc4ad",
-    "epilogue/sm100_store_cd_swap_ab.cuh": "77c280afab2a284d7a105323f3a878549d1e7f358ab0a28190c43958aed247d2",
-    "epilogue/transform.cuh": "85c5159fbfa9cfbda4a1f99885e72668e4df771d01e200001fe39ab89da17ccb",
-    "common/types.cuh": "a5fc39709678359f8a326dcb6c216edf09aa7dc7443bacbe91cc416a8802e74a",
-    "common/math.cuh": "576e9db1a1889087f77b3f74d74d011bf452f16c0e5c030bdd661e961c074ddc",
+    "impls/sm100_fp8_fp4_gemm_1d1d.cuh": "f567031e4f6e2b86b0ee99560c3eaff0160623a82e01aff0559fbeb3c2ec17b4",
+    "epilogue/sm100_store_cd.cuh": "f90b1baca0b88bad39cd84a3634447e2a4f24c249ab067bfa6afb7eed5979aea",
+    "epilogue/sm100_store_cd_swap_ab.cuh": "23cf25fed0aa5bcc26465a88cb3b11144d236f9697458d072dbb9171ad1edd8d",
+    "epilogue/operators.cuh": "4e916eab753dcc06eee8fe8664a8f1ba412a4724119cdbb04de52e01c12f7bf3",
+    "common/types.cuh": "0382bf27efb6deea5dc21a4f8ae21296494e513166c2682c63e498c70cefa6b2",
+    "common/math.cuh": "65aef0dbff42f066d2715c33b632f452cb4e21503fe168be0dca55aed0af9262",
     "layout/gemm.cuh": "b692f024495a4160dc65a8094bb13eae65be4c902d10436fce6446e6919d2b57",
 }
 
@@ -145,6 +145,20 @@ def _dependencies():
     return include, Path(nvcc).resolve().parent.parent, nvcc, cxx
 
 
+def _prepare_headers(include, output):
+    # Only this JIT sees FP32 scratch. Installed DeepGEMM stays unchanged.
+    # _dependencies pins both layouts before this private-header adaptation.
+    for name in ("sm100_store_cd.cuh", "sm100_store_cd_swap_ab.cuh"):
+        relative = Path("deep_gemm/epilogue") / name
+        text = (include / relative).read_text()
+        old = "nv_bfloat162 values_bf16x2["
+        if text.count(old) != 1:
+            raise RuntimeError(f"Unexpected DeepGEMM epilogue layout: {name}")
+        path = output / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text.replace(old, "float2 values_bf16x2["))
+
+
 def _build_library(sms, dependencies):
     include, cuda, nvcc, cxx = dependencies
     source = Path(__file__).resolve().parent
@@ -154,6 +168,7 @@ def _build_library(sms, dependencies):
     digest.update(platform.machine().encode())
     for name in _SOURCES:
         digest.update((source / name).read_bytes())
+    digest.update(Path(__file__).read_bytes())
     # Include all transitive vendor headers in the disk-cache identity.
     for path in sorted(include.rglob("*")):
         if path.suffix in (".h", ".hpp", ".cuh"):
@@ -174,6 +189,7 @@ def _build_library(sms, dependencies):
         if not (library.is_file() and cubin.is_file()):
             with tempfile.TemporaryDirectory(dir=cache) as temporary:
                 tmp = Path(temporary)
+                _prepare_headers(include, tmp)
                 commands = [
                     [
                         nvcc,
@@ -190,6 +206,7 @@ def _build_library(sms, dependencies):
                         "--ptxas-options=--verbose",
                         "--diag-suppress=39,161,174,177,186,940",
                         f"-DV41_NUM_SMS={sms}",
+                        "-I" + str(tmp),
                         "-I" + str(include),
                     ],
                     [
@@ -310,7 +327,7 @@ def try_grouped_quant(a, weight, *, out=None, quant_kernel=None):
 
 @torch.inference_mode()
 def warmup(weight, scale):
-    """Compile/load two fixed kernels once, then launch both with private inputs."""
+    """Compile/load fixed schedules once, then warm them with private inputs."""
     if not _weight_supported(weight, scale):
         return False
     device = weight.device
